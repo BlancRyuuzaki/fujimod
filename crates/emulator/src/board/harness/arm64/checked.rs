@@ -235,6 +235,11 @@ impl Guard {
             },
         )?;
         let width = u64::from(exclusive.bytes);
+        if address % width != 0 {
+            return Err(format!(
+                "unaligned exclusive access at {address:#x} width {width} (pc {pc:#x})"
+            ));
+        }
         if exclusive.load {
             if !contains(&self.options.readable, address, width) {
                 return Err(format!(
@@ -1291,6 +1296,18 @@ mod tests {
         let r = checked_call(&mut b, o).unwrap();
         assert!(!r.returned);
         assert!(r.failure.unwrap().contains("outside declared range"));
+        assert!(r.stores.is_empty());
+    }
+    #[test]
+    fn misaligned_exclusive_load_is_refused_before_retirement() {
+        // LDXR W1,[X0]; RET with a four-byte access at an unaligned address.
+        let mut b = board(&[0x885f7c01, 0xd65f03c0]);
+        let mut o = options();
+        o.arguments = vec![0x4001];
+        let r = checked_call(&mut b, o).unwrap();
+        assert!(!r.returned);
+        assert_eq!(r.instructions, 0);
+        assert!(r.failure.unwrap().contains("unaligned exclusive access"));
         assert!(r.stores.is_empty());
     }
 }
