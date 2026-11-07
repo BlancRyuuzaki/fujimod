@@ -754,6 +754,39 @@ impl Board {
         self.mmio.push((core, address, bytes));
         Ok(())
     }
+    /// Register the identity-mapped MMIO windows of an installed interrupt
+    /// controller so the board serves their accesses. Without this, the
+    /// windows are never reachable because the board only maps RAM and
+    /// peripheral pages.
+    pub fn map_interrupts(&mut self) -> Result<(), String> {
+        let (cores, windows) = {
+            let state = self.state.borrow();
+            match &state.interrupts {
+                Some(map) => (map.cores, map.windows()),
+                None => return Ok(()),
+            }
+        };
+        for core in 0..cores {
+            for (address, size) in &windows {
+                self.map_mmio(core, *address, *size as usize, *address)?;
+            }
+        }
+        Ok(())
+    }
+    /// Identity-mapped MMIO windows served by an installed interrupt controller.
+    pub fn interrupt_windows(&self) -> Vec<(u64, u64)> {
+        self.state
+            .borrow()
+            .interrupts
+            .as_ref()
+            .map(|map| {
+                map.windows()
+                    .into_iter()
+                    .map(|(address, size)| (address, address + size))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
     /// Observe guest ticks every 100,000 executed instructions, at existing scheduler
     /// boundaries. The listener receives no board access and does not change guest
     /// scheduling or stop criteria.

@@ -19,6 +19,7 @@ mod storage;
 use device::{Adapters, Failures, Object};
 use fujimod_emulator::board::{
     Board as ExecutionBoard,
+    InterruptMap,
     bus::{Bus, Mode},
     factory,
 };
@@ -43,6 +44,27 @@ enum Backend {
     Graph(fujimod_emulator_session::Session),
     Xp5(Box<xp5::Opened>),
     Xp4(Box<dyn xp4_backend::Xp4Backend>),
+}
+
+/// Optional interrupt controller admission for a device-free board.
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum InterruptAdmission {
+    GicV3 {
+        distributor: u64,
+        redistributor: u64,
+        stride: u64,
+        cores: usize,
+        lines: usize,
+    },
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeviceFreeBoard {
+    kind: String,
+    #[serde(default)]
+    interrupts: Option<InterruptAdmission>,
 }
 
 /// Lend the session of a Python `Board` to another binding crate.
@@ -516,7 +538,9 @@ impl Board {
             .and_then(serde_json::Value::as_str)
             == Some("none")
         {
-            if json::<serde_json::Value>(devices)? != serde_json::json!({"kind":"none"})
+            let device_free: DeviceFreeBoard = serde_json::from_str(devices)
+                .map_err(|e| PyValueError::new_err(format!("device-free board schema: {e}")))?;
+            if device_free.kind != "none"
                 || !models.is_empty()
                 || json::<serde_json::Value>(scene)? != serde_json::json!({})
                 || !graph.peripherals.is_empty()
@@ -528,8 +552,25 @@ impl Board {
                     "Device-free boards require strict RAM-only execution",
                 ));
             }
+            let interrupts = match device_free.interrupts {
+                None => None,
+                Some(InterruptAdmission::GicV3 {
+                    distributor,
+                    redistributor,
+                    stride,
+                    cores,
+                    lines,
+                }) => Some(
+                    InterruptMap::gic_v3(distributor, redistributor, stride, cores, lines)
+                        .map_err(error)?,
+                ),
+            };
             let board = graph
-                .build(factory::Options::new(engine), Bus::new(Mode::Strict), None)
+                .build(
+                    factory::Options::new(engine),
+                    Bus::new(Mode::Strict),
+                    interrupts,
+                )
                 .map_err(error)?;
             return Ok(Self {
                 driver: None,
@@ -537,7 +578,7 @@ impl Board {
                 function_watch: None,
                 instruction_points: BTreeMap::new(),
                 backend: Some(Backend::Graph(fujimod_emulator_session::Session {
-                    definition: serde_json::json!({"execution":json::<serde_json::Value>(execution)?,"devices":{"kind":"none"}}),
+                    definition: serde_json::json!({"execution":json::<serde_json::Value>(execution)?,"devices":json::<serde_json::Value>(devices)?}),
                     board,
                     controls: None,
                     contact_driver: None,
@@ -716,7 +757,7 @@ impl Board {
         {
             return Err(PyValueError::new_err("isolated call is already active"));
         }
-        if self.session()?.definition["devices"] != serde_json::json!({"kind":"none"}) {
+        if self.session()?.definition["devices"]["kind"] != "none" {
             return Err(PyValueError::new_err(
                 "Checked routines require a device-free board",
             ));
