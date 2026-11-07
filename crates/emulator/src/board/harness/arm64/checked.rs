@@ -335,20 +335,15 @@ fn tlbi_selects_a_valid_operand(op1: u32, crm: u32, op2: u32) -> bool {
     mask & (1 << op2) != 0
 }
 
-/// True for an architectural cache or TLB maintenance operation.
-///
-/// Reserved SYS encodings are refused, as are AT (writes PAR_EL1) and DC
-/// ZVA (stores zeros to a cache line). Both operandless (Rt=31) and
-/// register-addressed forms use this decoder.
 /// Barriers, event hints and `NOP` that need no model in this harness.
 ///
 /// A barrier only orders accesses against other observers. This harness runs
 /// one core, keeps no caches and no store buffer, and retires each store before
-/// decoding the next instruction, so every architecturally defined barrier is
-/// already satisfied and no pipeline model is needed. `DSB` and `DMB` accept
-/// every four-bit domain combination and the supplied images use `dsb sy`,
-/// `dsb ish`, `dsb ishst`, `dmb sy` and `dmb ish`; `SSBB` occupies the reserved
-/// `DSB` option-0 encoding. `ISB` accepts only its defined option `0xf`. `SEV`
+/// decoding the next instruction, so admitted barriers need no pipeline model.
+/// `DSB` and `DMB` accept the defined shareability/load/store options. `SSBB`
+/// and `PSSBB` occupy `DSB` options 0 and 4; `ISB` accepts only option `0xf`.
+/// The supplied images use `dsb sy`, `dsb ish`, `dsb ishst`, `dmb sy` and
+/// `dmb ish`. `SEV`
 /// signals an event to other cores, and no second core here can be waiting.
 /// `NOP` names no state. Hints that would suspend the core (`WFI`, `WFE`) and
 /// hint-space words with no such justification stay refused.
@@ -356,14 +351,23 @@ fn is_barrier_or_hint(word: u32) -> bool {
     if word == 0xd503_201f || word == 0xd503_209f {
         return true;
     }
-    // `DSB`/`DMB` `<option>`: 1101 0101 0000 0011 0011 oooo 1001 1111 for DSB
-    // and 1011 1111 for DMB. The option field is masked out and validated by
-    // the forms above; ISB is the single defined option-0xf encoding.
-    word & 0xffff_f09f == 0xd503_309f
-        || word & 0xffff_f09f == 0xd503_309b
-        || word == 0xd503_3fdf
+    // Mask only the option field: the low byte distinguishes DSB, DMB and ISB.
+    let option = (word >> 8) & 0xf;
+    let standard = matches!(option, 1..=3 | 5..=7 | 9..=11 | 13..=15);
+    if word & 0xffff_f0ff == 0xd503_309f {
+        return standard || matches!(option, 0 | 4); // SSBB / PSSBB.
+    }
+    if word & 0xffff_f0ff == 0xd503_30bf {
+        return standard;
+    }
+    word == 0xd503_3fdf
 }
 
+/// True for an architectural cache or TLB maintenance operation.
+///
+/// Reserved SYS encodings are refused, as are AT (writes PAR_EL1) and DC
+/// ZVA (stores zeros to a cache line). Both operandless (Rt=31) and
+/// register-addressed forms use this decoder.
 fn is_cache_or_tlbi(word: u32) -> bool {
     // SYS form: 1101 0101 00 L op0 op1 CRn CRm op2 Rt.
     if word & 0xfff8_0000 != 0xd508_0000 {
@@ -1725,8 +1729,11 @@ mod tests {
         for word in [
             0xd503_3f5f, // clrex clears an exclusive monitor instead
             0xd503_229f, // csdb: a hint this harness does not model
-            0xd503_3f7f, // dsb encoding in the isb slot
-            0xd503_3fef, // reserved isb option 0xe
+            0xd503_389f, // reserved DSB option 0x8
+            0xd503_38bf, // reserved DMB option 0x8
+            0xd503_3edf, // reserved ISB option 0xe
+            0xd503_3f7f, // generic MSR, not a barrier
+            0xd503_3fef, // generic MSR, not an ISB encoding
             0xd400_41bf, // svc enters an exception
         ] {
             assert!(!is_barrier_or_hint(word), "{word:#010x}");
