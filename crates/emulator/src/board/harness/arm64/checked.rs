@@ -39,8 +39,9 @@ pub struct RegisterObservation {
 }
 /// Declared AArch64 exception level for the checked routine entry PSTATE.
 ///
-/// Only EL1 is admitted today; EL2 and EL3 are reserved for later work and
-/// refuse before any instruction runs.
+/// EL1 and EL3 are admitted; EL3 entries may additionally read and write the
+/// EL3 system registers and `eret` to a declared, AArch64 target. EL2 remains
+/// reserved and refuses before any instruction runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EntryLevel {
@@ -80,6 +81,10 @@ pub struct CheckedOptions {
     /// Named read-only model registers and their expected values.
     #[serde(default)]
     pub system_reads: Vec<(String, u64)>,
+    /// Named system registers the routine may read or write. Writes require
+    /// membership here; reads may also be declared through `system_reads`.
+    #[serde(default)]
+    pub system_registers: Vec<String>,
     #[serde(default)]
     pub stop_addresses: Vec<u64>,
     pub entry: u64,
@@ -140,6 +145,12 @@ pub struct SystemReadObservation {
     pub destination: u8,
     pub value: u64,
 }
+#[derive(Serialize)]
+pub struct SystemWriteObservation {
+    pub pc: u64,
+    pub name: String,
+    pub value: u64,
+}
 #[derive(Default)]
 struct Observed {
     failure: Option<String>,
@@ -150,6 +161,7 @@ struct Observed {
     hits: Vec<StubHit>,
     observations: Vec<RegisterObservation>,
     system_reads: Vec<SystemReadObservation>,
+    system_writes: Vec<SystemWriteObservation>,
     pending: Option<SystemReadObservation>,
     /// Single-threaded exclusive monitor: the most recent exclusive load's
     /// (address, byte width). Only one core runs under this harness, so a
@@ -171,6 +183,7 @@ pub struct CheckedResult {
     pub observations: Vec<RegisterObservation>,
     pub system_read_model_values: Vec<(String, u64)>,
     pub system_read_observations: Vec<SystemReadObservation>,
+    pub system_writes: Vec<SystemWriteObservation>,
 }
 struct Guard {
     cpu: Weak<dyn Cpu>,
@@ -206,7 +219,32 @@ fn admitted_system_register(name: &str) -> Option<u16> {
         "TTBR0_EL1" => 0xc100,
         "TTBR1_EL1" => 0xc101,
         "MAIR_EL1" => 0xc510,
+        "VBAR_EL1" => 0xc600,
+        "VBAR_EL2" => 0xe600,
+        "VBAR_EL3" => 0xf600,
+        "SPSR_EL3" => 0xf200,
+        "ELR_EL3" => 0xf201,
 
+        _ => return None,
+    })
+}
+/// Canonical name for an admitted system-register encoding, used by the MSR
+/// and MRS paths to resolve the architectural register a word names.
+fn system_register_name(encoding: u16) -> Option<&'static str> {
+    Some(match encoding {
+        0xc000 => "MIDR_EL1",
+        0xc005 => "MPIDR_EL1",
+        0xc212 => "CurrentEL",
+        0xc080 => "SCTLR_EL1",
+        0xc102 => "TCR_EL1",
+        0xc100 => "TTBR0_EL1",
+        0xc101 => "TTBR1_EL1",
+        0xc510 => "MAIR_EL1",
+        0xc600 => "VBAR_EL1",
+        0xe600 => "VBAR_EL2",
+        0xf600 => "VBAR_EL3",
+        0xf200 => "SPSR_EL3",
+        0xf201 => "ELR_EL3",
         _ => return None,
     })
 }
@@ -370,31 +408,134 @@ impl Guard {
         let mut bytes = [0; 4];
         cpu.read_memory(pc, &mut bytes)?;
         let word = u32::from_le_bytes(bytes);
+        // ERET switches the exception level; only an EL3 entry may execute it.
+        if word == 0xd69f_03e0 {
+            if self.options.entry_level != Some(EntryLevel::El3) {
+                return Err("EL3 eret requires an EL3 entry level".into());
+            }
+            let spsr = scalar(
+                &*cpu,
+                Register::Arm64System(fujimod_emulator_cpu::arm::SystemRegister::from_encoding(
+                    0xf200,
+                )),
+            )?;
+            if spsr & 0x10 != 0 || !matches!(spsr & 0xf, 0b0000 | 0b0100 | 0b0101) {
+                return Err("eret refuses a non-AArch64 SPSR_EL3 mode".into());
+            }
+            let elr = scalar(
+                &*cpu,
+                Register::Arm64System(fujimod_emulator_cpu::arm::SystemRegister::from_encoding(
+                    0xf201,
+                )),
+            )?;
+            if !contains(&self.options.executable, elr, 4) {
+                return Err(format!(
+                    "eret target outside declared code range at {elr:#x}"
+                ));
+            }
+            return Ok(());
+        }
+        // DSB SY, DMB ISH and ISB are ordering points in this single-core,
+        // bus-free routine: admitted RAM stores complete before the next
+        // instruction, and an instruction barrier needs no pipeline model.
+        // They share the MSR system-instruction top bits, so they must be
+        // admitted before the MSR/MRS class checks below.
+        if matches!(word, 0xd503_201f | 0xd503_3f9f | 0xd503_3bbf | 0xd503_3fdf) {
+            return Ok(());
+        }
         // Exact MRS class: all other system instructions retain the default refusal.
         if word & 0xffe0_0000 == 0xd520_0000 {
             let encoding = ((word >> 5) & 0xffff) as u16;
-            let (name, expected) = self
+            let name = system_register_name(encoding).ok_or_else(|| {
+                format!("Unsupported instruction {word:#010x} at {pc:#x}: undeclared MRS")
+            })?;
+            if self.options.entry_level == Some(EntryLevel::El1)
+                && matches!(encoding, 0xf200 | 0xf201 | 0xf600 | 0xe600)
+            {
+                return Err(format!(
+                    "EL3 system register {name} requires an EL3 entry level"
+                ));
+            }
+            let declared = self
                 .options
                 .system_reads
                 .iter()
-                .find(|(name, _)| admitted_system_register(name) == Some(encoding))
-                .ok_or_else(|| {
-                    format!("Unsupported instruction {word:#010x} at {pc:#x}: undeclared MRS")
-                })?;
-            let value = model_value(&*cpu, name, encoding)?;
-            if value != *expected {
+                .find(|(name, _)| admitted_system_register(name) == Some(encoding));
+            if declared.is_none()
+                && !self
+                    .options
+                    .system_registers
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(name))
+            {
                 return Err(format!(
-                    "System register model value changed before MRS at {pc:#x}"
+                    "Unsupported instruction {word:#010x} at {pc:#x}: undeclared MRS"
                 ));
+            }
+            let value = model_value(&*cpu, name, encoding)?;
+            if let Some((_, expected)) = declared {
+                if value != *expected {
+                    return Err(format!(
+                        "System register model value changed before MRS at {pc:#x}"
+                    ));
+                }
             }
             self.observed.borrow_mut().pending = Some(SystemReadObservation {
                 pc,
-                name: name.clone(),
+                name: name.to_string(),
                 encoding,
                 destination: (word & 31) as u8,
                 value,
             });
             return Ok(());
+        }
+        // Exact MSR class: a declared system-register write is serviced by the
+        // guard, so the CPU never executes the instruction. Bit 20 (the load
+        // bit) is part of the class mask: it distinguishes MSR register from
+        // the barrier/hint family that shares the top system-instruction bits.
+        if word & 0xfff0_0000 == 0xd510_0000 {
+            let encoding = ((word >> 5) & 0xffff) as u16;
+            let name = system_register_name(encoding).ok_or_else(|| {
+                format!("Unsupported instruction {word:#010x} at {pc:#x}: undeclared MSR")
+            })?;
+            if self.options.entry_level == Some(EntryLevel::El1)
+                && matches!(encoding, 0xf200 | 0xf201 | 0xf600 | 0xe600)
+            {
+                return Err(format!(
+                    "EL3 system register {name} requires an EL3 entry level"
+                ));
+            }
+            if !self
+                .options
+                .system_registers
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(name))
+            {
+                return Err(format!(
+                    "Unsupported instruction {word:#010x} at {pc:#x}: undeclared MSR"
+                ));
+            }
+            let value = if word & 31 == 31 {
+                0
+            } else {
+                scalar(&*cpu, Register::X((word & 31) as u8))?
+            };
+            cpu.write_register(
+                Register::Arm64System(fujimod_emulator_cpu::arm::SystemRegister::from_encoding(
+                    encoding,
+                )),
+                &value.to_le_bytes(),
+            )?;
+            self.observed
+                .borrow_mut()
+                .system_writes
+                .push(SystemWriteObservation {
+                    pc,
+                    name: name.to_string(),
+                    value,
+                });
+            cpu.write_register(Register::Pc, &pc.wrapping_add(4).to_le_bytes())?;
+            return self.pause(&*cpu);
         }
         if word & 0x0a00_0000 == 0x0800_0000 {
             // Exclusives are emulated by this guard with a single-threaded
@@ -471,10 +612,8 @@ impl Guard {
             || word & 0xff20_fc1f == 0x1e20_2000) // FCMP S/D.
             && (word >> 22) & 3 <= 1)
             || word & 0xdfff_fc00 == 0x5ea1_b800; // FCVTZS/U scalar S to S.
-        // DSB SY and DMB ISH are ordering points in this single-core, bus-free
-        // routine: admitted RAM stores complete before the next instruction.
-        if matches!(word, 0xd503_201f | 0xd503_3f9f | 0xd503_3bbf)
-            || integer
+        // DSB SY, DMB ISH and ISB are admitted above as ordering points.
+        if integer
             || branch
             || scalar_fmov_immediate
             || scalar_fmov_register_transfer
@@ -555,7 +694,7 @@ pub fn checked_call_with(
         Some(level) => level,
         None => return Err("Missing entry exception level".into()),
     };
-    if entry_level != EntryLevel::El1 {
+    if entry_level == EntryLevel::El2 {
         return Err(format!(
             "Unsupported entry exception level {} (reserved)",
             entry_level.level()
@@ -894,6 +1033,7 @@ pub fn checked_call_with(
         observations: std::mem::take(&mut observed.observations),
         system_read_model_values: guard.options.system_reads.clone(),
         system_read_observations: std::mem::take(&mut observed.system_reads),
+        system_writes: std::mem::take(&mut observed.system_writes),
     })
 }
 
@@ -940,6 +1080,11 @@ mod tests {
         )
         .unwrap()
     }
+    fn sysreg(encoding: u16) -> Register {
+        Register::Arm64System(fujimod_emulator_cpu::arm::SystemRegister::from_encoding(
+            encoding,
+        ))
+    }
     #[test]
     fn el1_declaration_without_pstate_runs_to_completion() {
         let mut b = board(&[0xd65f03c0]);
@@ -973,22 +1118,14 @@ mod tests {
     }
     #[test]
     fn reserved_entry_levels_refuse_before_execution() {
-        for level in [EntryLevel::El2, EntryLevel::El3] {
-            let mut b = board(&[0xd65f03c0]);
-            let mut o = options();
-            o.entry_level = Some(level);
-            let error = checked_call(&mut b, o)
-                .err()
-                .expect("reserved level accepted");
-            assert_eq!(
-                error,
-                format!(
-                    "Unsupported entry exception level {} (reserved)",
-                    level.level()
-                )
-            );
-            assert_eq!(b.instruction_counts()[0], 0);
-        }
+        let mut b = board(&[0xd65f03c0]);
+        let mut o = options();
+        o.entry_level = Some(EntryLevel::El2);
+        let error = checked_call(&mut b, o)
+            .err()
+            .expect("reserved level accepted");
+        assert_eq!(error, "Unsupported entry exception level 2 (reserved)");
+        assert_eq!(b.instruction_counts()[0], 0);
     }
     #[test]
     fn missing_entry_level_refuses_before_execution() {
@@ -1269,7 +1406,6 @@ mod tests {
             (0xd5181000, true),
             (0xd5033b9f, true), // DSB ISH remains outside this policy.
             (0xd5033fbf, true), // DMB SY remains outside this policy.
-            (0xd5033fdf, true), // ISB remains outside this policy.
         ] {
             let mut b = board(&[word, 0xd65f03c0]);
             let mut o = options();
@@ -1428,5 +1564,94 @@ mod tests {
         assert_eq!(r.instructions, 0);
         assert!(r.failure.unwrap().contains("unaligned exclusive access"));
         assert!(r.stores.is_empty());
+    }
+    #[test]
+    fn el3_entry_writes_elr_reads_spsr_and_erets_to_el1() {
+        // MSR ELR_EL3,x0; MRS x1,SPSR_EL3; ISB; ERET; RET (at x0).
+        let mut b = board(&[
+            0xd51e_4020,
+            0xd53e_4001,
+            0xd503_3fdf,
+            0xd69f_03e0,
+            0xd65f_03c0,
+        ]);
+        b.write_register(0, sysreg(0xf200), 0x3c5).unwrap(); // SPSR_EL3: EL1h.
+        // Set the active SP at the board's EL1h reset level; the entry's EL3
+        // PSTATE switch saves it into SP_EL1 so `eret` lands on the same SP.
+        b.write_register(0, Register::Sp, 0x9000).unwrap();
+        b.write_register(0, sysreg(0xf088), 0x401).unwrap(); // SCR_EL3: AArch64 lower EL.
+        b.write_register(0, sysreg(0xe088), 0x80000000).unwrap(); // HCR_EL2: AArch64 EL1.
+        let mut o = options();
+        o.entry_level = Some(EntryLevel::El3);
+        o.pstate = Some(0x3cd);
+        o.arguments = vec![0x1010];
+        o.system_registers = vec!["spsr_el3".into(), "elr_el3".into()];
+        o.system_reads = vec![("SPSR_EL3".into(), 0x3c5)];
+        o.executable = vec![(0x1000, 0x1014)];
+        let r = checked_call(&mut b, o).unwrap();
+        assert!(r.returned, "{:?}", r.failure);
+        assert_eq!(r.registers["x1"], 0x3c5);
+        assert_eq!(r.registers["pstate"] & 0xf, 0b0101);
+        assert_eq!(r.system_writes.len(), 1);
+        assert_eq!(r.system_writes[0].pc, 0x1000);
+        assert_eq!(r.system_writes[0].name, "ELR_EL3");
+        assert_eq!(r.system_writes[0].value, 0x1010);
+    }
+    #[test]
+    fn el1_entry_eret_refuses_with_el3_message() {
+        let mut b = board(&[0xd69f_03e0, 0xd65f_03c0]);
+        let r = checked_call(&mut b, options()).unwrap();
+        assert_eq!(r.instructions, 0);
+        assert!(r
+            .failure
+            .unwrap()
+            .contains("EL3 eret requires an EL3 entry level"));
+    }
+    #[test]
+    fn el3_entry_undeclared_msr_refuses() {
+        // MSR SCTLR_EL1,x0 without any system_registers declaration.
+        let mut b = board(&[0xd5181000, 0xd65f_03c0]);
+        let mut o = options();
+        o.entry_level = Some(EntryLevel::El3);
+        o.pstate = Some(0x3cd);
+        let r = checked_call(&mut b, o).unwrap();
+        assert_eq!(r.instructions, 0);
+        assert!(r.failure.unwrap().contains("undeclared MSR"));
+    }
+    #[test]
+    fn el1_entry_el3_register_read_refuses() {
+        // MRS x1,SPSR_EL3; RET.
+        let mut b = board(&[0xd53e_4001, 0xd65f_03c0]);
+        b.write_register(0, sysreg(0xf200), 0x3c5).unwrap();
+        let mut o = options();
+        o.system_reads = vec![("SPSR_EL3".into(), 0x3c5)];
+        let r = checked_call(&mut b, o).unwrap();
+        assert_eq!(r.instructions, 0);
+        assert!(r
+            .failure
+            .unwrap()
+            .contains("EL3 system register SPSR_EL3 requires an EL3 entry level"));
+    }
+    #[test]
+    fn isb_alone_runs_to_completion() {
+        let mut b = board(&[0xd503_3fdf, 0xd65f_03c0]);
+        let r = checked_call(&mut b, options()).unwrap();
+        assert!(r.returned, "{:?}", r.failure);
+        assert_eq!(r.instructions, 2);
+    }
+    #[test]
+    fn el3_eret_non_aarch64_spsr_mode_refuses() {
+        // ERET with SPSR_EL3 M[3:0] = 0b0001; RET is never reached.
+        let mut b = board(&[0xd69f_03e0, 0xd65f_03c0]);
+        b.write_register(0, sysreg(0xf200), 0x3c1).unwrap();
+        let mut o = options();
+        o.entry_level = Some(EntryLevel::El3);
+        o.pstate = Some(0x3cd);
+        let r = checked_call(&mut b, o).unwrap();
+        assert_eq!(r.instructions, 0);
+        assert!(r
+            .failure
+            .unwrap()
+            .contains("eret refuses a non-AArch64 SPSR_EL3 mode"));
     }
 }
