@@ -228,7 +228,8 @@ fn admitted_system_register(name: &str) -> Option<u16> {
         "VBAR_EL3" => 0xf600,
         "SPSR_EL3" => 0xf200,
         "ELR_EL3" => 0xf201,
-        "CTR_EL0" => 0xc801,
+        "CTR_EL0" => 0xd801,
+        "CLIDR_EL1" => 0xc801,
         "CSSELR_EL1" => 0xd000,
         "CCSIDR_EL1" => 0xc800,
         _ => return None,
@@ -251,7 +252,8 @@ fn system_register_name(encoding: u16) -> Option<&'static str> {
         0xf600 => "VBAR_EL3",
         0xf200 => "SPSR_EL3",
         0xf201 => "ELR_EL3",
-        0xc801 => "CTR_EL0",
+        0xd801 => "CTR_EL0",
+        0xc801 => "CLIDR_EL1",
         0xd000 => "CSSELR_EL1",
         0xc800 => "CCSIDR_EL1",
         _ => return None,
@@ -1518,6 +1520,45 @@ mod tests {
             ),
             (0x1000, 0xc005, 0, mpidr)
         );
+    }
+    #[test]
+    fn cache_identity_reads_name_their_own_encodings() {
+        // MRS x0, CLIDR_EL1. CLIDR sits one op2 above CCSIDR at the same op1,
+        // and CTR_EL0 sits at op1=3, so the three encodings never alias. An
+        // alias would serve one register's model value for another's read,
+        // which the declared-value check cannot detect.
+        let mut b = board(&[0xd5390020, 0xd65f03c0]);
+        let clidr = b
+            .read_register(
+                0,
+                Register::Arm64System(arm64::system_register("c801").unwrap()),
+            )
+            .unwrap();
+        let mut o = options();
+        o.system_reads = vec![("CLIDR_EL1".into(), clidr)];
+        let r = checked_call(&mut b, o).unwrap();
+        assert!(r.returned, "{:?}", r.failure);
+        assert_eq!(r.registers["x0"], clidr);
+        assert_eq!(r.system_read_observations[0].name, "CLIDR_EL1");
+        assert_eq!(r.system_read_observations[0].encoding, 0xc801);
+    }
+    #[test]
+    fn ctr_read_uses_its_op1_three_encoding() {
+        // MRS x0, CTR_EL0, the same shape at op1=3.
+        let mut b = board(&[0xd53b0020, 0xd65f03c0]);
+        let ctr = b
+            .read_register(
+                0,
+                Register::Arm64System(arm64::system_register("d801").unwrap()),
+            )
+            .unwrap();
+        let mut o = options();
+        o.system_reads = vec![("CTR_EL0".into(), ctr)];
+        let r = checked_call(&mut b, o).unwrap();
+        assert!(r.returned, "{:?}", r.failure);
+        assert_eq!(r.registers["x0"], ctr);
+        assert_eq!(r.system_read_observations[0].name, "CTR_EL0");
+        assert_eq!(r.system_read_observations[0].encoding, 0xd801);
     }
     #[test]
     fn invalid_declarations_fail_before_retirement() {
