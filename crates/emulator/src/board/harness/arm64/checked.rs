@@ -1,8 +1,8 @@
 //! Fail-closed, flat-address AArch64 routine policy. All memory transfers are
 //! checked before execution; write callbacks are observations, never vetoes.
-use super::{Options, initialize};
-use crate::board::{Board, scalar};
-use fujimod_emulator_cpu::{Access, Cpu, Hook, HookRange, Model, Register, arm64};
+use super::{initialize, Options};
+use crate::board::{scalar, Board};
+use fujimod_emulator_cpu::{arm64, Access, Cpu, Hook, HookRange, Model, Register};
 use serde::{Deserialize, Serialize};
 use std::{
     cell::{Cell, RefCell},
@@ -257,27 +257,52 @@ fn system_register_name(encoding: u16) -> Option<&'static str> {
         _ => return None,
     })
 }
-/// True for the AArch64 cache and TLB maintenance operations that name no
-/// operand register (Rt=31). They share the SYS form with L=0 and the op0=0b01
-/// selector, and the CRn field picks the family: 7 is IC/DC and 8 is TLBI.
-/// `at` and `dc zva` share that space but are not maintenance-only: the first
-/// fills PAR_EL1 and the second stores zeros to a cache line.
-fn is_cache_or_tlbi_rt31(word: u32) -> bool {
+/// True for an architectural cache or TLB maintenance operation.
+/// The reserved encodings must not be admitted as TLB invalidations.
+fn tlbi_selects_a_valid_operand(op1: u32, crm: u32, op2: u32) -> bool {
+    let mask = match (op1, crm) {
+        // EL1: one, inner-shareable or outer-shareable scope and ranges.
+        (0, 1 | 3 | 7) => 0b1010_1111,
+        (0, 2 | 5 | 6) => 0b1010_1010,
+        // EL2: stage-two, range and EL1/EL2 selections.
+        (4, 0) => 0b0110_0110,
+        (4, 1 | 3 | 7) => 0b0111_0011,
+        (4, 2 | 5 | 6) => 0b0010_0010,
+        (4, 4) => 0b1111_1111,
+        // EL3: EL3 selections and physical-address ranges.
+        (6, 1 | 3 | 7) => 0b0011_0011,
+        (6, 2 | 5 | 6) => 0b0010_0010,
+        (6, 4) => 0b1000_1000,
+        _ => return false,
+    };
+    mask & (1 << op2) != 0
+}
+
+/// True for an architectural cache or TLB maintenance operation.
+///
+/// Reserved SYS encodings are refused, as are AT (writes PAR_EL1) and DC
+/// ZVA (stores zeros to a cache line). Both operandless (Rt=31) and
+/// register-addressed forms use this decoder.
+fn is_cache_or_tlbi(word: u32) -> bool {
     // SYS form: 1101 0101 00 L op0 op1 CRn CRm op2 Rt.
-    if word & 0xfff8_001f != 0xd508_001f {
+    if word & 0xfff8_0000 != 0xd508_0000 {
         return false;
     }
     let op1 = (word >> 16) & 7;
     let crn = (word >> 12) & 0xf;
     let crm = (word >> 8) & 0xf;
-    match (crn, op1) {
-        // Every TLBI operand invalidates a whole TLB or the entries selected
-        // by a range, a VA, an ASID or a VMID.
-        (8, _) => true,
+    let op2 = (word >> 5) & 7;
+    if crn == 8 {
+        return tlbi_selects_a_valid_operand(op1, crm, op2);
+    }
+    if crn != 7 {
+        return false;
+    }
+    match op1 {
         // IC and DC maintenance by set/way.
-        (7, 0) => matches!(crm, 1 | 5 | 6 | 10 | 14 | 15),
+        0 => matches!(crm, 1 | 5 | 6 | 10 | 14 | 15),
         // IC and DC maintenance by VA. CRm=4 holds the ZVA forms, which store.
-        (7, 3) => matches!(crm, 5 | 10 | 11 | 12 | 13 | 14 | 15),
+        3 => matches!(crm, 5 | 10 | 11 | 12 | 13 | 14 | 15),
         // op1=4 and op1=6 hold the AT selectors and the CIPAE forms.
         _ => false,
     }
@@ -487,23 +512,11 @@ impl Guard {
         if word & 0xfff0_f01f == 0xd500_401f {
             return Ok(());
         }
-        // IC, DC and TLBI maintenance with Rt=31 names no operand register,
-        // and the model keeps no caches and no TLB, so the operation changes
-        // nothing the routine can observe.
-        if is_cache_or_tlbi_rt31(word) {
+        // IC, DC and TLBI maintenance. The model keeps no caches and no TLB,
+        // so a valid operation changes no routine-visible state. Reserved
+        // encodings, address translation and DC ZVA remain refused.
+        if is_cache_or_tlbi(word) {
             return Ok(());
-        }
-        // SYS-form cache/TLB maintenance with an operand register. Rt names
-        // the set/way or address operand, so it is not a tracked system
-        // register. CRn=7 with op1=4 or 6 is the AT selector (writes PAR_EL1)
-        // and must stay refused. CRn=8 is the TLB family and is admitted for
-        // every operand field.
-        if word & 0xffff_0000 == 0xd508_0000 {
-            let crn = (word >> 12) & 0xf;
-            let op1 = (word >> 16) & 7;
-            if crn == 8 || (crn == 7 && !matches!(op1, 4 | 6)) {
-                return Ok(());
-            }
         }
         // Exact MRS class: all other system instructions retain the default refusal.
         if word & 0xffe0_0000 == 0xd520_0000 {
@@ -658,8 +671,8 @@ impl Guard {
             || (word & 0x7fff_0000 == 0x5ac0_0000 && (word>>10)&63 <= 5) // RBIT/REV/CLZ/CLS
             || (word & 0x7fe0_0000 == 0x1ac0_0000
                 && matches!((word>>10)&63,2|3|8..=11|16..=23)); // DIV/shifts/CRC
-        // Pointer authentication and newer system-dependent operations that
-        // share data-processing major groups are not generic integer ALU ops.
+                                                                // Pointer authentication and newer system-dependent operations that
+                                                                // share data-processing major groups are not generic integer ALU ops.
         let branch = word & 0x7c00_0000 == 0x1400_0000
             || word & 0xff00_0010 == 0x5400_0000
             || word & 0x7e00_0000 == 0x3400_0000
@@ -676,7 +689,7 @@ impl Guard {
             || word & 0xff20_fc1f == 0x1e20_2000) // FCMP S/D.
             && (word >> 22) & 3 <= 1)
             || word & 0xdfff_fc00 == 0x5ea1_b800; // FCVTZS/U scalar S to S.
-        // DSB SY, DMB ISH and ISB are admitted above as ordering points.
+                                                  // DSB SY, DMB ISH and ISB are admitted above as ordering points.
         if integer
             || branch
             || scalar_fmov_immediate
@@ -1106,9 +1119,8 @@ pub fn checked_call_with(
 mod tests {
     use super::*;
     use crate::board::{
-        InterruptMap,
         bus::{Bus, Mode},
-        factory,
+        factory, InterruptMap,
     };
     use serde_json::json;
     fn board(words: &[u32]) -> Board {
@@ -1176,10 +1188,17 @@ mod tests {
         b.write_memory(
             0,
             0x1000,
-            &[0xd2bf4001u32, 0x52800020, 0xb9000020, 0xb9400022, 0xaa0203e0, 0xd65f03c0]
-                .into_iter()
-                .flat_map(u32::to_le_bytes)
-                .collect::<Vec<_>>(),
+            &[
+                0xd2bf4001u32,
+                0x52800020,
+                0xb9000020,
+                0xb9400022,
+                0xaa0203e0,
+                0xd65f03c0,
+            ]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>(),
         )
         .unwrap();
         let o: CheckedOptions = serde_json::from_value(json!({
@@ -1187,7 +1206,8 @@ mod tests {
             "stack_pointer":36864,"stack":[32768,40960],"max_instructions":20,"quantum":10,
             "executable":[[4096,4120]],"readable":[[4096,4120],[16384,16400],[32768,40960]],
             "writable":[[16384,16392],[32768,40960]],"store_limit":20,"stubs":[],"registers":[]
-        })).unwrap();
+        }))
+        .unwrap();
         let r = checked_call(&mut b, o).unwrap();
         assert!(r.returned, "{:?}", r.failure);
         assert_eq!(r.return_value, Some(0x51));
@@ -1529,7 +1549,7 @@ mod tests {
         assert_eq!(r.registers["sp"], 0x9000);
     }
     #[test]
-    fn cache_and_tlbi_admission_is_limited_to_operandless_maintenance() {
+    fn cache_and_tlbi_admission_accepts_documented_operations_only() {
         for word in [
             0xd508_751f, // ic iallu
             0xd508_711f, // ic ialluis
@@ -1539,22 +1559,29 @@ mod tests {
             0xd50b_7e3f, // dc civac, xzr
             0xd508_871f, // tlbi vmalle1
             0xd50c_879f, // tlbi alle1
+            0xd508_8700, // tlbi vmalle1 (Rt is reserved)
+            0xd508_8720, // tlbi vae1, x0
+            0xd50e_871f, // tlbi alle3
+            0xd50b_7520, // ic ivau, x0
         ] {
-            assert!(is_cache_or_tlbi_rt31(word), "{word:#010x}");
+            assert!(is_cache_or_tlbi(word), "{word:#010x}");
         }
         for word in [
-            0xd508_781f, // at s1e1r, xzr
-            0xd50c_781f, // at s1e2r, xzr
-            0xd50b_743f, // dc zva, xzr
-            0xd50b_7520, // ic ivau, x0
-            0xd508_7b9f, // sys #0, c7, c11, #4: no cache operand
+            0xd508_801f, // Reserved SYS #0,c8,c0,#0: never a TLBI operand
+            0xd50a_871f, // Reserved op1=2 CRn=8 encoding
+            0xd508_841f, // Reserved CRm=4 EL1 encoding
+            0xd508_883f, // Reserved CRm=8 EL1 encoding
+            0xd50c_783f, // AT S1E2R, xzr: writes PAR_EL1
+            0xd50b_743f, // DC ZVA, xzr: stores zeros to a cache line
+            0xd50a_6a5f, // AT S12E1RW, xzr: writes PAR_EL1
+            0xd508_7b9f, // SYS #0, c7, c11, #4: reserved cache operand
             0xd503_201f, // nop
             0xd400_41bf, // svc #0x20d
             0xd440_0000, // hlt #0
             0xd518_1000, // msr tcr_el1, x0
             0xd538_0000, // mrs x0, midr_el1
         ] {
-            assert!(!is_cache_or_tlbi_rt31(word), "{word:#010x}");
+            assert!(!is_cache_or_tlbi(word), "{word:#010x}");
         }
     }
     #[test]
@@ -1735,8 +1762,8 @@ mod tests {
             0xd65f_03c0,
         ]);
         b.write_register(0, sysreg(0xf200), 0x3c5).unwrap(); // SPSR_EL3: EL1h.
-        // Set the active SP at the board's EL1h reset level; the entry's EL3
-        // PSTATE switch saves it into SP_EL1 so `eret` lands on the same SP.
+                                                             // Set the active SP at the board's EL1h reset level; the entry's EL3
+                                                             // PSTATE switch saves it into SP_EL1 so `eret` lands on the same SP.
         b.write_register(0, Register::Sp, 0x9000).unwrap();
         b.write_register(0, sysreg(0xf088), 0x401).unwrap(); // SCR_EL3: AArch64 lower EL.
         b.write_register(0, sysreg(0xe088), 0x80000000).unwrap(); // HCR_EL2: AArch64 EL1.
