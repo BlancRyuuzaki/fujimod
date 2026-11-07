@@ -270,7 +270,8 @@ fn tlbi_selects_a_valid_operand(op1: u32, crm: u32, op2: u32) -> bool {
         (4, 2 | 5 | 6) => 0b0010_0010,
         (4, 4) => 0b1111_1111,
         // EL3: EL3 selections and physical-address ranges.
-        (6, 1 | 3 | 7) => 0b0011_0011,
+        (6, 1 | 7) => 0b0011_0011,
+        (6, 3) => 0b0010_0011,
         (6, 2 | 5 | 6) => 0b0010_0010,
         (6, 4) => 0b1000_1000,
         _ => return false,
@@ -298,12 +299,18 @@ fn is_cache_or_tlbi(word: u32) -> bool {
     if crn != 7 {
         return false;
     }
-    match op1 {
-        // IC and DC maintenance by set/way.
-        0 => matches!(crm, 1 | 5 | 6 | 10 | 14 | 15),
-        // IC and DC maintenance by VA. CRm=4 holds the ZVA forms, which store.
-        3 => matches!(crm, 5 | 10 | 11 | 12 | 13 | 14 | 15),
-        // op1=4 and op1=6 hold the AT selectors and the CIPAE forms.
+    // IC and DC SYS selectors. The op2 field is part of the operation:
+    // accepting a CRm family without it also accepts unrelated SYS words.
+    // CRm=4 contains DC ZVA, which stores to memory.
+    match (op1, crm, op2) {
+        (0, 1 | 5, 0) => true, // IC IALLUIS / IALLU.
+        (0, 6, 1..=6) => true, // DC invalidate by VA or set/way.
+        (0, 10 | 14, 2 | 4 | 6) => true, // DC clean / clean and invalidate by set/way.
+        (0, 15, 1 | 5) => true, // DC CIVAPS / CIGDVAPS.
+        (3, 5, 1) => true, // IC IVAU.
+        (3, 10 | 12 | 13 | 14, 1 | 3 | 5) => true, // DC by VA.
+        (3, 11, 0 | 1 | 7) => true, // DC CVAOC / CVAU / CGDVAOC.
+        (3, 15, 0 | 7) => true, // DC CIVAOC / CIGDVAOC.
         _ => false,
     }
 }
@@ -1568,7 +1575,10 @@ mod tests {
         }
         for word in [
             0xd508_801f, // Reserved SYS #0,c8,c0,#0: never a TLBI operand
+            0xd508_713f, // SYS #0,c7,c1,#1: not IC IALLUIS
+            0xd50b_7540, // SYS #3,c7,c5,#2,x0: not IC IVAU
             0xd50a_871f, // Reserved op1=2 CRn=8 encoding
+            0xd50e_839f, // SYS #6,c8,c3,#4: not a TLBI selector
             0xd508_841f, // Reserved CRm=4 EL1 encoding
             0xd508_883f, // Reserved CRm=8 EL1 encoding
             0xd50c_783f, // AT S1E2R, xzr: writes PAR_EL1
