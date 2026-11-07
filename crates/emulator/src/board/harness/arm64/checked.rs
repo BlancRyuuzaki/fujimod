@@ -250,6 +250,8 @@ fn admitted_system_register(name: &str) -> Option<u16> {
         "CLIDR_EL1" => 0xc801,
         "CSSELR_EL1" => 0xd000,
         "CCSIDR_EL1" => 0xc800,
+        "SPSel" => 0xc210,
+        "DAIF" => 0xda11,
         _ => return parse_implementation_defined_name(name),
     })
 }
@@ -292,6 +294,8 @@ fn system_register_name(encoding: u16) -> Option<String> {
         0xc801 => "CLIDR_EL1",
         0xd000 => "CSSELR_EL1",
         0xc800 => "CCSIDR_EL1",
+        0xc210 => "SPSel",
+        0xda11 => "DAIF",
         _ => return implementation_defined_name(encoding),
     };
     Some(name.to_string())
@@ -1828,7 +1832,11 @@ mod tests {
         }
         // Only the implementation-defined space becomes a systematic name, so
         // an architectural register still needs its own table entry.
-        assert_eq!(system_register_name(0xda11), None);
+        assert_eq!(system_register_name(0xdb02), None);
+        assert_eq!(system_register_name(0xda11).as_deref(), Some("DAIF"));
+        assert_eq!(system_register_name(0xc210).as_deref(), Some("SPSel"));
+        assert_eq!(admitted_system_register("DAIF"), Some(0xda11));
+        assert_eq!(admitted_system_register("SPSel"), Some(0xc210));
         assert_eq!(parse_implementation_defined_name("S3_0_C15_C2_1"), None);
         assert_eq!(parse_implementation_defined_name("S4_1_C15_C2_1"), None);
         assert_eq!(parse_implementation_defined_name("S3_1_C15_C2"), None);
