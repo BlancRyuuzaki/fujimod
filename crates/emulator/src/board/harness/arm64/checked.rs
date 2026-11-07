@@ -232,13 +232,31 @@ fn admitted_system_register(name: &str) -> Option<u16> {
         "CLIDR_EL1" => 0xc801,
         "CSSELR_EL1" => 0xd000,
         "CCSIDR_EL1" => 0xc800,
-        _ => return None,
+        _ => return parse_implementation_defined_name(name),
     })
+}
+/// Encoding for a systematic implementation-defined name such as
+/// `S3_1_C15_C2_1`, which is how the camera's Cortex-A53 register
+/// `CPUACTLR_EL1` appears in disassembly. These encodings carry no
+/// architectural meaning, so a caller must declare the value it models.
+fn parse_implementation_defined_name(name: &str) -> Option<u16> {
+    let mut parts = name.strip_prefix('S')?.split('_');
+    let op0 = parts.next()?.parse::<u16>().ok()?;
+    let op1 = parts.next()?.parse::<u16>().ok()?;
+    let crn = parts.next()?.strip_prefix('C')?.parse::<u16>().ok()?;
+    let crm = parts.next()?.strip_prefix('C')?.parse::<u16>().ok()?;
+    let op2 = parts.next()?.parse::<u16>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let encoding = (op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2;
+    implementation_defined_name(encoding)?;
+    Some(encoding)
 }
 /// Canonical name for an admitted system-register encoding, used by the MSR
 /// and MRS paths to resolve the architectural register a word names.
-fn system_register_name(encoding: u16) -> Option<&'static str> {
-    Some(match encoding {
+fn system_register_name(encoding: u16) -> Option<String> {
+    let name = match encoding {
         0xc000 => "MIDR_EL1",
         0xc005 => "MPIDR_EL1",
         0xc212 => "CurrentEL",
@@ -256,8 +274,26 @@ fn system_register_name(encoding: u16) -> Option<&'static str> {
         0xc801 => "CLIDR_EL1",
         0xd000 => "CSSELR_EL1",
         0xc800 => "CCSIDR_EL1",
-        _ => return None,
-    })
+        _ => return implementation_defined_name(encoding),
+    };
+    Some(name.to_string())
+}
+/// Systematic name for the implementation-defined system-register space this
+/// firmware uses: `S3_<op1>_C<crn>_C<crm>_<op2>`. A53-only registers such as
+/// `CPUACTLR_EL1` (`S3_1_C15_C2_1`) live there and have no architectural value,
+/// so naming them only makes them declarable; nothing reads without a
+/// declaration. `S3_6_*` and `S3_7_*` are reserved for implementations, and
+/// `CRn=15` with `op1 != 0` is implementation defined at every exception level.
+fn implementation_defined_name(encoding: u16) -> Option<String> {
+    let op0 = encoding >> 14;
+    let op1 = (encoding >> 11) & 7;
+    let crn = (encoding >> 7) & 15;
+    let crm = (encoding >> 3) & 15;
+    let op2 = encoding & 7;
+    if op0 != 3 || op1 == 0 || (op1 < 6 && crn != 15) {
+        return None;
+    }
+    Some(format!("S{op0}_{op1}_C{crn}_C{crm}_{op2}"))
 }
 /// True for an architectural cache or TLB maintenance operation.
 /// The reserved encodings must not be admitted as TLB invalidations.
@@ -286,6 +322,30 @@ fn tlbi_selects_a_valid_operand(op1: u32, crm: u32, op2: u32) -> bool {
 /// Reserved SYS encodings are refused, as are AT (writes PAR_EL1) and DC
 /// ZVA (stores zeros to a cache line). Both operandless (Rt=31) and
 /// register-addressed forms use this decoder.
+/// Barriers, event hints and `NOP` that need no model in this harness.
+///
+/// A barrier only orders accesses against other observers. This harness runs
+/// one core, keeps no caches and no store buffer, and retires each store before
+/// decoding the next instruction, so every architecturally defined barrier is
+/// already satisfied and no pipeline model is needed. `DSB` and `DMB` accept
+/// every four-bit domain combination and the supplied images use `dsb sy`,
+/// `dsb ish`, `dsb ishst`, `dmb sy` and `dmb ish`; `SSBB` occupies the reserved
+/// `DSB` option-0 encoding. `ISB` accepts only its defined option `0xf`. `SEV`
+/// signals an event to other cores, and no second core here can be waiting.
+/// `NOP` names no state. Hints that would suspend the core (`WFI`, `WFE`) and
+/// hint-space words with no such justification stay refused.
+fn is_barrier_or_hint(word: u32) -> bool {
+    if word == 0xd503_201f || word == 0xd503_209f {
+        return true;
+    }
+    // `DSB`/`DMB` `<option>`: 1101 0101 0000 0011 0011 oooo 1001 1111 for DSB
+    // and 1011 1111 for DMB. The option field is masked out and validated by
+    // the forms above; ISB is the single defined option-0xf encoding.
+    word & 0xffff_f09f == 0xd503_309f
+        || word & 0xffff_f09f == 0xd503_309b
+        || word == 0xd503_3fdf
+}
+
 fn is_cache_or_tlbi(word: u32) -> bool {
     // SYS form: 1101 0101 00 L op0 op1 CRn CRm op2 Rt.
     if word & 0xfff8_0000 != 0xd508_0000 {
@@ -505,12 +565,12 @@ impl Guard {
             }
             return Ok(());
         }
-        // DSB SY, DMB ISH and ISB are ordering points in this single-core,
-        // bus-free routine: admitted RAM stores complete before the next
-        // instruction, and an instruction barrier needs no pipeline model.
-        // They share the MSR system-instruction top bits, so they must be
-        // admitted before the MSR/MRS class checks below.
-        if matches!(word, 0xd503_201f | 0xd503_3f9f | 0xd503_3bbf | 0xd503_3fdf) {
+        // Barrier, event-hint and NOP forms are ordering points in this
+        // single-core, cache-free routine: admitted RAM stores complete before
+        // the next instruction, and an instruction barrier needs no pipeline
+        // model. They share the MSR system-instruction top bits, so they must
+        // be admitted before the MSR/MRS class checks below.
+        if is_barrier_or_hint(word) {
             return Ok(());
         }
         // MSR (immediate) with Rt=31 writes one PSTATE field: SPSel, DAIFSet,
@@ -552,13 +612,13 @@ impl Guard {
                     .options
                     .system_registers
                     .iter()
-                    .any(|n| n.eq_ignore_ascii_case(name))
+                    .any(|n| n.eq_ignore_ascii_case(&name))
             {
                 return Err(format!(
                     "Unsupported instruction {word:#010x} at {pc:#x}: undeclared MRS"
                 ));
             }
-            let value = model_value(&*cpu, name, encoding)?;
+            let value = model_value(&*cpu, &name, encoding)?;
             if let Some((_, expected)) = declared {
                 if value != *expected {
                     return Err(format!(
@@ -595,7 +655,7 @@ impl Guard {
                 .options
                 .system_registers
                 .iter()
-                .any(|n| n.eq_ignore_ascii_case(name))
+                .any(|n| n.eq_ignore_ascii_case(&name))
             {
                 return Err(format!(
                     "Unsupported instruction {word:#010x} at {pc:#x}: undeclared MSR"
@@ -1576,6 +1636,75 @@ mod tests {
         }
     }
     #[test]
+    fn barrier_admission_covers_the_forms_the_images_use() {
+        for word in [
+            0xd503_201f, // nop
+            0xd503_209f, // sev
+            0xd503_3f9f, // dsb sy
+            0xd503_3b9f, // dsb ish
+            0xd503_3a9f, // dsb ishst
+            0xd503_3fbf, // dmb sy
+            0xd503_3bbf, // dmb ish
+            0xd503_3fdf, // isb
+            0xd503_309f, // ssbb, which occupies the reserved dsb option-0 form
+        ] {
+            assert!(is_barrier_or_hint(word), "{word:#010x}");
+        }
+        for word in [
+            0xd503_3f5f, // clrex clears an exclusive monitor instead
+            0xd503_229f, // csdb: a hint this harness does not model
+            0xd503_3f7f, // dsb encoding in the isb slot
+            0xd503_3fef, // reserved isb option 0xe
+            0xd400_41bf, // svc enters an exception
+        ] {
+            assert!(!is_barrier_or_hint(word), "{word:#010x}");
+        }
+    }
+    #[test]
+    fn barrier_forms_retire_and_leave_state_alone() {
+        // DSB ISHST; ISB; ADD X1,SP,#0; RET reaches the return with the stack
+        // pointer the two barriers leave untouched.
+        let mut b = board(&[0xd503_3a9f, 0xd503_3fdf, 0x9100_03e1, 0xd65f_03c0]);
+        let r = checked_call(&mut b, options()).unwrap();
+        assert!(r.returned, "{:?}", r.failure);
+        assert_eq!(r.instructions, 4);
+        assert_eq!(r.registers["x1"], 0x9000);
+        assert_eq!(r.registers["sp"], 0x9000);
+    }
+    #[test]
+    fn implementation_defined_names_are_systematic_and_declarable() {
+        // MRS X1, S3_1_C15_C2_1 is the A53 CPUACTLR_EL1 read at 0x5b580.
+        assert_eq!(system_register_name(0xcf91).as_deref(), Some("S3_1_C15_C2_1"));
+        assert_eq!(parse_implementation_defined_name("S3_1_C15_C2_1"), Some(0xcf91));
+        assert_eq!(system_register_name(0xdf80).as_deref(), Some("S3_3_C15_C0_0"));
+        assert_eq!(parse_implementation_defined_name("S3_3_C15_C0_0"), Some(0xdf80));
+        for (name, encoding) in [
+            ("MIDR_EL1", 0xc000u16),
+            ("CTR_EL0", 0xd801),
+            ("ELR_EL3", 0xf201),
+            ("CLIDR_EL1", 0xc801),
+        ] {
+            assert_eq!(system_register_name(encoding).as_deref(), Some(name));
+            assert_eq!(admitted_system_register(name), Some(encoding));
+        }
+        // Only the implementation-defined space becomes a systematic name, so
+        // an architectural register still needs its own table entry.
+        assert_eq!(system_register_name(0xda11), None);
+        assert_eq!(parse_implementation_defined_name("S3_0_C15_C2_1"), None);
+        assert_eq!(parse_implementation_defined_name("S4_1_C15_C2_1"), None);
+        assert_eq!(parse_implementation_defined_name("S3_1_C15_C2"), None);
+        assert_eq!(parse_implementation_defined_name("S3_x_C15_C2_1"), None);
+    }
+    #[test]
+    fn implementation_defined_reads_require_a_declaration() {
+        // MRS X1, S3_1_C15_C2_1; RET names no architectural value, so the call
+        // refuses before retirement until the caller declares the register.
+        let mut b = board(&[0xd539_f221, 0xd65f_03c0]);
+        let r = checked_call(&mut b, options()).unwrap();
+        assert_eq!(r.instructions, 0);
+        assert!(r.failure.unwrap().contains("undeclared MRS"));
+    }
+    #[test]
     fn cache_and_tlb_maintenance_without_an_operand_register_retire() {
         // IC IALLU; TLBI VMALLE1; ADD X1,SP,#0; RET records the stack pointer
         // the two maintenance operations leave untouched.
@@ -1643,8 +1772,8 @@ mod tests {
             (0xd5380000, false),
             (0xd538001f, true),
             (0xd5181000, true),
-            (0xd5033b9f, true), // DSB ISH remains outside this policy.
-            (0xd5033fbf, true), // DMB SY remains outside this policy.
+            (0xd5033f5f, true), // CLREX clears a monitor and stays outside this policy.
+            (0xd503229f, true), // CSDB is a hint this harness does not model.
         ] {
             let mut b = board(&[word, 0xd65f03c0]);
             let mut o = options();
