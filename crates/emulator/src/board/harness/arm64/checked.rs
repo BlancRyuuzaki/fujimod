@@ -447,6 +447,16 @@ impl Guard {
         if matches!(word, 0xd503_201f | 0xd503_3f9f | 0xd503_3bbf | 0xd503_3fdf) {
             return Ok(());
         }
+        // MSR (immediate) with Rt=31 writes one PSTATE field: SPSel, DAIFSet,
+        // DAIFClr, UAO, PAN, SSBS, DIT and TCO all share this encoding and
+        // name no architectural system register, so the CPU model owns the
+        // whole effect. CRn=4 with Rt=31 separates the class from the hint,
+        // barrier and system-operation forms sharing the same top bits, and
+        // the register-form MRS/MSR classes differ in bit 20 (0xd52/0xd51),
+        // so this admission cannot reach them.
+        if word & 0xfff0_f01f == 0xd500_401f {
+            return Ok(());
+        }
         // Exact MRS class: all other system instructions retain the default refusal.
         if word & 0xffe0_0000 == 0xd520_0000 {
             let encoding = ((word >> 5) & 0xffff) as u16;
@@ -1687,6 +1697,75 @@ mod tests {
         let r = checked_call(&mut b, options()).unwrap();
         assert!(r.returned, "{:?}", r.failure);
         assert_eq!(r.instructions, 2);
+    }
+    #[test]
+    fn msr_immediate_spsel_selects_the_stack_bank() {
+        let sp_el0 = sysreg(0xc208);
+        let sp_el1 = sysreg(0xe208);
+        // Entry at EL3, ERET to EL1t (PSTATE 0xc4, SPSel=0), then
+        // MSR SPSel,#1 moves the routine onto SP_EL1; ADD X1,SP,#0 records
+        // the banked value and MSR SPSel,#0 restores the entry bank.
+        let mut b = board(&[
+            0xd69f_03e0,
+            0xd500_41bf,
+            0x9100_03e1,
+            0xd500_40bf,
+            0xd65f_03c0,
+        ]);
+        b.write_register(0, sysreg(0xf200), 0xc4).unwrap(); // SPSR_EL3: EL1t.
+        b.write_register(0, sysreg(0xf201), 0x1004).unwrap(); // ELR_EL3.
+        b.write_register(0, sysreg(0xf088), 0x401).unwrap(); // SCR_EL3: AArch64 lower EL.
+        b.write_register(0, sysreg(0xe088), 0x8000_0000).unwrap(); // HCR_EL2.
+        b.write_register(0, sp_el0, 0xaa80).unwrap();
+        b.write_register(0, sp_el1, 0xbbc0).unwrap();
+        let mut o = options();
+        o.entry_level = Some(EntryLevel::El3);
+        o.pstate = Some(0x3cd);
+        o.executable = vec![(0x1000, 0x1014)];
+        o.readable = vec![(0x1000, 0x1014), (0x4000, 0x4010), (0x8000, 0xa000)];
+        o.system_registers = vec!["spsr_el3".into(), "elr_el3".into()];
+        let r = checked_call(&mut b, o).unwrap();
+        assert!(r.returned, "{:?}", r.failure);
+        assert_eq!(r.instructions, 5);
+        assert_eq!(r.registers["x1"], 0xbbc0);
+        assert_eq!(r.registers["pstate"] & 0x1f, 0b00100);
+        assert_eq!(r.registers["sp"], 0xaa80);
+        // MSR SPSel,#0 at EL1h selects SP_EL0 for the same read-back, and
+        // MSR SPSel,#1 restores SP_EL1 before RET.
+        let mut b = board(&[0xd500_40bf, 0x9100_03e1, 0xd500_41bf, 0xd65f_03c0]);
+        b.write_register(0, sp_el0, 0xaa80).unwrap();
+        let mut o = options();
+        o.executable = vec![(0x1000, 0x1010)];
+        o.readable = vec![(0x1000, 0x1010), (0x4000, 0x4010), (0x8000, 0xa000)];
+        let r = checked_call(&mut b, o).unwrap();
+        assert!(r.returned, "{:?}", r.failure);
+        assert_eq!(r.instructions, 4);
+        assert_eq!(r.registers["x1"], 0xaa80);
+        assert_eq!(r.registers["pstate"] & 1, 1);
+        assert_eq!(r.registers["sp"], 0x9000);
+    }
+    #[test]
+    fn msr_immediate_daif_clear_and_set_age_pstate() {
+        // MSR DAIFClr,#3 unmasks F and I; RET runs with them clear.
+        let mut b = board(&[0xd503_43ff, 0xd65f_03c0]);
+        let r = checked_call(&mut b, options()).unwrap();
+        assert!(r.returned, "{:?}", r.failure);
+        assert_eq!(r.instructions, 2);
+        assert_eq!(r.registers["pstate"] & 0x3c0, 0x300);
+        // MSR DAIFSet,#3 masks them again.
+        let mut b = board(&[0xd503_43df, 0xd65f_03c0]);
+        let r = checked_call(&mut b, options()).unwrap();
+        assert!(r.returned, "{:?}", r.failure);
+        assert_eq!(r.instructions, 2);
+        assert_eq!(r.registers["pstate"] & 0x3c0, 0x3c0);
+    }
+    #[test]
+    fn trap_instruction_sharing_the_low_bits_stays_refused() {
+        // SVC #0x20d: Rt=31 low bits from the immediate class, other top bits.
+        let mut b = board(&[0xd400_41bf, 0xd65f_03c0]);
+        let r = checked_call(&mut b, options()).unwrap();
+        assert_eq!(r.instructions, 0);
+        assert!(r.failure.unwrap().contains("Unsupported instruction"));
     }
     #[test]
     fn el3_eret_non_aarch64_spsr_mode_refuses() {
