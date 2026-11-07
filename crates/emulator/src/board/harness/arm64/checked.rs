@@ -37,6 +37,39 @@ pub struct RegisterObservation {
     pub pc: u64,
     pub registers: std::collections::BTreeMap<String, u64>,
 }
+/// Declared AArch64 exception level for the checked routine entry PSTATE.
+///
+/// Only EL1 is admitted today; EL2 and EL3 are reserved for later work and
+/// refuse before any instruction runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EntryLevel {
+    El1,
+    El2,
+    El3,
+}
+impl EntryLevel {
+    /// PSTATE `M[3:0]` encoding for this level in its high (SP_ELx) stack mode.
+    pub fn m4(self) -> u64 {
+        match self {
+            EntryLevel::El1 => 0b0101,
+            EntryLevel::El2 => 0b1001,
+            EntryLevel::El3 => 0b1101,
+        }
+    }
+    /// Numeric exception level (1, 2, or 3).
+    pub fn level(self) -> u64 {
+        match self {
+            EntryLevel::El1 => 1,
+            EntryLevel::El2 => 2,
+            EntryLevel::El3 => 3,
+        }
+    }
+    /// Complete initial PSTATE value: `0x3c0 | m4()`, the level's high-stack mode.
+    pub fn pstate(self) -> u64 {
+        0x3c0 | self.m4()
+    }
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CheckedOptions {
@@ -50,6 +83,14 @@ pub struct CheckedOptions {
     #[serde(default)]
     pub stop_addresses: Vec<u64>,
     pub entry: u64,
+    /// Declared entry exception level. Required; an absent declaration is
+    /// refused with an explicit message rather than serde's missing-field error.
+    #[serde(default)]
+    pub entry_level: Option<EntryLevel>,
+    /// Explicit initial PSTATE. When absent, the declared level's high-stack
+    /// PSTATE is used; when present, its M[3:0] must match the declared level.
+    #[serde(default)]
+    pub pstate: Option<u64>,
     pub arguments: Vec<u64>,
     pub return_address: u64,
     pub stack_pointer: u64,
@@ -510,6 +551,21 @@ pub fn checked_call_with(
     options: CheckedOptions,
     mut callback: impl FnMut(&StubHit, &StubSnapshot) -> Result<StubResponse, String>,
 ) -> Result<CheckedResult, String> {
+    let entry_level = match options.entry_level {
+        Some(level) => level,
+        None => return Err("Missing entry exception level".into()),
+    };
+    if entry_level != EntryLevel::El1 {
+        return Err(format!(
+            "Unsupported entry exception level {} (reserved)",
+            entry_level.level()
+        ));
+    }
+    let pstate = match options.pstate {
+        None => entry_level.pstate(),
+        Some(value) if value & 0xf == entry_level.m4() => value,
+        Some(_) => return Err("PSTATE exception level contradicts declared entry level".into()),
+    };
     if !board.state.borrow().bus.is_empty()
         || board.cpus.len() != 1
         || board.cpu(0)?.model() != Model::ArmV8A
@@ -577,7 +633,7 @@ pub fn checked_call_with(
         arguments: options.arguments.clone(),
         return_address: options.return_address,
         stack_pointer: Some(options.stack_pointer),
-        pstate: Some(0x3c5),
+        pstate: Some(pstate),
         max_instructions: options.max_instructions,
         quantum: options.quantum,
     };
@@ -876,11 +932,74 @@ mod tests {
         b
     }
     fn options() -> CheckedOptions {
-        serde_json::from_value(json!({"entry":4096,"arguments":[],"return_address":45056,
+        serde_json::from_value(
+            json!({"entry":4096,"entry_level":"el1","arguments":[],"return_address":45056,
             "stack_pointer":36864,"stack":[32768,40960],"max_instructions":20,"quantum":10,
             "executable":[[4096,4112]],"readable":[[4096,4112],[16384,16400],[32768,40960]],
-            "writable":[[16384,16392],[32768,40960]],"store_limit":20,"stubs":[],"registers":[]}))
+            "writable":[[16384,16392],[32768,40960]],"store_limit":20,"stubs":[],"registers":[]}),
+        )
         .unwrap()
+    }
+    #[test]
+    fn el1_declaration_without_pstate_runs_to_completion() {
+        let mut b = board(&[0xd65f03c0]);
+        let o = options();
+        assert_eq!(o.entry_level, Some(EntryLevel::El1));
+        assert!(o.pstate.is_none());
+        let r = checked_call(&mut b, o).unwrap();
+        assert!(r.returned, "{:?}", r.failure);
+    }
+    #[test]
+    fn explicit_el1_pstate_matching_declared_level_is_accepted() {
+        let mut b = board(&[0xd65f03c0]);
+        let mut o = options();
+        o.pstate = Some(0x3c5);
+        let r = checked_call(&mut b, o).unwrap();
+        assert!(r.returned, "{:?}", r.failure);
+    }
+    #[test]
+    fn el1_pstate_contradicting_declared_level_refuses_before_execution() {
+        let mut b = board(&[0xd65f03c0]);
+        let mut o = options();
+        o.pstate = Some(0x3cd);
+        let error = checked_call(&mut b, o)
+            .err()
+            .expect("contradicting pstate accepted");
+        assert_eq!(
+            error,
+            "PSTATE exception level contradicts declared entry level"
+        );
+        assert_eq!(b.instruction_counts()[0], 0);
+    }
+    #[test]
+    fn reserved_entry_levels_refuse_before_execution() {
+        for level in [EntryLevel::El2, EntryLevel::El3] {
+            let mut b = board(&[0xd65f03c0]);
+            let mut o = options();
+            o.entry_level = Some(level);
+            let error = checked_call(&mut b, o)
+                .err()
+                .expect("reserved level accepted");
+            assert_eq!(
+                error,
+                format!(
+                    "Unsupported entry exception level {} (reserved)",
+                    level.level()
+                )
+            );
+            assert_eq!(b.instruction_counts()[0], 0);
+        }
+    }
+    #[test]
+    fn missing_entry_level_refuses_before_execution() {
+        let mut b = board(&[0xd65f03c0]);
+        let mut o = options();
+        o.entry_level = None;
+        let error = checked_call(&mut b, o)
+            .err()
+            .expect("missing level accepted");
+        assert_eq!(error, "Missing entry exception level");
+        assert_eq!(b.instruction_counts()[0], 0);
     }
     #[test]
     fn initial_entry_requires_four_admitted_executable_bytes() {
@@ -1080,7 +1199,7 @@ mod tests {
                 Register::Arm64System(arm64::system_register("MIDR_EL1").unwrap()),
             )
             .unwrap();
-        let mut value = json!({"entry":4096,"arguments":[],"return_address":45056,
+        let mut value = json!({"entry":4096,"entry_level":"el1","arguments":[],"return_address":45056,
             "stack_pointer":36864,"stack":[32768,40960],"max_instructions":20,"quantum":10,
             "executable":[[4096,4112]],"readable":[[4096,4112],[16384,16400],[32768,40960]],
             "writable":[[16384,16392],[32768,40960]],"store_limit":20,"stubs":[],"registers":[]});
