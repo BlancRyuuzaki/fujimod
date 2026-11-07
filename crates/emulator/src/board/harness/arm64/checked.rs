@@ -81,6 +81,13 @@ pub struct CheckedOptions {
     /// Named read-only model registers and their expected values.
     #[serde(default)]
     pub system_reads: Vec<(String, u64)>,
+    /// Current values of registers the CPU core does not implement, such as
+    /// the A53-only `S3_1_C15_C2_1`. A declaration is the model: the guard
+    /// retires each read and write without executing it, returns the declared
+    /// value for reads, and updates it on writes. Every observation records
+    /// whether the value came from the model or from this declaration.
+    #[serde(default)]
+    pub system_values: Vec<(String, u64)>,
     /// Named system registers the routine may read or write. Writes require
     /// membership here; reads may also be declared through `system_reads`.
     #[serde(default)]
@@ -144,6 +151,14 @@ pub struct SystemReadObservation {
     pub encoding: u16,
     pub destination: u8,
     pub value: u64,
+    /// Whether the value came from the CPU model or from a caller declaration.
+    pub source: SystemValueSource,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemValueSource {
+    Model,
+    Declared,
 }
 #[derive(Serialize)]
 pub struct SystemWriteObservation {
@@ -193,6 +208,9 @@ struct Guard {
     /// controller. Transfers into these windows are admitted even though
     /// they are not declared RAM; the board serves them on the MMIO path.
     interrupt_windows: Vec<Span>,
+    /// Declared values for registers the CPU core does not implement, keyed by
+    /// encoding. Reads return the stored value; writes replace it.
+    system_state: RefCell<std::collections::BTreeMap<u16, u64>>,
     observed: RefCell<Observed>,
 }
 fn contains(spans: &[Span], address: u64, size: u64) -> bool {
@@ -602,6 +620,28 @@ impl Guard {
                     "EL3 system register {name} requires an EL3 entry level"
                 ));
             }
+            // A caller-declared register is the model: the core implements no
+            // such register, so the guard writes the declared value and retires
+            // the instruction without executing it.
+            if let Some(declared_value) = self.system_state.borrow().get(&encoding).copied() {
+                let destination = (word & 31) as u8;
+                if destination != 31 {
+                    cpu.write_register(Register::X(destination), &declared_value.to_le_bytes())?;
+                }
+                self.observed
+                    .borrow_mut()
+                    .system_reads
+                    .push(SystemReadObservation {
+                        pc,
+                        name,
+                        encoding,
+                        destination,
+                        value: declared_value,
+                        source: SystemValueSource::Declared,
+                    });
+                cpu.write_register(Register::Pc, &pc.wrapping_add(4).to_le_bytes())?;
+                return self.pause(&*cpu);
+            }
             let declared = self
                 .options
                 .system_reads
@@ -632,6 +672,7 @@ impl Guard {
                 encoding,
                 destination: (word & 31) as u8,
                 value,
+                source: SystemValueSource::Model,
             });
             return Ok(());
         }
@@ -650,6 +691,24 @@ impl Guard {
                 return Err(format!(
                     "EL3 system register {name} requires an EL3 entry level"
                 ));
+            }
+            if self.system_state.borrow().contains_key(&encoding) {
+                let value = if word & 31 == 31 {
+                    0
+                } else {
+                    scalar(&*cpu, Register::X((word & 31) as u8))?
+                };
+                self.system_state.borrow_mut().insert(encoding, value);
+                self.observed
+                    .borrow_mut()
+                    .system_writes
+                    .push(SystemWriteObservation {
+                        pc,
+                        name,
+                        value,
+                    });
+                cpu.write_register(Register::Pc, &pc.wrapping_add(4).to_le_bytes())?;
+                return self.pause(&*cpu);
             }
             if !self
                 .options
@@ -963,13 +1022,20 @@ pub fn checked_call_with(
     {
         return Err("Invalid explicit routine stop addresses".into());
     }
-    if options.system_reads.len() > 9 {
+    if options.system_reads.len() > 9 || options.system_values.len() > 9 {
         return Err("Too many declared system reads".into());
     }
     let mut names = std::collections::BTreeSet::new();
-    for (name, _) in &options.system_reads {
+    for (name, _) in options.system_reads.iter().chain(&options.system_values) {
         if admitted_system_register(name).is_none() || !names.insert(name) {
             return Err(format!("Unsupported or duplicate system register {name}"));
+        }
+    }
+    for (name, _) in &options.system_values {
+        if options.system_registers.iter().any(|n| n == name) {
+            return Err(format!(
+                "System register {name} is both declared to the model and given a value"
+            ));
         }
     }
     initialize(board, &call)?;
@@ -992,10 +1058,16 @@ pub fn checked_call_with(
     let initial = registers(board)?;
     let start = board.instruction_counts()[0];
     let tick = board.now();
+    let system_state = options
+        .system_values
+        .iter()
+        .filter_map(|(name, value)| Some((admitted_system_register(name)?, *value)))
+        .collect::<std::collections::BTreeMap<u16, u64>>();
     let mut guard = Box::new(Guard {
         cpu: Rc::downgrade(&board.cpus[0]),
         pause: board.host_pause.clone(),
         options,
+        system_state: RefCell::new(system_state),
         interrupt_windows: board.interrupt_windows(),
         observed: RefCell::new(Observed::default()),
     });
@@ -1670,6 +1742,66 @@ mod tests {
         assert_eq!(r.instructions, 4);
         assert_eq!(r.registers["x1"], 0x9000);
         assert_eq!(r.registers["sp"], 0x9000);
+    }
+    #[test]
+    fn declared_system_values_service_reads_the_core_does_not_implement() {
+        // MRS X1, S3_1_C15_C2_1; RET. The A53 CPUACTLR_EL1 encoding has no
+        // value in the CPU model, so a caller declaration is the model.
+        let mut b = board(&[0xd539_f221, 0xd65f_03c0]);
+        let mut o = options();
+        o.system_values = vec![("S3_1_C15_C2_1".into(), 0x1234_5678)];
+        let r = checked_call(&mut b, o).unwrap();
+        assert!(r.returned);
+        assert_eq!(r.system_read_observations.len(), 1);
+        let read = &r.system_read_observations[0];
+        assert_eq!(read.name, "S3_1_C15_C2_1");
+        assert_eq!(read.encoding, 0xcf91);
+        assert_eq!(read.destination, 1);
+        assert_eq!(read.value, 0x1234_5678);
+        assert_eq!(read.source, SystemValueSource::Declared);
+        assert_eq!(r.registers["x1"], 0x1234_5678);
+        // The read never reaches the CPU: the core implements no such
+        // register, so the guard retires it and the routine continues.
+        assert_eq!(r.failure, None);
+    }
+    #[test]
+    fn declared_system_writes_update_the_declared_value() {
+        // MRS x1,S3_1_C15_C2_1; MOVZ x1,#7; MSR S3_1_C15_C2_1,x1;
+        // MRS x2,S3_1_C15_C2_1; RET. The declaration is the register state.
+        let mut b = board(&[0xd539_f221, 0xd280_00e1, 0xd519_f221, 0xd539_f222, 0xd65f_03c0]);
+        let mut o = options();
+        o.executable = vec![(4096, 4116)];
+        o.system_values = vec![("S3_1_C15_C2_1".into(), 0x11)];
+        let r = checked_call(&mut b, o).unwrap();
+        assert!(r.returned);
+        assert_eq!(r.registers["x1"], 7);
+        assert_eq!(r.registers["x2"], 7);
+        assert_eq!(r.system_read_observations.len(), 2);
+        assert_eq!(r.system_read_observations[0].value, 0x11);
+        assert_eq!(r.system_read_observations[1].value, 7);
+        assert_eq!(r.system_writes.len(), 1);
+        assert_eq!(r.system_writes[0].value, 7);
+    }
+    #[test]
+    fn contradictory_system_register_declarations_are_refused() {
+        let mut b = board(&[0xd539_f221, 0xd65f_03c0]);
+        let mut o = options();
+        o.system_values = vec![("S3_1_C15_C2_1".into(), 0)];
+        o.system_registers = vec!["S3_1_C15_C2_1".into()];
+        let error = match checked_call(&mut b, o) {
+            Ok(_) => panic!("contradictory declarations were accepted"),
+            Err(error) => error,
+        };
+        assert!(error.contains("both declared to the model and given a value"));
+        let mut b = board(&[0xd539_f221, 0xd65f_03c0]);
+        let mut o = options();
+        o.system_values = vec![("S3_1_C15_C2_1".into(), 0)];
+        o.system_reads = vec![("S3_1_C15_C2_1".into(), 0)];
+        let error = match checked_call(&mut b, o) {
+            Ok(_) => panic!("duplicate declaration was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.contains("Unsupported or duplicate system register"));
     }
     #[test]
     fn implementation_defined_names_are_systematic_and_declarable() {
