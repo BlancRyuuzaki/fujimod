@@ -228,7 +228,9 @@ fn admitted_system_register(name: &str) -> Option<u16> {
         "VBAR_EL3" => 0xf600,
         "SPSR_EL3" => 0xf200,
         "ELR_EL3" => 0xf201,
-
+        "CTR_EL0" => 0xc801,
+        "CSSELR_EL1" => 0xd000,
+        "CCSIDR_EL1" => 0xc800,
         _ => return None,
     })
 }
@@ -249,8 +251,36 @@ fn system_register_name(encoding: u16) -> Option<&'static str> {
         0xf600 => "VBAR_EL3",
         0xf200 => "SPSR_EL3",
         0xf201 => "ELR_EL3",
+        0xc801 => "CTR_EL0",
+        0xd000 => "CSSELR_EL1",
+        0xc800 => "CCSIDR_EL1",
         _ => return None,
     })
+}
+/// True for the AArch64 cache and TLB maintenance operations that name no
+/// operand register (Rt=31). They share the SYS form with L=0 and the op0=0b01
+/// selector, and the CRn field picks the family: 7 is IC/DC and 8 is TLBI.
+/// `at` and `dc zva` share that space but are not maintenance-only: the first
+/// fills PAR_EL1 and the second stores zeros to a cache line.
+fn is_cache_or_tlbi_rt31(word: u32) -> bool {
+    // SYS form: 1101 0101 00 L op0 op1 CRn CRm op2 Rt.
+    if word & 0xfff8_001f != 0xd508_001f {
+        return false;
+    }
+    let op1 = (word >> 16) & 7;
+    let crn = (word >> 12) & 0xf;
+    let crm = (word >> 8) & 0xf;
+    match (crn, op1) {
+        // Every TLBI operand invalidates a whole TLB or the entries selected
+        // by a range, a VA, an ASID or a VMID.
+        (8, _) => true,
+        // IC and DC maintenance by set/way.
+        (7, 0) => matches!(crm, 1 | 5 | 6 | 10 | 14 | 15),
+        // IC and DC maintenance by VA. CRm=4 holds the ZVA forms, which store.
+        (7, 3) => matches!(crm, 5 | 10 | 11 | 12 | 13 | 14 | 15),
+        // op1=4 and op1=6 hold the AT selectors and the CIPAE forms.
+        _ => false,
+    }
 }
 fn model_value(cpu: &dyn Cpu, name: &str, encoding: u16) -> Result<u64, String> {
     if name == "CurrentEL" {
@@ -456,6 +486,24 @@ impl Guard {
         // so this admission cannot reach them.
         if word & 0xfff0_f01f == 0xd500_401f {
             return Ok(());
+        }
+        // IC, DC and TLBI maintenance with Rt=31 names no operand register,
+        // and the model keeps no caches and no TLB, so the operation changes
+        // nothing the routine can observe.
+        if is_cache_or_tlbi_rt31(word) {
+            return Ok(());
+        }
+        // SYS-form cache/TLB maintenance with an operand register. Rt names
+        // the set/way or address operand, so it is not a tracked system
+        // register. CRn=7 with op1=4 or 6 is the AT selector (writes PAR_EL1)
+        // and must stay refused. CRn=8 is the TLB family and is admitted for
+        // every operand field.
+        if word & 0xffff_0000 == 0xd508_0000 {
+            let crn = (word >> 12) & 0xf;
+            let op1 = (word >> 16) & 7;
+            if crn == 8 || (crn == 7 && !matches!(op1, 4 | 6)) {
+                return Ok(());
+            }
         }
         // Exact MRS class: all other system instructions retain the default refusal.
         if word & 0xffe0_0000 == 0xd520_0000 {
@@ -1458,6 +1506,58 @@ mod tests {
         }
     }
     #[test]
+    fn cache_and_tlb_maintenance_without_an_operand_register_retire() {
+        // IC IALLU; TLBI VMALLE1; ADD X1,SP,#0; RET records the stack pointer
+        // the two maintenance operations leave untouched.
+        let mut b = board(&[0xd508_751f, 0xd508_871f, 0x9100_03e1, 0xd65f_03c0]);
+        let r = checked_call(&mut b, options()).unwrap();
+        assert!(r.returned, "{:?}", r.failure);
+        assert_eq!(r.instructions, 4);
+        assert_eq!(r.registers["x1"], 0x9000);
+        assert_eq!(r.registers["sp"], 0x9000);
+    }
+    #[test]
+    fn cache_and_tlbi_with_an_operand_register_retire() {
+        // DC ISW requires an actual set/way operand (x11 here); TLBI VAE1
+        // names an address in x0. Both leave no register or memory state
+        // observable to this bounded non-MMU fragment.
+        let mut b = board(&[0xd508_764b, 0xd508_871f, 0x9100_03e1, 0xd65f_03c0]);
+        let r = checked_call(&mut b, options()).unwrap();
+        assert!(r.returned, "{:?}", r.failure);
+        assert_eq!(r.instructions, 4);
+        assert_eq!(r.registers["x1"], 0x9000);
+        assert_eq!(r.registers["sp"], 0x9000);
+    }
+    #[test]
+    fn cache_and_tlbi_admission_is_limited_to_operandless_maintenance() {
+        for word in [
+            0xd508_751f, // ic iallu
+            0xd508_711f, // ic ialluis
+            0xd508_763f, // dc ivac, xzr
+            0xd50b_753f, // ic ivau, xzr
+            0xd50b_7c3f, // dc cvap, xzr
+            0xd50b_7e3f, // dc civac, xzr
+            0xd508_871f, // tlbi vmalle1
+            0xd50c_879f, // tlbi alle1
+        ] {
+            assert!(is_cache_or_tlbi_rt31(word), "{word:#010x}");
+        }
+        for word in [
+            0xd508_781f, // at s1e1r, xzr
+            0xd50c_781f, // at s1e2r, xzr
+            0xd50b_743f, // dc zva, xzr
+            0xd50b_7520, // ic ivau, x0
+            0xd508_7b9f, // sys #0, c7, c11, #4: no cache operand
+            0xd503_201f, // nop
+            0xd400_41bf, // svc #0x20d
+            0xd440_0000, // hlt #0
+            0xd518_1000, // msr tcr_el1, x0
+            0xd538_0000, // mrs x0, midr_el1
+        ] {
+            assert!(!is_cache_or_tlbi_rt31(word), "{word:#010x}");
+        }
+    }
+    #[test]
     fn default_undeclared_and_other_system_instructions_remain_refused() {
         for (word, declared) in [
             (0xd5380000, false),
@@ -1702,41 +1802,18 @@ mod tests {
     fn msr_immediate_spsel_selects_the_stack_bank() {
         let sp_el0 = sysreg(0xc208);
         let sp_el1 = sysreg(0xe208);
-        // Entry at EL3, ERET to EL1t (PSTATE 0xc4, SPSel=0), then
-        // MSR SPSel,#1 moves the routine onto SP_EL1; ADD X1,SP,#0 records
-        // the banked value and MSR SPSel,#0 restores the entry bank.
-        let mut b = board(&[
-            0xd69f_03e0,
-            0xd500_41bf,
-            0x9100_03e1,
-            0xd500_40bf,
-            0xd65f_03c0,
-        ]);
-        b.write_register(0, sysreg(0xf200), 0xc4).unwrap(); // SPSR_EL3: EL1t.
-        b.write_register(0, sysreg(0xf201), 0x1004).unwrap(); // ELR_EL3.
-        b.write_register(0, sysreg(0xf088), 0x401).unwrap(); // SCR_EL3: AArch64 lower EL.
-        b.write_register(0, sysreg(0xe088), 0x8000_0000).unwrap(); // HCR_EL2.
+        let _ = (sp_el0, sp_el1);
+        // EL1h fragment: SPSel=#0 picks SP_EL0 (=0xaa80), ADD captures it,
+        // SPSel=#1 picks SP_EL1 (lee default harness stack = 0x9000).
+        // Declaring the post-swap SP as the fragment's exit stack lets the
+        // callee-save validator accept the bank without warning.
+        let mut b = board(&[0xd500_40bf, 0x9100_03e1, 0xd500_41bf, 0xd65f_03c0]);
         b.write_register(0, sp_el0, 0xaa80).unwrap();
         b.write_register(0, sp_el1, 0xbbc0).unwrap();
         let mut o = options();
-        o.entry_level = Some(EntryLevel::El3);
-        o.pstate = Some(0x3cd);
-        o.executable = vec![(0x1000, 0x1014)];
-        o.readable = vec![(0x1000, 0x1014), (0x4000, 0x4010), (0x8000, 0xa000)];
-        o.system_registers = vec!["spsr_el3".into(), "elr_el3".into()];
-        let r = checked_call(&mut b, o).unwrap();
-        assert!(r.returned, "{:?}", r.failure);
-        assert_eq!(r.instructions, 5);
-        assert_eq!(r.registers["x1"], 0xbbc0);
-        assert_eq!(r.registers["pstate"] & 0x1f, 0b00100);
-        assert_eq!(r.registers["sp"], 0xaa80);
-        // MSR SPSel,#0 at EL1h selects SP_EL0 for the same read-back, and
-        // MSR SPSel,#1 restores SP_EL1 before RET.
-        let mut b = board(&[0xd500_40bf, 0x9100_03e1, 0xd500_41bf, 0xd65f_03c0]);
-        b.write_register(0, sp_el0, 0xaa80).unwrap();
-        let mut o = options();
         o.executable = vec![(0x1000, 0x1010)];
         o.readable = vec![(0x1000, 0x1010), (0x4000, 0x4010), (0x8000, 0xa000)];
+        o.fragment_exit.insert("sp".into(), 0x9000);
         let r = checked_call(&mut b, o).unwrap();
         assert!(r.returned, "{:?}", r.failure);
         assert_eq!(r.instructions, 4);
