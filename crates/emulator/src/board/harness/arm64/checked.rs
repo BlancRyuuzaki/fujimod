@@ -303,14 +303,16 @@ fn is_cache_or_tlbi(word: u32) -> bool {
     // accepting a CRm family without it also accepts unrelated SYS words.
     // CRm=4 contains DC ZVA, which stores to memory.
     match (op1, crm, op2) {
-        (0, 1 | 5, 0) => true, // IC IALLUIS / IALLU.
-        (0, 6, 1..=6) => true, // DC invalidate by VA or set/way.
-        (0, 10 | 14, 2 | 4 | 6) => true, // DC clean / clean and invalidate by set/way.
-        (0, 15, 1 | 5) => true, // DC CIVAPS / CIGDVAPS.
-        (3, 5, 1) => true, // IC IVAU.
-        (3, 10 | 12 | 13 | 14, 1 | 3 | 5) => true, // DC by VA.
-        (3, 11, 0 | 1 | 7) => true, // DC CVAOC / CVAU / CGDVAOC.
-        (3, 15, 0 | 7) => true, // DC CIVAOC / CIGDVAOC.
+        // IC IALLUIS / IALLU; DC invalidate by VA or set/way.
+        (0, 1 | 5, 0) | (0, 6, 1..=6) => true,
+        // DC clean / clean and invalidate by set/way; CIVAPS / CIGDVAPS.
+        (0, 10 | 14, 2 | 4 | 6) | (0, 15, 1 | 5) => true,
+        // IC IVAU.
+        (3, 5, 1) => true,
+        // DC maintenance by VA.
+        (3, 10 | 12 | 13 | 14, 1 | 3 | 5) => true,
+        // DC CVAOC / CVAU / CGDVAOC; CIVAOC / CIGDVAOC.
+        (3, 11, 0 | 1 | 7) | (3, 15, 0 | 7) => true,
         _ => false,
     }
 }
