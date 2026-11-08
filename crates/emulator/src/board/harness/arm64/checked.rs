@@ -178,6 +178,10 @@ struct Observed {
     system_reads: Vec<SystemReadObservation>,
     system_writes: Vec<SystemWriteObservation>,
     pending: Option<SystemReadObservation>,
+    /// System-register writes the guest made that must reach the backend from
+    /// outside a hook: the backend ignores table-register writes issued while
+    /// its own translation is being set up.
+    deferred: Vec<(u16, u64)>,
     /// Single-threaded exclusive monitor: the most recent exclusive load's
     /// (address, byte width). Only one core runs under this harness, so a
     /// single reservation is the entire architectural monitor.
@@ -560,7 +564,11 @@ impl Guard {
         }
         if pc & 3 != 0
             || size != 4
-            || !contains(&self.options.executable, self.physical(&*cpu, pc, Access::Fetch)?, 4)
+            || !contains(
+                &self.options.executable,
+                self.physical(&*cpu, pc, Access::Fetch)?,
+                4,
+            )
         {
             return Err(format!(
                 "Instruction fetch outside declared code range at {pc:#x}"
@@ -729,16 +737,12 @@ impl Guard {
                 } else {
                     scalar(&*cpu, Register::X((word & 31) as u8))?
                 };
-                self.refuse_mid_run_translation(encoding, value, pc)?;
+                self.defer_backend_write(encoding, &name, value);
                 self.system_state.borrow_mut().insert(encoding, value);
                 self.observed
                     .borrow_mut()
                     .system_writes
-                    .push(SystemWriteObservation {
-                        pc,
-                        name,
-                        value,
-                    });
+                    .push(SystemWriteObservation { pc, name, value });
                 cpu.write_register(Register::Pc, &pc.wrapping_add(4).to_le_bytes())?;
                 return self.pause(&*cpu);
             }
@@ -757,7 +761,7 @@ impl Guard {
             } else {
                 scalar(&*cpu, Register::X((word & 31) as u8))?
             };
-            self.refuse_mid_run_translation(encoding, value, pc)?;
+            self.defer_backend_write(encoding, &name, value);
             cpu.write_register(
                 Register::Arm64System(fujimod_emulator_cpu::arm::SystemRegister::from_encoding(
                     encoding,
@@ -872,16 +876,16 @@ impl Guard {
         }
         Err(format!("Unsupported instruction {word:#010x} at {pc:#x}"))
     }
-    /// Refuse a mid-run enable of address translation: the declaring caller is
-    /// the only place the executing backend and this guard can be brought into
-    /// agreement, and an MSR cannot reach the backend's own table registers.
-    fn refuse_mid_run_translation(&self, encoding: u16, value: u64, pc: u64) -> Result<(), String> {
-        if encoding == 0xc080 && value & 1 != 0 {
-            return Err(format!(
-                "Unsupported SCTLR_EL1.M set at {pc:#x}: translation must be declared before the call"
-            ));
+    /// Queue a system-register write that must be applied outside this hook.
+    /// A backend ignores table-register writes issued while it is stepping, so
+    /// the outer loop applies them between runs and before the next fetch.
+    fn defer_backend_write(&self, encoding: u16, name: &str, value: u64) {
+        if matches!(
+            name,
+            "TTBR0_EL1" | "TTBR1_EL1" | "TCR_EL1" | "MAIR_EL1" | "SCTLR_EL1"
+        ) {
+            self.observed.borrow_mut().deferred.push((encoding, value));
         }
-        Ok(())
     }
     /// The EL1 stage-1 inputs the guest has published, read from the CPU.
     fn translation_state(&self, cpu: &dyn Cpu) -> Result<arm64::TranslationState, String> {
@@ -1182,9 +1186,9 @@ pub fn checked_call_with(
         };
         board.write_register(
             0,
-            Register::Arm64System(
-                fujimod_emulator_cpu::arm::SystemRegister::from_encoding(encoding),
-            ),
+            Register::Arm64System(fujimod_emulator_cpu::arm::SystemRegister::from_encoding(
+                encoding,
+            )),
             *value,
         )?;
     }
@@ -1319,6 +1323,16 @@ pub fn checked_call_with(
             if board.read_register(0, Register::Pc)? == guard.options.return_address {
                 guard.observed.borrow_mut().returned = true;
                 break;
+            }
+            let deferred = std::mem::take(&mut guard.observed.borrow_mut().deferred);
+            for (encoding, value) in deferred {
+                board.write_register(
+                    0,
+                    Register::Arm64System(
+                        fujimod_emulator_cpu::arm::SystemRegister::from_encoding(encoding),
+                    ),
+                    value,
+                )?;
             }
             let used = board.instruction_counts()[0] - start;
             if used >= guard.options.max_instructions {
@@ -1915,10 +1929,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        for (address, values) in [
-            (0x1000u64, vec![0x2003u64]),
-            (0x2000, vec![0x3003u64]),
-        ] {
+        for (address, values) in [(0x1000u64, vec![0x2003u64]), (0x2000, vec![0x3003u64])] {
             b.write_memory(
                 0,
                 address,
@@ -1977,24 +1988,56 @@ mod tests {
         b.read_memory(0, DATA_PA, &mut bytes).unwrap();
         assert_eq!(u64::from_le_bytes(bytes), 0xbeef);
         b.read_memory(0, DATA_VA, &mut bytes).unwrap();
-        assert_eq!(u64::from_le_bytes(bytes), 0, "the virtual address is a decoy");
+        assert_eq!(
+            u64::from_le_bytes(bytes),
+            0,
+            "the virtual address is a decoy"
+        );
         assert_eq!(result.stores[0].address, DATA_PA);
     }
     #[test]
-    fn enabling_translation_inside_a_checked_call_refuses() {
-        // Declared translation works because the caller installs the tables in
-        // both the guard and the backend before the run. An MSR cannot do that,
-        // so the transition itself refuses instead of letting the guard and the
-        // backend resolve different physical addresses.
+    fn translation_enabled_inside_the_call_reaches_the_mapped_code_page() {
+        // The entry page is identity-mapped, but the page the program jumps to
+        // after enabling translation maps elsewhere: a stale flat fetch would
+        // run the decoy instructions at the virtual address instead.
         let mut b = translated_board(&[
-            0xd280_0020,
-            0xd518_1000,
-            0xd503_3fdf,
-            0xd2a0_0041,
-            0xd297_dde2,
-            0xf900_0022,
-            0xd65f_03c0,
+            0xd280_0020, // MOVZ X0,#1
+            0xd518_1000, // MSR SCTLR_EL1,X0
+            0xd503_3fdf, // ISB
+            0xd28e_0005, // MOVZ X5,#0x7000
+            0xd61f_00a0, // BR X5
         ]);
+        let mut level3 = [0u64; 512];
+        level3[(CODE >> 12) as usize] = CODE | 0x407;
+        level3[(JUMP_VA >> 12) as usize] = JUMP_PA | 0x407;
+        b.write_memory(
+            0,
+            0x3000,
+            &level3
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        // A decoy at the virtual address and the real continuation elsewhere.
+        b.write_memory(
+            0,
+            JUMP_VA,
+            &[0xd503_201fu32; 8]
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        b.write_memory(
+            0,
+            JUMP_PA,
+            &[0xd282_4680u32, 0xd65f_03c0]
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
         let mut options = translated_options();
         options.system_values = vec![
             ("SCTLR_EL1".into(), 0),
@@ -2002,20 +2045,19 @@ mod tests {
             ("TCR_EL1".into(), 0x20),
             ("MAIR_EL1".into(), 0x4400),
         ];
+        options.executable = vec![(CODE, CODE + 0x20), (JUMP_PA, JUMP_PA + 0x10)];
+        options.readable = vec![
+            (CODE, CODE + 0x20),
+            (JUMP_PA, JUMP_PA + 0x10),
+            (32768, 40960),
+        ];
         let result = checked_call(&mut b, options).unwrap();
-        let failure = result.failure.expect("mid-run enable must refuse");
-        assert!(
-            failure.contains("translation must be declared before the call"),
-            "{failure}"
-        );
-        assert!(
-            failure.contains("0x6004"),
-            "the refusal names the enabling MSR: {failure}"
-        );
-        let mut bytes = [0u8; 8];
-        b.read_memory(0, DATA_PA, &mut bytes).unwrap();
-        assert_eq!(u64::from_le_bytes(bytes), 0);
+        assert_eq!(result.failure, None);
+        assert_eq!(result.registers["x0"], 0x1234);
+        assert!(result.returned);
     }
+    const JUMP_VA: u64 = 0x7000;
+    const JUMP_PA: u64 = 0xB000;
     #[test]
     fn a_device_page_refuses_a_translated_access() {
         // Attribute index 0 is Device in the declared MAIR, so this page is a
@@ -2027,7 +2069,10 @@ mod tests {
         let options = translated_options();
         let result = checked_call(&mut b, options).unwrap();
         let failure = result.failure.expect("device access must refuse");
-        assert!(failure.contains("translated Device access at 0x7000"), "{failure}");
+        assert!(
+            failure.contains("translated Device access at 0x7000"),
+            "{failure}"
+        );
     }
     #[test]
     fn writing_sctlr_with_translation_off_retires() {
@@ -2050,7 +2095,13 @@ mod tests {
     fn declared_system_writes_update_the_declared_value() {
         // MRS x1,S3_1_C15_C2_1; MOVZ x1,#7; MSR S3_1_C15_C2_1,x1;
         // MRS x2,S3_1_C15_C2_1; RET. The declaration is the register state.
-        let mut b = board(&[0xd539_f221, 0xd280_00e1, 0xd519_f221, 0xd539_f222, 0xd65f_03c0]);
+        let mut b = board(&[
+            0xd539_f221,
+            0xd280_00e1,
+            0xd519_f221,
+            0xd539_f222,
+            0xd65f_03c0,
+        ]);
         let mut o = options();
         o.executable = vec![(4096, 4116)];
         o.system_values = vec![("S3_1_C15_C2_1".into(), 0x11)];
@@ -2088,10 +2139,22 @@ mod tests {
     #[test]
     fn implementation_defined_names_are_systematic_and_declarable() {
         // MRS X1, S3_1_C15_C2_1 is the A53 CPUACTLR_EL1 read at 0x5b580.
-        assert_eq!(system_register_name(0xcf91).as_deref(), Some("S3_1_C15_C2_1"));
-        assert_eq!(parse_implementation_defined_name("S3_1_C15_C2_1"), Some(0xcf91));
-        assert_eq!(system_register_name(0xdf80).as_deref(), Some("S3_3_C15_C0_0"));
-        assert_eq!(parse_implementation_defined_name("S3_3_C15_C0_0"), Some(0xdf80));
+        assert_eq!(
+            system_register_name(0xcf91).as_deref(),
+            Some("S3_1_C15_C2_1")
+        );
+        assert_eq!(
+            parse_implementation_defined_name("S3_1_C15_C2_1"),
+            Some(0xcf91)
+        );
+        assert_eq!(
+            system_register_name(0xdf80).as_deref(),
+            Some("S3_3_C15_C0_0")
+        );
+        assert_eq!(
+            parse_implementation_defined_name("S3_3_C15_C0_0"),
+            Some(0xdf80)
+        );
         for (name, encoding) in [
             ("MIDR_EL1", 0xc000u16),
             ("CTR_EL0", 0xd801),
