@@ -1387,6 +1387,16 @@ class DecoderSelection(TypedDict, total=False):
     processors: Required[list[str]]
 
 
+class DeferredTimer(TypedDict, total=False):
+    callback_arguments: Required[int]
+    cancel: Required[TimerRoutine]
+    kind: Required[str]
+    one_shot_periodic: Required[int]
+    period_unit: Required[str]
+    periodic_nonzero: Required[bool]
+    start: Required[TimerRoutine]
+
+
 class DeviceGraph(TypedDict, total=False):
     attachment_order: Required[list[str]]
     construction_order: Required[list[str]]
@@ -1670,10 +1680,11 @@ FirmwareControlIds = TypedDict(
 
 
 class FirmwareCpu(TypedDict, total=False):
-    cpsr: Required[int]
+    cpsr: NotRequired[int | None]
+    entry: NotRequired[FirmwareEntry | None]
     id: Required[int]
     pc: Required[int]
-    regs: Required[FirmwareRegs]
+    regs: NotRequired[FirmwareRegs | None]
     running: Required[bool]
     sysregs: Required[FirmwareSysregs]
 
@@ -1705,6 +1716,15 @@ class FirmwareDescriptors(TypedDict, total=False):
     sampling: Required[str]
     sha256: Required[str]
     size: Required[int]
+
+
+class FirmwareEntry(TypedDict, total=False):
+    level: Required[FirmwareEntryLevel]
+    pstate: Required[int]
+    regs: Required[dict[str, int]]
+
+
+type FirmwareEntryLevel = Literal["el1h", "el2h", "el3h", "el3t"]
 
 
 FirmwareFacts = TypedDict(
@@ -2086,12 +2106,16 @@ class FirmwareSyntheticSignature(TypedDict, total=False):
 
 class FirmwareSysregs(TypedDict, total=False):
     CPACR_EL1: Required[int]
+    ELR_EL3: NotRequired[int | None]
     ICC_IGRPEN0_EL1: Required[int]
     ICC_IGRPEN1_EL1: Required[int]
     ICC_PMR_EL1: Required[int]
+    SCR_EL3: NotRequired[int | None]
     SCTLR_EL1: Required[int]
+    SPSR_EL3: NotRequired[int | None]
     SP_EL0: Required[int]
     SP_EL1: Required[int]
+    SP_EL3: NotRequired[int | None]
     VBAR_EL1: Required[int]
 
 
@@ -4175,6 +4199,9 @@ class ResolvedSelection(TypedDict, total=False):
     settings: NotRequired[FirmwareSettings | None]
     soc: Required[Soc]
     state: NotRequired[FirmwareState | None]
+    ui_event_codes: NotRequired[UiEventCodes | None]
+    ui_scene_names: NotRequired[UiSceneNames | None]
+    ui_setting_names: NotRequired[UiSettingNames | None]
 
 
 class Resources(TypedDict, total=False):
@@ -4201,6 +4228,7 @@ class Resources(TypedDict, total=False):
 
 class RestartMechanism(TypedDict, total=False):
     deadline_offset: Required[int]
+    deferred_timer: NotRequired[DeferredTimer | None]
     parameter_bytes: Required[int]
     power_off: Required[PowerOff]
     request: Required[int]
@@ -5455,6 +5483,11 @@ class TcmState(TypedDict, total=False):
     reset_address: Required[int]
 
 
+class TimerRoutine(TypedDict, total=False):
+    address: Required[int]
+    size: Required[int]
+
+
 type TimingOperation = Literal[
     "settle",
     "sample",
@@ -5469,6 +5502,48 @@ type TimingOperation = Literal[
 class TranslatedKey(TypedDict, total=False):
     event: Required[int]
     physical_key: Required[int]
+
+
+UiEventCodes = TypedDict(
+    "UiEventCodes",
+    {
+        "$schema": Required["str"],
+        "firmware_id": Required["str"],
+        "firmware_sha256": Required["str"],
+        "id": Required["str"],
+        "schema": Required["int"],
+        "ui_event_codes": Required["dict[str, int]"],
+    },
+    total=False,
+)
+
+
+UiSceneNames = TypedDict(
+    "UiSceneNames",
+    {
+        "$schema": Required["str"],
+        "firmware_id": Required["str"],
+        "firmware_sha256": Required["str"],
+        "id": Required["str"],
+        "schema": Required["int"],
+        "ui_scene_names": Required["dict[str, int]"],
+    },
+    total=False,
+)
+
+
+UiSettingNames = TypedDict(
+    "UiSettingNames",
+    {
+        "$schema": Required["str"],
+        "firmware_id": Required["str"],
+        "firmware_sha256": Required["str"],
+        "id": Required["str"],
+        "schema": Required["int"],
+        "ui_setting_names": Required["dict[str, int]"],
+    },
+    total=False,
+)
 
 
 class UpdateRange(TypedDict, total=False):

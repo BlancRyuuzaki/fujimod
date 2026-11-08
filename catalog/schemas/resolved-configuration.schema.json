@@ -6211,6 +6211,54 @@
       ],
       "type": "object"
     },
+    "DeferredTimer": {
+      "additionalProperties": false,
+      "description": "A stock timer that calls a no-argument callback after a millisecond delay.",
+      "properties": {
+        "callback_arguments": {
+          "description": "Number of arguments passed to the callback.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cancel": {
+          "$ref": "#/$defs/TimerRoutine",
+          "description": "Stock routine that cancels the handle returned by `start`."
+        },
+        "kind": {
+          "description": "Normalized ABI identifier.",
+          "type": "string"
+        },
+        "one_shot_periodic": {
+          "description": "Value of the periodic selector for a one-shot callback.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "period_unit": {
+          "description": "Unit accepted by `start`'s first argument.",
+          "type": "string"
+        },
+        "periodic_nonzero": {
+          "description": "Whether nonzero selector values repeat the callback.",
+          "type": "boolean"
+        },
+        "start": {
+          "$ref": "#/$defs/TimerRoutine",
+          "description": "Stock routine that starts a timer."
+        }
+      },
+      "required": [
+        "kind",
+        "period_unit",
+        "one_shot_periodic",
+        "periodic_nonzero",
+        "callback_arguments",
+        "start",
+        "cancel"
+      ],
+      "type": "object"
+    },
     "DeviceGraph": {
       "additionalProperties": false,
       "description": "Declared graph facts.",
@@ -7612,10 +7660,24 @@
       "description": "Declared cpu facts.",
       "properties": {
         "cpsr": {
-          "description": "Declared cpsr.",
+          "description": "Declared cpsr for a legacy EL1 handoff.",
           "format": "uint64",
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "entry": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FirmwareEntry"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Declared explicit entry descriptor."
         },
         "id": {
           "description": "Declared id.",
@@ -7630,8 +7692,15 @@
           "type": "integer"
         },
         "regs": {
-          "$ref": "#/$defs/FirmwareRegs",
-          "description": "Declared regs."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FirmwareRegs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Declared legacy handoff registers."
         },
         "running": {
           "description": "Declared running.",
@@ -7643,10 +7712,8 @@
         }
       },
       "required": [
-        "cpsr",
         "id",
         "pc",
-        "regs",
         "running",
         "sysregs"
       ],
@@ -7792,6 +7859,62 @@
         "size"
       ],
       "type": "object"
+    },
+    "FirmwareEntry": {
+      "additionalProperties": false,
+      "description": "Declared entry descriptor facts.",
+      "properties": {
+        "level": {
+          "$ref": "#/$defs/FirmwareEntryLevel",
+          "description": "Declared entry level."
+        },
+        "pstate": {
+          "description": "Declared entry pstate.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "regs": {
+          "additionalProperties": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "description": "Declared entry registers keyed by x0 through x30.",
+          "type": "object"
+        }
+      },
+      "required": [
+        "level",
+        "pstate",
+        "regs"
+      ],
+      "type": "object"
+    },
+    "FirmwareEntryLevel": {
+      "description": "Declared entry level.",
+      "oneOf": [
+        {
+          "const": "el1h",
+          "description": "EL1 handoff entry.",
+          "type": "string"
+        },
+        {
+          "const": "el2h",
+          "description": "EL2 entry.",
+          "type": "string"
+        },
+        {
+          "const": "el3h",
+          "description": "EL3 entry.",
+          "type": "string"
+        },
+        {
+          "const": "el3t",
+          "description": "EL3 entry with the SPSel-selected stack pointer (SP_EL0).",
+          "type": "string"
+        }
+      ]
     },
     "FirmwareFacts": {
       "additionalProperties": false,
@@ -9770,6 +9893,15 @@
           "minimum": 0,
           "type": "integer"
         },
+        "ELR_EL3": {
+          "description": "Declared ELR EL3.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "ICC_IGRPEN0_EL1": {
           "description": "Declared ICC IGRPEN0 EL1.",
           "format": "uint64",
@@ -9788,11 +9920,29 @@
           "minimum": 0,
           "type": "integer"
         },
+        "SCR_EL3": {
+          "description": "Declared SCR EL3.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "SCTLR_EL1": {
           "description": "Declared SCTLR EL1.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "SPSR_EL3": {
+          "description": "Declared SPSR EL3.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "SP_EL0": {
           "description": "Declared SP EL0.",
@@ -9805,6 +9955,15 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "SP_EL3": {
+          "description": "Declared SP EL3.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "VBAR_EL1": {
           "description": "Declared VBAR EL1.",
@@ -20647,6 +20806,17 @@
           "minimum": 0,
           "type": "integer"
         },
+        "deferred_timer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeferredTimer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Optional stock timer ABI for an autonomous deferred restart. This is\npresent only when its locator qualified a callback timer on the same\nfirmware; delivery and callback placement remain separate mechanisms."
+        },
         "parameter_bytes": {
           "description": "Bytes of sender parameters.",
           "format": "uint32",
@@ -26002,6 +26172,29 @@
       "required": [
         "bytes",
         "reset_address"
+      ],
+      "type": "object"
+    },
+    "TimerRoutine": {
+      "additionalProperties": false,
+      "description": "A bounded stock routine that Rust verifies before using the timer ABI.",
+      "properties": {
+        "address": {
+          "description": "Entry address before `code_alias`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "size": {
+          "description": "Exact routine bytes covered by the matching code check.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "address",
+        "size"
       ],
       "type": "object"
     },
