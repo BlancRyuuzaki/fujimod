@@ -31,6 +31,8 @@ mod schedule_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod translation_execution_tests;
+#[cfg(test)]
 mod translation_tests;
 #[cfg(test)]
 mod workers_tests;
