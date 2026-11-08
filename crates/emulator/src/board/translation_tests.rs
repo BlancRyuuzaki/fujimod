@@ -187,7 +187,9 @@ fn an_execute_never_page_refuses_a_fetch_but_reads() {
 }
 
 #[test]
-fn an_unmodeled_memory_attribute_refuses() {
+fn a_write_back_memory_attribute_is_ordinary_ram() {
+    // The X-H2 map marks its RAM pages with MAIR index 2 = 0xff (write-back),
+    // which must behave like any other Normal attribute without modeled caches.
     let board = translated_board();
     board
         .write_register(0, register(&board, "MAIR_EL1"), MAIR | (0xff << 16))
@@ -195,11 +197,14 @@ fn an_unmodeled_memory_attribute_refuses() {
     let mut level3 = [0u64; 512];
     level3[(MAPPED_VA >> 12) as usize] = MAPPED_PA | (2 << 2) | 0x403;
     words(&board, LEVEL3, &level3);
+    board
+        .write_physical(MAPPED_PA, b"WB!!")
+        .unwrap();
     let mut bytes = [0u8; 4];
-    let error = board
+    board
         .read_guest_memory(0, MAPPED_VA, &mut bytes)
-        .unwrap_err();
-    assert!(error.contains("memory attribute"), "{error}");
+        .unwrap();
+    assert_eq!(&bytes, b"WB!!");
 }
 
 #[test]

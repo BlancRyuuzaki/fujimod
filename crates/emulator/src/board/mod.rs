@@ -142,10 +142,9 @@ fn memory_kind(mair: u64, attribute: Option<u8>) -> Result<MemoryKind, String> {
     let attribute = ((mair >> (8 * u32::from(index & 7))) & 0xff) as u8;
     match attribute & 0xc0 {
         0x00 => Ok(MemoryKind::Device),
-        0x40 => Ok(MemoryKind::Normal),
-        _ => Err(format!(
-            "AArch64 memory attribute {attribute:#04x} is not modeled"
-        )),
+        // Write-through, write-back and allocation hints behave alike without
+        // modeled caches, so every non-Device encoding is ordinary RAM.
+        _ => Ok(MemoryKind::Normal),
     }
 }
 /// Devices and callbacks have one owner. Interactive native processors run
