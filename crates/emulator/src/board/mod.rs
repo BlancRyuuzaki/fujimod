@@ -35,6 +35,8 @@ mod translation_device_tests;
 #[cfg(test)]
 mod translation_execution_tests;
 #[cfg(test)]
+mod translation_matrix_tests;
+#[cfg(test)]
 mod translation_tests;
 #[cfg(test)]
 mod workers_tests;
