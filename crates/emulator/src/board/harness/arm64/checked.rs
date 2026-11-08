@@ -273,6 +273,21 @@ fn parse_implementation_defined_name(name: &str) -> Option<u16> {
     implementation_defined_name(encoding)?;
     Some(encoding)
 }
+/// Refuse the write that switches address translation on.
+///
+/// Every fetch and access after `SCTLR_EL1.M` is set has to walk page tables,
+/// and this harness has no translation model: continuing would keep fetching
+/// at flat addresses while claiming a checked execution. The condition is a
+/// guest register value, not a PC or a firmware global, so any routine that
+/// enables the MMU meets the same refusal at its own `MSR`.
+fn refuse_enabled_mmu(encoding: u16, value: u64, pc: u64) -> Result<(), String> {
+    if encoding == 0xc080 && value & 1 != 0 {
+        return Err(format!(
+            "Unsupported SCTLR_EL1.M set at {pc:#x}: address translation is not modeled"
+        ));
+    }
+    Ok(())
+}
 /// Canonical name for an admitted system-register encoding, used by the MSR
 /// and MRS paths to resolve the architectural register a word names.
 fn system_register_name(encoding: u16) -> Option<String> {
@@ -706,6 +721,7 @@ impl Guard {
                 } else {
                     scalar(&*cpu, Register::X((word & 31) as u8))?
                 };
+                refuse_enabled_mmu(encoding, value, pc)?;
                 self.system_state.borrow_mut().insert(encoding, value);
                 self.observed
                     .borrow_mut()
@@ -733,6 +749,7 @@ impl Guard {
             } else {
                 scalar(&*cpu, Register::X((word & 31) as u8))?
             };
+            refuse_enabled_mmu(encoding, value, pc)?;
             cpu.write_register(
                 Register::Arm64System(fujimod_emulator_cpu::arm::SystemRegister::from_encoding(
                     encoding,
@@ -1774,6 +1791,42 @@ mod tests {
         // The read never reaches the CPU: the core implements no such
         // register, so the guard retires it and the routine continues.
         assert_eq!(r.failure, None);
+    }
+    #[test]
+    fn enabling_address_translation_refuses_at_the_transition() {
+        // MOVZ x0,#1; MSR SCTLR_EL1,x0; RET. Setting SCTLR_EL1.M asks for page
+        // table walks this harness does not model, so the transition itself is
+        // the refusal: the routine must not continue at flat addresses.
+        let mut b = board(&[0xd280_0020, 0xd518_1000, 0xd65f_03c0]);
+        let mut o = options();
+        o.system_registers = vec!["SCTLR_EL1".into()];
+        let r = checked_call(&mut b, o).unwrap();
+        assert_eq!(r.instructions, 1);
+        assert!(!r.returned);
+        let failure = r.failure.unwrap();
+        assert!(failure.contains("SCTLR_EL1.M set"), "{failure}");
+        assert!(
+            failure.contains("address translation is not modeled"),
+            "{failure}"
+        );
+        assert!(failure.contains("0x1004"), "{failure}");
+    }
+    #[test]
+    fn writing_sctlr_with_translation_off_retires() {
+        // MOVZ x0,#0; MSR SCTLR_EL1,x0; RET. The same write with M clear only
+        // replaces the declared register value, so an MMU-off routine still
+        // runs to its return.
+        let mut b = board(&[0xd280_0000, 0xd518_1000, 0xd65f_03c0]);
+        let mut o = options();
+        o.system_values = vec![("SCTLR_EL1".into(), 0x30d0_0800)];
+        let r = checked_call(&mut b, o).unwrap();
+        assert!(r.returned, "{:?}", r.failure);
+        // The guard retires the serviced MSR without counting it, so the two
+        // executed words are the MOVZ and the RET.
+        assert_eq!(r.instructions, 2);
+        assert_eq!(r.system_writes.len(), 1);
+        assert_eq!(r.system_writes[0].name, "SCTLR_EL1");
+        assert_eq!(r.system_writes[0].value, 0);
     }
     #[test]
     fn declared_system_writes_update_the_declared_value() {
