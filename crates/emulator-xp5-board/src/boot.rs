@@ -101,13 +101,25 @@ pub fn startup_from_profile(
             let affinity = affinities
                 .get(&processor.id)
                 .ok_or_else(|| format!("processor {} has no MPIDR affinity", processor.id))?;
-            let mut registers = vec![(Register::Pc, cpu.pc), (Register::Pstate, cpu.cpsr)];
-            for (name, value) in [
-                ("x19", cpu.regs.x19),
-                ("x20", cpu.regs.x20),
-                ("x21", cpu.regs.x21),
-            ] {
-                insert_start_register(&mut registers, name, value)?;
+            let pstate = cpu
+                .entry
+                .as_ref()
+                .map(|entry| entry.pstate)
+                .or(cpu.cpsr)
+                .ok_or("firmware CPU declares neither an entry descriptor nor a legacy handoff")?;
+            let mut registers = vec![(Register::Pc, cpu.pc), (Register::Pstate, pstate)];
+            if let Some(entry) = &cpu.entry {
+                for (name, value) in &entry.regs {
+                    insert_start_register(&mut registers, name, *value)?;
+                }
+            } else if let Some(regs) = &cpu.regs {
+                for (name, value) in [
+                    ("x19", regs.x19),
+                    ("x20", regs.x20),
+                    ("x21", regs.x21),
+                ] {
+                    insert_start_register(&mut registers, name, value)?;
+                }
             }
             for (name, value) in serde_json::to_value(&cpu.sysregs)
                 .map_err(|error| error.to_string())?
