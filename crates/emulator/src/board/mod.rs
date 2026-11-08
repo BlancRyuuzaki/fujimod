@@ -24,8 +24,6 @@ pub mod preservation;
 mod observation_tests;
 #[cfg(test)]
 mod preservation_tests;
-#[cfg(test)]
-mod translation_tests;
 mod observe;
 mod schedule;
 #[cfg(test)]
@@ -33,13 +31,15 @@ mod schedule_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod translation_tests;
+#[cfg(test)]
 mod workers_tests;
 use bus::Bus;
 pub use fujimod_emulator_cpu::GuestProfilePhase;
 use fujimod_emulator_cpu::timeline::{Ratio, Target, Timeline};
 use fujimod_emulator_cpu::{
-    arm64, Access, Cpu, ExecutionPolicy, Exit, Hook, HookId, HookRange, Interrupt, Mmio, Model,
-    Register, Run,
+    Access, Cpu, ExecutionPolicy, Exit, Hook, HookId, HookRange, Interrupt, Mmio, Model, Register,
+    Run, arm64,
 };
 use fujimod_emulator_devices::{Host, Record};
 use serde_json::{Value, json};
@@ -124,6 +124,27 @@ struct Binding {
     mmio_callback_counts: Rc<RefCell<Vec<u64>>>,
     core: usize,
     base: u64,
+}
+/// Memory class the MAIR attribute of a translated page selects.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MemoryKind {
+    Normal,
+    Device,
+}
+/// Classify one MAIR attribute byte. `None` is the MMU-disabled Device regime.
+/// Every attribute the walker cannot classify refuses instead of guessing.
+fn memory_kind(mair: u64, attribute: Option<u8>) -> Result<MemoryKind, String> {
+    let Some(index) = attribute else {
+        return Ok(MemoryKind::Device);
+    };
+    let attribute = ((mair >> (8 * u32::from(index & 7))) & 0xff) as u8;
+    match attribute & 0xc0 {
+        0x00 => Ok(MemoryKind::Device),
+        0x40 => Ok(MemoryKind::Normal),
+        _ => Err(format!(
+            "AArch64 memory attribute {attribute:#04x} is not modeled"
+        )),
+    }
 }
 /// Devices and callbacks have one owner. Interactive native processors run
 /// concurrently between barriers; exact execution uses ordered slices.
@@ -628,10 +649,10 @@ impl Board {
     /// Resolve a guest span to physical memory through EL1 stage-1 tables.
     ///
     /// `None` means translation is disabled, so the guest address is already
-    /// physical. A translated span must reach contiguous pages inside modeled
-    /// RAM: device and host access keep the separate physical paths. Table reads
-    /// are observational, and the walker refuses every translation feature it
-    /// does not model.
+    /// physical. A translated span must reach contiguous Normal-memory pages
+    /// inside modeled RAM, and its MAIR attribute must not change inside the
+    /// span. Table reads are observational, and the walker refuses every
+    /// translation feature it does not model.
     fn translated_span(
         &self,
         core: usize,
@@ -642,12 +663,24 @@ impl Board {
         if !self.translation_enabled(core)? {
             return Ok(None);
         }
+        let mair = self.aarch64_register(core, "MAIR_EL1")?;
         let mut offset = 0;
         let mut first: Option<u64> = None;
+        let mut kind: Option<MemoryKind> = None;
         while offset < length {
             let at = address + offset;
             let state = self.translation_state(core, at)?;
-            let physical = state.translate(at, access, |table| self.table_word(table))?;
+            let (physical, attribute) = state.walk(at, access, |table| self.table_word(table))?;
+            let page = memory_kind(mair, attribute)?;
+            if let Some(kind) = kind {
+                if page != kind {
+                    return Err(format!(
+                        "AArch64 {access:?} at {address:#x}: span crosses a memory attribute change"
+                    ));
+                }
+            } else {
+                kind = Some(page);
+            }
             match first {
                 None => first = Some(physical),
                 Some(base) if physical != base + offset => {
@@ -660,6 +693,11 @@ impl Board {
             offset += (0x1000 - (at & 0xfff)).min(length - offset);
         }
         let base = first.unwrap_or(address);
+        if kind == Some(MemoryKind::Device) {
+            return Err(format!(
+                "AArch64 {access:?} at {address:#x}: translated Device access at {base:#x} is only performed by the running core's MMIO path"
+            ));
+        }
         if !self.ram_contains(base, length) {
             return Err(format!(
                 "AArch64 {access:?} at {address:#x}: translated address {base:#x} is outside modeled RAM; translated device access is not modeled"
