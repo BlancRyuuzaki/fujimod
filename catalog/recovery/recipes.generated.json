@@ -7475,7 +7475,7 @@
       }
     },
     "missing": [
-      "XP5 bindings: sd_route: expected one complete instruction contract, found 0"
+      "XP5 bindings: sd_host: expected one complete instruction contract, found 0"
     ]
   },
   {

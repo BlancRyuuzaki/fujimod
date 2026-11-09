@@ -9,7 +9,7 @@ use fujimod_emulator_parts_controls::key_input::{ControlsOptions, Key, KeyInput}
 use fujimod_emulator_xp5_board::board as xp5_board;
 use fujimod_emulator_xp5_display::display;
 use fujimod_emulator_xp5_storage::flash_storage;
-use fujimod_emulator_xp5_io::mailbox;
+use fujimod_emulator_xp5_io::{mailbox, usb_connection_status::UsbConnectionStatus};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
@@ -339,6 +339,7 @@ enum Command {
         pressed: bool,
         at: Option<u64>,
     },
+    UsbConnection { base: u64, connected: bool },
     Frames,
     Close,
 }
@@ -404,6 +405,7 @@ struct Worker {
     output_directory: PathBuf,
     archive: u64,
     unmodeled_devices: Vec<String>,
+    usb_connections: BTreeMap<u64, usize>,
     instruction_points: BTreeMap<usize, Box<board::observation::InstructionPoints>>,
 }
 impl Worker {
@@ -456,6 +458,7 @@ impl Worker {
         let mode = config.mode.runtime();
         let mut graph = DeviceGraph::new();
         let mut unmodeled_devices = vec![];
+        let mut usb_connections = BTreeMap::new();
         let (input, input_source) = match config.devices {
             Devices::Xp5 {
                 windows,
@@ -507,6 +510,12 @@ impl Worker {
                         Ok(())
                     }
                 })?;
+                for window in windows
+                    .iter()
+                    .filter(|window| window.kind == "usb-connection-status")
+                {
+                    usb_connections.insert(window.base, graph.at(window.base)?);
+                }
                 if !resources.sd.is_empty() { return Err("unused SD media configuration".into()); }
                 if !resources.displays.is_empty() {
                     return Err("unused scanout configuration".into());
@@ -614,6 +623,7 @@ impl Worker {
             output_directory: config.output_directory,
             archive: 0,
             unmodeled_devices,
+            usb_connections,
             instruction_points: BTreeMap::new(),
         })
     }
@@ -699,6 +709,18 @@ impl Worker {
                     .enqueue(Duration::from_nanos(at), Key::parse(&key)?, pressed)?;
                 self.board.inputs_changed(self.input_source)?;
                 Ok(json!({"at":at}))
+            }
+            Command::UsbConnection { base, connected } => {
+                let device = self
+                    .usb_connections
+                    .get(&base)
+                    .copied()
+                    .ok_or("no declared usb-connection-status device at this base")?;
+                self.board.device_input::<UsbConnectionStatus, _>(device, |status, _cx| {
+                    status.set_connected(connected);
+                    Ok(())
+                })?;
+                Ok(json!({"base":base,"connected":connected}))
             }
             Command::Frames => {
                 let mut frames = vec![];

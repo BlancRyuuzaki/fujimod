@@ -10,6 +10,7 @@ use std::{
 
 const RAM: u64 = 0x10000;
 const ADC: u64 = 0xff90_6000;
+const USB_STATUS: u64 = 0xff90_e300;
 const RESULT: u64 = 0x11000;
 const RELEASED: u16 = 0x456;
 
@@ -147,5 +148,90 @@ fn ladder_key_edges_reach_the_adc_the_guest_reads_and_undeclared_models_are_refu
         .call(json!({"command":"create","config":config(&directory, controls)}))
         .unwrap_err();
     assert!(error.contains("unknown variant"), "{error}");
+    worker.close();
+}
+
+fn usb_config(directory: &Path, include_usb_status: bool) -> Value {
+    let program = [0xb940_0020u32, 0xb900_0040, 0x17ff_fffe]
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
+    std::fs::write(directory.join("program.bin"), &program).unwrap();
+    let mut windows = vec![
+        json!({"kind":"adc","base":ADC,"size":0x1000,"options":{"samples":vec![RELEASED; 15]}}),
+    ];
+    let mut peripherals = vec![json!({"core":0,"address":ADC,"physical":ADC,"size":0x1000})];
+    if include_usb_status {
+        windows
+            .push(json!({"kind":"usb-connection-status","base":USB_STATUS,"size":4,"options":{}}));
+        peripherals.push(json!({"core":0,"address":USB_STATUS,"physical":USB_STATUS,"size":4}));
+    }
+    json!({
+        "schema": 1, "engine": "unicorn", "mode": "strict",
+        "instructions_per_tick": [1, 1], "quantum": 16,
+        "ram": [{"base": RAM, "size": 0x4000}],
+        "processors": [{"model": "armv8a", "released": true, "mprofile": null, "rprofile": null, "aprofile": null,
+            "registers": [{"name":"pc","value":RAM},{"name":"pstate","value":0x3c5},
+                {"name":"x1","value":USB_STATUS},{"name":"x2","value":RESULT}]}],
+        "mappings": [{"core":0,"address":RAM,"physical":RAM,"size":0x4000,"permissions":7}],
+        "peripherals": peripherals,
+        "interrupts": null,
+        "devices": {"kind":"xp5","companion":null,"storage":null,"displays":[],
+            "windows": windows,
+            "controls": ladder_keys()},
+        "images": [{"address": RAM, "asset": "program"}],
+        "assets": [{"id":"program","content":{"size":program.len(),
+            "sha256":format!("{:x}", Sha256::digest(&program))}}],
+        "inputs": {"root": directory, "files": {"program": {"kind":"file","path":"program.bin"}},
+            "max_asset_bytes": program.len()},
+        "output_directory": directory.join("frames"),
+    })
+}
+
+#[test]
+fn usb_connection_command_changes_checked_status_device_and_refuses_missing_node() {
+    let directory = directory("worker-usb-connection");
+    let mut worker = Worker::spawn();
+    worker
+        .call(json!({"command":"create","config":usb_config(&directory, true)}))
+        .unwrap();
+
+    let read_status = |worker: &mut Worker| {
+        let result = worker
+            .call(json!({"command":"run-instructions","count":3,"until":null}))
+            .unwrap();
+        assert!(result["failure"].is_null(), "{result}");
+        let memory = worker
+            .call(json!({"command":"read-memory","core":0,"address":RESULT,"size":4}))
+            .unwrap();
+        u32::from_le_bytes(
+            (0..4)
+                .map(|i| {
+                    u8::from_str_radix(&memory["hex"].as_str().unwrap()[i * 2..i * 2 + 2], 16)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+                .try_into()
+                .unwrap(),
+        )
+    };
+    assert_eq!(read_status(&mut worker), 0);
+    worker
+        .call(json!({"command":"usb-connection","base":USB_STATUS,"connected":true}))
+        .unwrap();
+    assert_eq!(read_status(&mut worker), 1);
+    worker.close();
+
+    let mut worker = Worker::spawn();
+    worker
+        .call(json!({"command":"create","config":usb_config(&directory, false)}))
+        .unwrap();
+    let error = worker
+        .call(json!({"command":"usb-connection","base":USB_STATUS,"connected":true}))
+        .unwrap_err();
+    assert!(
+        error.contains("no declared usb-connection-status"),
+        "{error}"
+    );
     worker.close();
 }
