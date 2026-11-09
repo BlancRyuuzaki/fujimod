@@ -111,9 +111,11 @@ impl Setup {
     fn verify(&self, inverted: &[u8]) -> Result<Vec<u8>> {
         let prefix = self.prefix.read(inverted)?;
         require(
-            prefix.len() == 0x40000
-                && self.low_length >= 4
-                && self.low_length <= prefix.len() - 0x800,
+            self.low_length >= 4
+                && prefix
+                    .len()
+                    .checked_sub(0x800)
+                    .is_some_and(|available| self.low_length <= available),
             "XP5 prefix extent differs",
         )?;
         require(
@@ -578,6 +580,13 @@ mod tests {
         let mut ram = data[0x40000..].to_vec();
         put64(&mut ram, 0x40, 0).unwrap();
         (data, setup, ram)
+    }
+    #[test]
+    fn source_checked_setup_prefix_uses_its_declared_extent() {
+        let (data, mut setup, _) = fixture();
+        setup.prefix = source(&data[..0x28000]);
+        setup.proofs[0].source = setup.prefix.clone();
+        assert!(setup.verify(&data).is_ok());
     }
     #[test]
     fn startup_skips_installed_flash_probe_while_stage_one_preserves_it() {
