@@ -1,8 +1,8 @@
 //! I2C1 battery/power clients. Address36 is the gauge;66/68 retain
 //! power-control writes.
 //! Other addresses NACK. No device identity or unsolicited ID is invented.
-use fujimod_emulator_parts_io::power_controller::FuelGauge;
 use fujimod_emulator_devices::{Cx, Device};
+use fujimod_emulator_parts_io::power_controller::FuelGauge;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -166,5 +166,104 @@ impl Device for BatteryI2c {
         *self = serde_json::from_value(state.clone())
             .map_err(|e| format!("invalid I2C battery checkpoint: {e}"))?;
         Ok(())
+    }
+}
+
+/// Register-only controller for an explicitly declared idle bus.
+#[derive(Serialize, Deserialize)]
+pub struct IdleI2c {
+    base: u64,
+    idle_lines: u32,
+    regs: [u32; 8],
+}
+
+impl IdleI2c {
+    pub fn new(base: u64, idle_lines: u32) -> Result<Self, String> {
+        if base & 3 != 0 || idle_lines & !0x30 != 0 {
+            return Err("invalid idle I2C configuration".into());
+        }
+        Ok(Self {
+            base,
+            idle_lines,
+            regs: [0; 8],
+        })
+    }
+
+    fn index(&self, address: u64, size: u8) -> Option<usize> {
+        let offset = address.checked_sub(self.base)?;
+        (matches!(size, 1 | 4) && offset <= 0x1c && offset & 3 == 0).then_some(offset as usize / 4)
+    }
+}
+
+impl Device for IdleI2c {
+    fn name(&self) -> &'static str {
+        "i2c-idle"
+    }
+
+    fn read(&mut self, cx: &mut Cx<'_>, address: u64, size: u8) -> u64 {
+        let Some(index) = self.index(address, size) else {
+            cx.unmodeled();
+            return 0;
+        };
+        let value = if index == 7 {
+            (self.regs[index] & !0x30) | self.idle_lines
+        } else {
+            self.regs[index]
+        };
+        if size == 1 {
+            u64::from(value & 0xff)
+        } else {
+            u64::from(value)
+        }
+    }
+
+    fn write(&mut self, cx: &mut Cx<'_>, address: u64, size: u8, value: u64) {
+        let Some(index) = self.index(address, size) else {
+            cx.unmodeled();
+            return;
+        };
+        let value = if size == 1 {
+            (self.regs[index] & !0xff) | (value as u32 & 0xff)
+        } else {
+            value as u32
+        };
+        if index == 1 && value & 0x12 == 0x12 {
+            cx.unmodeled();
+            return;
+        }
+        self.regs[index] = value;
+    }
+
+    fn save(&self) -> Value {
+        serde_json::to_value(self).unwrap()
+    }
+    fn restore(&mut self, state: &Value) -> Result<(), String> {
+        let saved: Self = serde_json::from_value(state.clone())
+            .map_err(|e| format!("invalid idle I2C checkpoint: {e}"))?;
+        if saved.base != self.base || saved.idle_lines != self.idle_lines {
+            return Err("idle I2C checkpoint configuration differs".into());
+        }
+        self.regs = saved.regs;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+    use fujimod_emulator_devices::test_host::recording::RecordingHost;
+
+    #[test]
+    fn recovery_registers_and_declared_idle_lines_refuse_transfers() {
+        let mut device = IdleI2c::new(0xff926000, 0x30).unwrap();
+        let mut host = RecordingHost::default();
+        let mut cx = Cx::new(&mut host, 0, 0, 0);
+        device.write(&mut cx, 0xff926018, 1, 3);
+        assert_eq!(device.read(&mut cx, 0xff926018, 1), 3);
+        device.write(&mut cx, 0xff92601c, 4, 1);
+        assert_eq!(device.read(&mut cx, 0xff92601c, 4), 0x31);
+        assert!(cx.refusal().is_none());
+        device.write(&mut cx, 0xff926004, 4, 0x12);
+        assert!(cx.refusal().is_some());
     }
 }

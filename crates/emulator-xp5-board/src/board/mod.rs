@@ -117,6 +117,25 @@ fn register_with_resources(
                 )?),
             )?;
         }
+        "i2c-idle" => {
+            if window.base != 0xff926000 || window.size != 0x1000 {
+                return Err("invalid idle I2C window".into());
+            }
+            if window.options.keys().any(|key| key != "idle_lines") {
+                return Err("unknown idle I2C option".into());
+            }
+            let idle_lines = window
+                .options
+                .get("idle_lines")
+                .and_then(toml::Value::as_integer)
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or("idle I2C requires idle_lines")?;
+            bus.register(
+                window.base,
+                window.size,
+                Box::new(i2c::IdleI2c::new(window.base, idle_lines)?),
+            )?;
+        }
         "battery-i2c" => {
             if window.base != 0xff925000 || window.size != 0x1000 {
                 return Err("invalid battery I2C1 window".into());
@@ -519,10 +538,7 @@ pub fn register_all(
                     .and_then(|n| u32::try_from(n).ok())
                     .filter(|n| *n <= 0xffffff)
                     .ok_or("flash storage-controller requires jedec_id")?;
-                // Current opcode geometry comes from the 20bb20 descriptor.
-                if jedec != 0x20bb20 {
-                    return Err("only 0x20bb20 flash geometry is supported".into());
-                }
+                let descriptor = flash_storage_controller::Descriptor::for_jedec(jedec)?;
                 bus.register(
                     w.base,
                     w.size,
@@ -531,7 +547,7 @@ pub fn register_all(
                             .storage
                             .clone()
                             .ok_or("controller requires flash storage aperture")?,
-                        jedec,
+                        descriptor,
                     )),
                 )?;
             }

@@ -14,13 +14,60 @@ struct State {
     rx_fifo: std::collections::VecDeque<u8>,
     configuration_complete: bool,
 }
+/// Explicit command vocabulary and erase geometry for a selected NOR device.
+#[derive(Clone, Copy)]
+pub struct Descriptor {
+    jedec: u32,
+    reads: &'static [u8],
+    programs: &'static [u8],
+    erases: &'static [(u8, usize)],
+}
+impl Descriptor {
+    pub fn for_jedec(jedec: u32) -> Result<Self, String> {
+        let (reads, programs, erases): (&[u8], &[u8], &[(u8, usize)]) = match jedec {
+            0x20bb20 => (
+                &[0x03, 0x13, 0x0b, 0x0c, 0xeb, 0xec],
+                &[0x02, 0x12, 0x32, 0x34],
+                &[
+                    (0x20, 0x1000),
+                    (0x21, 0x1000),
+                    (0xd8, 0x10000),
+                    (0xdc, 0x10000),
+                ],
+            ),
+            0x2c5b1b => (
+                &[0x13, 0xfd, 0xcc],
+                &[0x12],
+                &[(0x21, 0x1000), (0xdc, 0x20000)],
+            ),
+            _ => return Err(format!("unsupported serial-flash descriptor {jedec:#x}")),
+        };
+        Ok(Self {
+            jedec,
+            reads,
+            programs,
+            erases,
+        })
+    }
+    fn reads(self, cmd: u8) -> bool {
+        self.reads.contains(&cmd)
+    }
+    fn programs(self, cmd: u8) -> bool {
+        self.programs.contains(&cmd)
+    }
+    fn erase_size(self, cmd: u8) -> Option<usize> {
+        self.erases
+            .iter()
+            .find_map(|&(opcode, size)| (opcode == cmd).then_some(size))
+    }
+}
 pub struct Controller {
     state: State,
     flash_storage: Shared,
-    jedec: u32,
+    descriptor: Descriptor,
 }
 impl Controller {
-    pub fn new(flash_storage: Shared, jedec: u32) -> Self {
+    pub fn new(flash_storage: Shared, descriptor: Descriptor) -> Self {
         let mut regs = vec![0; 64];
         regs[0x10 / 4] = 0x10001; // Explicit inherited enabled/idle controller assumption.
         Self {
@@ -34,7 +81,7 @@ impl Controller {
                 configuration_complete: false,
             },
             flash_storage,
-            jedec,
+            descriptor,
         }
     }
     fn known(o: u64) -> bool {
@@ -93,14 +140,14 @@ impl Controller {
                 flash_storage.session.write_enable = false;
                 self.state.complete = true;
             }
-            0x05 | 0x9f | 0x03 | 0x13 | 0x0b | 0x0c | 0xeb | 0xec => {
+            cmd if cmd == 0x05 || cmd == 0x9f || self.descriptor.reads(cmd) => {
                 let count = (self.state.regs[0xa0 / 4] & 0x7ff) as usize + 1;
                 self.state.rx_fifo = match cmd {
                     0x05 => vec![(flash_storage.session.write_enable as u8) << 1; count].into(),
                     0x9f => (0..count)
                         .map(|i| {
                             if i < 3 {
-                                (self.jedec >> (16 - i * 8)) as u8
+                                (self.descriptor.jedec >> (16 - i * 8)) as u8
                             } else {
                                 0xff
                             }
@@ -112,13 +159,9 @@ impl Controller {
                 };
                 self.state.complete = true;
             }
-            0x02 | 0x12 | 0x32 | 0x34 => {}
-            0x20 | 0x21 | 0xd8 | 0xdc => {
-                let size = if cmd == 0x20 || cmd == 0x21 {
-                    0x1000
-                } else {
-                    0x10000
-                };
+            cmd if self.descriptor.programs(cmd) => {}
+            cmd if self.descriptor.erase_size(cmd).is_some() => {
+                let size = self.descriptor.erase_size(cmd).unwrap();
                 flash_storage.erase(self.state.regs[0x50 / 4] as u64, size)?;
                 self.state.complete = true;
             }
@@ -127,7 +170,7 @@ impl Controller {
         Ok(())
     }
     fn stop(&mut self) -> Result<(), String> {
-        if matches!(self.cmd(), 0x02 | 0x12 | 0x32 | 0x34) && !self.state.tx.is_empty() {
+        if self.descriptor.programs(self.cmd()) && !self.state.tx.is_empty() {
             self.flash_storage
                 .lock()
                 .unwrap()
@@ -152,12 +195,12 @@ impl Controller {
             0x05 => (s.session.write_enable as u8) << 1,
             0x9f => {
                 if self.state.cursor < 3 {
-                    (self.jedec >> (16 - self.state.cursor * 8)) as u8
+                    (self.descriptor.jedec >> (16 - self.state.cursor * 8)) as u8
                 } else {
                     0xff
                 }
             }
-            0x03 | 0x13 | 0x0b | 0x0c | 0xeb | 0xec => s.read_device(
+            cmd if self.descriptor.reads(cmd) => s.read_device(
                 self.state.regs[0x50 / 4] as u64 + self.state.cursor as u64,
                 1,
             )?[0],
@@ -206,10 +249,8 @@ impl Device for Controller {
             0xf0 => {
                 let receive = !self.state.rx_fifo.is_empty()
                     || (self.state.active
-                        && matches!(
-                            self.cmd(),
-                            0x05 | 0x9f | 0x03 | 0x13 | 0x0b | 0x0c | 0xeb | 0xec
-                        ));
+                        && (matches!(self.cmd(), 0x05 | 0x9f)
+                            || self.descriptor.reads(self.cmd())));
                 let complete = self.state.complete
                     || self
                         .flash_storage
@@ -232,7 +273,7 @@ impl Device for Controller {
         let v = v as u32;
         let result = match o {
             0x80 => {
-                if !self.state.active || !matches!(self.cmd(), 0x02 | 0x12 | 0x32 | 0x34) {
+                if !self.state.active || !self.descriptor.programs(self.cmd()) {
                     Err("unsupported flash storage FIFO write".into())
                 } else {
                     self.state.tx.push(v as u8);
@@ -277,7 +318,7 @@ impl Device for Controller {
                 }
                 if o == 0x48 {
                     self.flash_storage.lock().unwrap().session.program_mode =
-                        matches!(v as u8, 0x02 | 0x12 | 0x32 | 0x34);
+                        self.descriptor.programs(v as u8);
                 }
                 Ok(())
             }
@@ -303,9 +344,66 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
+    fn selected_descriptors_enforce_commands_and_erase_geometry() {
+        assert!(Descriptor::for_jedec(0xabcdef).is_err());
+        for (id, large) in [(0x20bb20, 0x10000), (0x2c5b1b, 0x20000)] {
+            let storage = Arc::new(Mutex::new(Storage::new(vec![0; 0x50000]).unwrap()));
+            let descriptor = Descriptor::for_jedec(id).unwrap();
+            let mut c = Controller::new(storage.clone(), descriptor);
+            c.state.regs[0] = 1;
+            let issue = |c: &mut Controller, op| {
+                c.state.regs[0x40 / 4] = op;
+                c.begin()
+            };
+            c.state.regs[0xa0 / 4] = 2;
+            issue(&mut c, 0x9f).unwrap();
+            assert_eq!(
+                (0..3).map(|_| c.rx().unwrap()).collect::<Vec<_>>(),
+                vec![(id >> 16) as u8, (id >> 8) as u8, id as u8]
+            );
+            c.state.regs[0x50 / 4] = 0x1000;
+            issue(&mut c, 0x06).unwrap();
+            issue(&mut c, 0x21).unwrap();
+            assert_eq!(storage.lock().unwrap().read(0xfff, 0x1002).unwrap()[0], 0);
+            assert_eq!(
+                storage.lock().unwrap().read(0x1000, 0x1000).unwrap(),
+                vec![0xff; 0x1000]
+            );
+            c.state.regs[0x50 / 4] = 0x20000;
+            issue(&mut c, 0x06).unwrap();
+            issue(&mut c, 0xdc).unwrap();
+            assert_eq!(
+                storage
+                    .lock()
+                    .unwrap()
+                    .read(0x20000 + large - 1, 2)
+                    .unwrap(),
+                [0xff, 0]
+            );
+            c.state.regs[0x50 / 4] = 0x1000;
+            issue(&mut c, 0x06).unwrap();
+            issue(&mut c, 0x12).unwrap();
+            c.state.tx = vec![0x5a];
+            c.stop().unwrap();
+            issue(&mut c, 0x13).unwrap();
+            assert_eq!(c.rx().unwrap(), 0x5a);
+            assert!(issue(&mut c, 0xc7).is_err());
+            if id == 0x2c5b1b {
+                assert!(issue(&mut c, 0xd8).is_err());
+                assert!(issue(&mut c, 0x03).is_err());
+                issue(&mut c, 0xfd).unwrap();
+                assert_eq!(c.rx().unwrap(), 0x5a);
+                issue(&mut c, 0xcc).unwrap();
+                assert_eq!(c.rx().unwrap(), 0x5a);
+            }
+        }
+    }
+
+    #[test]
     fn pio_reads_count_transferred_bytes_once_and_exclude_identity_commands() {
         let storage = Arc::new(Mutex::new(Storage::new((0..32).collect()).unwrap()));
-        let mut controller = Controller::new(storage.clone(), 0xef4018);
+        let mut controller =
+            Controller::new(storage.clone(), Descriptor::for_jedec(0x20bb20).unwrap());
         controller.state.regs[0] = 1;
         controller.state.regs[0x40 / 4] = 0x03;
         controller.state.regs[0x50 / 4] = 8;
@@ -320,7 +418,7 @@ mod tests {
         assert_eq!(storage.lock().unwrap().session.reads.ranges, [(8, 13)]);
         controller.state.regs[0x40 / 4] = 0x9f;
         controller.begin().unwrap();
-        assert_eq!(controller.rx().unwrap(), 0xef);
+        assert_eq!(controller.rx().unwrap(), 0x20);
         assert_eq!(storage.lock().unwrap().session.reads.bytes, 5);
     }
 }
