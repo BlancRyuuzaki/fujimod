@@ -19,6 +19,7 @@ fn options(protocol: Protocol, initialization_fault: InitializationFault) -> Opt
         initialization_fault,
         high_speed: false,
         ram_banks: vec![],
+        capabilities_1: None,
     }
 }
 

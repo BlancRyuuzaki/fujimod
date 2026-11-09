@@ -10,6 +10,8 @@ struct State {
     base: u64,
     size: u64,
     width: u8,
+    #[serde(default)]
+    allowed_values: Option<Vec<u32>>,
     registers: BTreeMap<u64, u32>,
 }
 
@@ -18,12 +20,18 @@ pub struct WriteOnlyRegisters {
 }
 
 impl WriteOnlyRegisters {
-    pub fn new(base: u64, size: u64, width: u8) -> Result<Self, String> {
+    pub fn new(
+        base: u64,
+        size: u64,
+        width: u8,
+        allowed_values: Option<Vec<u32>>,
+    ) -> Result<Self, String> {
         if !matches!(width, 2 | 4)
             || base % u64::from(width) != 0
             || size == 0
             || size % u64::from(width) != 0
             || base.checked_add(size).is_none()
+            || !Self::allowed_values_valid(width, allowed_values.as_deref())
         {
             return Err("invalid write-only register window".into());
         }
@@ -32,9 +40,21 @@ impl WriteOnlyRegisters {
                 base,
                 size,
                 width,
+                allowed_values,
                 registers: BTreeMap::new(),
             },
         })
+    }
+
+    fn allowed_values_valid(width: u8, allowed_values: Option<&[u32]>) -> bool {
+        let Some(values) = allowed_values else {
+            return true;
+        };
+        let max_value = u32::MAX >> (8 * (4 - width));
+        !values.is_empty()
+            && values.iter().enumerate().all(|(index, value)| {
+                *value <= max_value && !values[..index].contains(value)
+            })
     }
 
     fn valid_register_offset(&self, offset: u64) -> bool {
@@ -49,6 +69,8 @@ impl WriteOnlyRegisters {
         if state.base != self.state.base
             || state.size != self.state.size
             || state.width != self.state.width
+            || state.allowed_values != self.state.allowed_values
+            || !Self::allowed_values_valid(state.width, state.allowed_values.as_deref())
             || state
                 .registers
                 .keys()
@@ -57,6 +79,9 @@ impl WriteOnlyRegisters {
                 .registers
                 .values()
                 .any(|value| u64::from(*value) > self.max_value())
+            || state.allowed_values.as_ref().is_some_and(|allowed| {
+                state.registers.values().any(|value| !allowed.contains(value))
+            })
         {
             return Err("invalid write-only register checkpoint".into());
         }
@@ -82,7 +107,14 @@ impl Device for WriteOnlyRegisters {
             cx.unmodeled();
             return;
         };
-        if size != self.state.width || value > self.max_value() {
+        if size != self.state.width
+            || value > self.max_value()
+            || self
+                .state
+                .allowed_values
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(&(value as u32)))
+        {
             cx.unmodeled();
             return;
         }
@@ -129,7 +161,7 @@ mod tests {
     #[test]
     fn selected_halfword_width_preserves_write_only_state_and_word_default() {
         let mut host = RecordingHost::default();
-        let mut halfwords = WriteOnlyRegisters::new(0x1000, 0x20, 2).unwrap();
+        let mut halfwords = WriteOnlyRegisters::new(0x1000, 0x20, 2, None).unwrap();
         halfwords.write(&mut Cx::new(&mut host, 0, 0, 0), 0x1002, 2, 0xabcd);
         let before_refusal = halfwords.save();
 
@@ -150,7 +182,7 @@ mod tests {
         assert!(cx.is_unmodeled());
 
         let checkpoint = halfwords.checkpoint().unwrap();
-        let mut restored = WriteOnlyRegisters::new(0x1000, 0x20, 2).unwrap();
+        let mut restored = WriteOnlyRegisters::new(0x1000, 0x20, 2, None).unwrap();
         restored.validate_checkpoint(&checkpoint).unwrap();
         restored.restore_checkpoint(&checkpoint).unwrap();
         assert_eq!(restored.save(), before_refusal);
@@ -159,10 +191,48 @@ mod tests {
         assert!(restored.restore(&invalid).is_err());
         assert_eq!(restored.save(), before_refusal);
 
-        let mut words = WriteOnlyRegisters::new(0x2000, 0x20, 4).unwrap();
+        let mut words = WriteOnlyRegisters::new(0x2000, 0x20, 4, None).unwrap();
         words.write(&mut Cx::new(&mut host, 0, 0, 0), 0x2004, 4, 0x1234_5678);
         assert_eq!(words.save()["registers"]["4"], 0x1234_5678);
-        assert!(WriteOnlyRegisters::new(0x1001, 0x20, 2).is_err());
-        assert!(WriteOnlyRegisters::new(0x1000, 0x20, 1).is_err());
+        assert!(WriteOnlyRegisters::new(0x1001, 0x20, 2, None).is_err());
+        assert!(WriteOnlyRegisters::new(0x1000, 0x20, 1, None).is_err());
+    }
+
+    #[test]
+    fn exact_allowed_values_refuse_other_writes_and_bind_checkpoint_policy() {
+        let mut host = RecordingHost::default();
+        let mut device = WriteOnlyRegisters::new(0x3000, 4, 4, Some(vec![1])).unwrap();
+
+        let mut cx = Cx::new(&mut host, 0, 0, 0);
+        device.write(&mut cx, 0x3000, 4, 1);
+        assert!(cx.refusal().is_none());
+        let saved = device.save();
+
+        let mut cx = Cx::new(&mut host, 0, 0, 0);
+        device.write(&mut cx, 0x3000, 4, 2);
+        assert!(cx.is_unmodeled());
+        assert_eq!(device.save(), saved);
+
+        let mut cx = Cx::new(&mut host, 0, 0, 0);
+        device.read(&mut cx, 0x3000, 4);
+        assert!(cx.is_unmodeled());
+        let mut cx = Cx::new(&mut host, 0, 0, 0);
+        device.write(&mut cx, 0x3000, 2, 1);
+        assert!(cx.is_unmodeled());
+
+        let checkpoint = device.checkpoint().unwrap();
+        let mut restored = WriteOnlyRegisters::new(0x3000, 4, 4, Some(vec![1])).unwrap();
+        restored.validate_checkpoint(&checkpoint).unwrap();
+        restored.restore_checkpoint(&checkpoint).unwrap();
+        assert_eq!(restored.save(), saved);
+
+        let different_policy = WriteOnlyRegisters::new(0x3000, 4, 4, None).unwrap();
+        assert!(different_policy.validate_checkpoint(&checkpoint).is_err());
+        let mut invalid_state = saved.clone();
+        invalid_state["registers"]["0"] = serde_json::json!(2);
+        assert!(restored.restore(&invalid_state).is_err());
+        assert_eq!(restored.save(), saved);
+        assert!(WriteOnlyRegisters::new(0x3000, 4, 4, Some(Vec::new())).is_err());
+        assert!(WriteOnlyRegisters::new(0x3000, 4, 4, Some(vec![1, 1])).is_err());
     }
 }

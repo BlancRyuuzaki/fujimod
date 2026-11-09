@@ -54,6 +54,9 @@ pub struct Options {
     /// Further DRAM banks SDMA reaches: (physical base, bytes).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ram_banks: Vec<(u64, u64)>,
+    /// Explicit SDHCI Capabilities 1 register input.
+    #[serde(default)]
+    pub capabilities_1: Option<u32>,
 }
 const MAX_DATA_FAULTS: usize = 32;
 const COMMAND_TIMEOUT_ERROR: u16 = 1;
@@ -199,7 +202,7 @@ impl SdHost {
         contacts: Contacts,
         irq: Option<InterruptLine>,
     ) -> Result<Self, String> {
-        if options.base & 0xfff != 0
+        if options.base & 3 != 0
             || options.base > 0xffffe000
             || options.transfer_ticks == 0
             || options.rca == 0
@@ -974,6 +977,9 @@ impl SdHost {
         if cx.refusal().is_some() {
             return 0;
         }
+        if offset == 0x44 {
+            return u64::from(self.options.capabilities_1.unwrap());
+        }
         if offset == 0x20 {
             return match self.pio(cx, None) {
                 Ok(v) => v as u64,
@@ -1045,6 +1051,7 @@ impl SdHost {
                         | (0x2e, 1)
                         | (0x2f, 1)
                 )
+                || self.options.capabilities_1.is_some() && (offset, size) == (0x44, 4)
         } else if self.options.protocol == Protocol::Application {
             Registers::valid(offset, size)
         } else {
@@ -1078,7 +1085,7 @@ impl SdHost {
         value: u32,
     ) -> Result<(), String> {
         let rom = self.options.protocol == Protocol::Rom;
-        if offset == 0x24 || offset == 0x3c || (16..32).contains(&offset) {
+        if offset == 0x24 || offset == 0x3c || offset == 0x44 || (16..32).contains(&offset) {
             return Err("SD response/present-state/auto-command status is read-only".into());
         }
         if offset == 0x20 {
@@ -1171,11 +1178,11 @@ impl SdHost {
         // cards; GFX 50R 0xcac8e4 sets them. They are stored with no effect.
         if offset == 0x28 && !rom && value & !0xffff != 0
             || offset == 4 && value & 0x8000 != 0
-            // Host-control-2 bit 8 (UHS-II interface enable) and UHS mode 7
-            // (UHS-II) are SDHCI 4 UHS-II selections; GFX 50R 0xcac788 probes
-            // them. A default-speed card has no UHS-II lanes, so they select
-            // nothing; other UHS modes and tuning still refuse.
-            || offset == 0x3e && value & !0x100 != 0 && value & !0x107 != 0
+            // Host-control-2 bit 8 (UHS-II interface enable), bit 12 (Host
+            // Version 4 Enable), mode 7 and driver-strength bits 4-5 are
+            // retained without changing card signaling. Other UHS modes and
+            // tuning still refuse.
+            || offset == 0x3e && value & !0x1137 != 0
             || offset == 0x3e && value & 7 != 0 && value & 7 != 7
             || offset == 0x100 && value & !7 != 0
             || offset == 0x104 && value != 0
@@ -1204,6 +1211,7 @@ struct Snapshot {
     reads: StorageReads,
     contacts: u8,
     initialization_fault: InitializationFault,
+    capabilities_1: Option<u32>,
     regs: Registers,
     clocks: Clocks,
     state: State,
@@ -1240,6 +1248,7 @@ impl Device for SdHost {
             reads: &'a StorageReads,
             contacts: u8,
             initialization_fault: InitializationFault,
+            capabilities_1: Option<u32>,
             regs: &'a Registers,
             clocks: &'a Clocks,
             state: State,
@@ -1265,6 +1274,7 @@ impl Device for SdHost {
                 reads: &self.reads,
                 contacts: self.contacts.checkpoint_level(),
                 initialization_fault: self.options.initialization_fault,
+                capabilities_1: self.options.capabilities_1,
                 regs: &self.regs,
                 clocks: &self.clocks,
                 state: self.state,
@@ -1290,6 +1300,9 @@ impl Device for SdHost {
         let state: Snapshot = saved.decode(self.name())?;
         if state.initialization_fault != self.options.initialization_fault {
             return Err("SD initialization fault policy differs".into());
+        }
+        if state.capabilities_1 != self.options.capabilities_1 {
+            return Err("SD Capabilities 1 input differs".into());
         }
         state
             .reads
@@ -1342,7 +1355,7 @@ impl Device for SdHost {
             "clocks":self.clocks.save(),"state":self.state,"app":self.app,"block_length":self.block_length,"bus_width":self.bus_width,
             "response":self.response,"request":request,"fifo":fujimod_emulator_devices::fingerprint::bytes(&fifo),"scratch":fujimod_emulator_devices::fingerprint::bytes(&self.scratch),
             "fifo_position":fifo_position,"rom_fifo_ready":self.rom_fifo_ready,
-            "initialization_fault":self.options.initialization_fault,"faults":self.faults,"fault_history":self.fault_history});
+            "initialization_fault":self.options.initialization_fault,"capabilities_1":self.options.capabilities_1,"faults":self.faults,"fault_history":self.fault_history});
         if self.access_mode != 0 {
             value["access_mode"] = self.access_mode.into();
         }
@@ -1442,6 +1455,7 @@ impl Device for SdHost {
             "request":self.request.as_ref().map(|r| serde_json::json!({"command":r.command,
                 "cursor":r.cursor,"quantity":r.quantity,"deadline":r.due})),
             "clocks":self.clocks.save(), "initialization_fault":self.options.initialization_fault,
+            "capabilities_1":self.options.capabilities_1,
             "data_faults":self.faults, "fault_history":self.fault_history
         })
     }
@@ -1507,6 +1521,13 @@ mod tests {
         host_at(protocol, BASE)
     }
     fn host_at(protocol: Protocol, base: u64) -> SdHost {
+        host_with_capabilities(protocol, base, None)
+    }
+    fn host_with_capabilities(
+        protocol: Protocol,
+        base: u64,
+        capabilities_1: Option<u32>,
+    ) -> SdHost {
         SdHost::new(
             Options {
                 base,
@@ -1518,6 +1539,7 @@ mod tests {
                 initialization_fault: InitializationFault::None,
                 high_speed: false,
                 ram_banks: vec![],
+                capabilities_1,
             },
             Wiring {
                 card: Card::new(sd_card::Options {
@@ -1530,6 +1552,94 @@ mod tests {
             },
         )
         .unwrap()
+    }
+    #[test]
+    fn host_control_2_works_at_word_aligned_base() {
+        use fujimod_emulator_devices::test_host::recording::RecordingHost;
+
+        let mut host = host_at(Protocol::Sdhc, 0xff9b2200);
+        let mut recording = RecordingHost::default();
+        let mut cx = Cx::new(&mut recording, 0, 0, 0);
+        host.write(&mut cx, 0xff9b223e, 2, 0x100);
+        assert_eq!(cx.refusal(), None);
+        assert_eq!(host.read(&mut cx, 0xff9b223e, 2), 0x100);
+
+        let options = Options {
+            base: 0xff9b2202,
+            protocol: Protocol::Sdhc,
+            transfer_ticks: 10,
+            clock_ticks: 2,
+            rca: 0x1234,
+            ram_bytes: 0x10000,
+            initialization_fault: InitializationFault::None,
+            high_speed: false,
+            ram_banks: vec![],
+            capabilities_1: None,
+        };
+        let wiring = Wiring {
+            card: Card::new(sd_card::Options {
+                sectors: 0x800000,
+                max_dirty_sectors: 65536,
+            })
+            .unwrap(),
+            contacts: Contacts::new(true, false),
+            irq: InterruptLine::Shared(78),
+        };
+        assert!(SdHost::new(options, wiring).is_err());
+    }
+    #[test]
+    fn host_control_2_retains_driver_strength_and_permitted_interface_bits() {
+        use fujimod_emulator_devices::test_host::recording::RecordingHost;
+
+        let mut host = host(Protocol::Sdhc);
+        let mut recording = RecordingHost::default();
+        let mut cx = Cx::new(&mut recording, 0, 0, 0);
+        host.write(&mut cx, BASE + 0x3e, 2, 0x1100);
+        assert_eq!(cx.refusal(), None);
+        assert_eq!(host.read(&mut cx, BASE + 0x3e, 2), 0x1100);
+        host.write(&mut cx, BASE + 0x3e, 2, 0x1130);
+        assert_eq!(cx.refusal(), None);
+        assert_eq!(host.read(&mut cx, BASE + 0x3e, 2), 0x1130);
+        host.write(&mut cx, BASE + 0x3e, 2, 0x30);
+        assert_eq!(cx.refusal(), None);
+        assert_eq!(host.read(&mut cx, BASE + 0x3e, 2), 0x30);
+
+        let mut unsupported_host = RecordingHost::default();
+        let mut unsupported_cx = Cx::new(&mut unsupported_host, 0, 0, 0);
+        host.write(&mut unsupported_cx, BASE + 0x3e, 2, 0x40);
+        assert!(unsupported_cx.refusal().is_some());
+    }
+    #[test]
+    fn capabilities_1_is_an_explicit_read_only_host_input() {
+        use fujimod_emulator_devices::test_host::recording::RecordingHost;
+
+        for (capabilities_1, expected) in [(Some(0), Some(0)), (Some(8), Some(8)), (None, None)] {
+            let mut host = host_with_capabilities(Protocol::Sdhc, BASE, capabilities_1);
+            let mut recording = RecordingHost::default();
+            let mut cx = Cx::new(&mut recording, 0, 0, 0);
+            let value = host.read(&mut cx, BASE + 0x44, 4);
+            match expected {
+                Some(expected) => {
+                    assert_eq!(value, expected);
+                    assert_eq!(cx.refusal(), None);
+                    host.write(&mut cx, BASE + 0x44, 4, expected);
+                    assert!(cx.refusal().is_some());
+
+                    let mut width_host =
+                        host_with_capabilities(Protocol::Sdhc, BASE, Some(expected as u32));
+                    let mut width_recording = RecordingHost::default();
+                    let mut width_cx = Cx::new(&mut width_recording, 0, 0, 0);
+                    assert_eq!(width_host.read(&mut width_cx, BASE + 0x44, 2), 0);
+                    assert!(width_cx.refusal().is_some());
+                }
+                None => assert!(cx.refusal().is_some()),
+            }
+        }
+        let cap8 = host_with_capabilities(Protocol::Sdhc, BASE, Some(8));
+        let cap0 = host_with_capabilities(Protocol::Sdhc, BASE, Some(0));
+        let saved = cap8.checkpoint().unwrap();
+        assert!(cap0.validate_checkpoint(&saved).is_err());
+        assert_ne!(cap8.fingerprint().unwrap(), cap0.fingerprint().unwrap());
     }
     #[test]
     fn rca_commands_ignore_reserved_bits_but_keep_card_selection() {

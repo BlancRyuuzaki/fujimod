@@ -11,6 +11,7 @@ pub mod mailbox;
 pub mod memory_configuration;
 pub mod output_link;
 pub mod reset_handshake;
+pub mod sd_controller_wrapper;
 pub mod sd_interface;
 pub mod spi;
 pub mod temperature;

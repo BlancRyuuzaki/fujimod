@@ -3,8 +3,8 @@
 use fujimod_emulator_devices::graph::{DeviceGraph, DeviceWindow};
 use fujimod_emulator_devices::parts::controls::Controls;
 use fujimod_emulator_xp5_io::{
-    adc, discarded_read, gates, gpio, i2c, mailbox, memory_configuration, reset_handshake, timer,
-    usb_connection_status, write_only_registers,
+    adc, discarded_read, gates, gpio, i2c, mailbox, memory_configuration, reset_handshake,
+    sd_controller_wrapper, timer, usb_connection_status, write_only_registers,
 };
 use fujimod_emulator_xp5_display::{display, panel_clock, panel_serial};
 use fujimod_emulator_xp5_storage::{flash_storage, flash_storage_controller, flash_storage_dma};
@@ -49,6 +49,39 @@ fn register_with_resources(
         "sd-interface" => {
             if window.size != 8 || !window.options.is_empty() {return Err("Invalid SD interface window".into());}
             bus.register(window.base,window.size,Box::new(fujimod_emulator_xp5_io::sd_interface::Interface::new(window.base)?))?;
+        }
+        "sd-controller-wrapper" => {
+            if window.size != 4
+                || window.options.keys().any(|key| !matches!(key.as_str(), "initial_word" | "writable_mask" | "write_width" | "readable"))
+            {
+                return Err("invalid SD controller wrapper window or options".into());
+            }
+            let integer = |key: &str| -> Result<u32, String> {
+                window.options.get(key)
+                    .and_then(toml::Value::as_integer)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| format!("SD controller wrapper requires {key}"))
+            };
+            let write_width = window.options.get("write_width")
+                .and_then(toml::Value::as_integer)
+                .and_then(|value| u8::try_from(value).ok())
+                .filter(|width| matches!(width, 2 | 4))
+                .ok_or("SD controller wrapper requires write_width 2 or 4")?;
+            let readable = window.options.get("readable")
+                .and_then(toml::Value::as_bool)
+                .ok_or("SD controller wrapper requires readable")?;
+            bus.register(
+                window.base,
+                window.size,
+                Box::new(sd_controller_wrapper::SdControllerWrapper::new(
+                    window.base,
+                    window.size,
+                    integer("initial_word")?,
+                    integer("writable_mask")?,
+                    write_width,
+                    readable,
+                )?),
+            )?;
         }
         "sdhci" => sd::register(bus, window, &mut resources.sd)?,
         "boot-control" => {
@@ -242,8 +275,12 @@ fn register_with_resources(
             )?;
         }
         "write-only-registers" => {
-            if window.options.keys().any(|option| option != "width") {
-                return Err("write-only-registers accepts only width".into());
+            if window
+                .options
+                .keys()
+                .any(|option| !matches!(option.as_str(), "width" | "allowed_values"))
+            {
+                return Err("write-only-registers accepts only width and allowed_values".into());
             }
             let width = match window.options.get("width") {
                 None => 4,
@@ -252,6 +289,23 @@ fn register_with_resources(
                     .filter(|width| matches!(width, 2 | 4))
                     .ok_or("write-only-registers width must be 2 or 4")?,
             };
+            let allowed_values = match window.options.get("allowed_values") {
+                None => None,
+                Some(value) => {
+                    let values = value
+                        .as_array()
+                        .ok_or("write-only-registers allowed_values must be an array")?
+                        .iter()
+                        .map(|value| {
+                            value
+                                .as_integer()
+                                .and_then(|value| u32::try_from(value).ok())
+                                .ok_or("write-only-registers allowed_values must contain u32 values")
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Some(values)
+                }
+            };
             bus.register(
                 window.base,
                 window.size,
@@ -259,6 +313,7 @@ fn register_with_resources(
                     window.base,
                     window.size,
                     width,
+                    allowed_values,
                 )?),
             )?;
         }

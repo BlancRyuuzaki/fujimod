@@ -89,17 +89,24 @@ impl Controller {
             o,
             0 | 4
                 | 8
+                | 0x0c
                 | 0x10
                 | 0x14
                 | 0x18
                 | 0x20
                 | 0x24
+                | 0x28
+                | 0x2c
+                | 0x30
                 | 0x34
                 | 0x40
                 | 0x44
                 | 0x48
                 | 0x50
+                | 0x64
+                | 0x68
                 | 0x74
+                | 0x78
                 | 0x80
                 | 0x94
                 | 0x98
@@ -224,6 +231,10 @@ impl Device for Controller {
             cx.unmodeled();
             return 0;
         }
+        if matches!(o, 0x0c | 0x28 | 0x2c | 0x30 | 0x64 | 0x68 | 0x78) {
+            cx.unmodeled();
+            return 0;
+        }
         match o {
             0x80 => match self.rx() {
                 Ok(b) => b as u64,
@@ -270,8 +281,40 @@ impl Device for Controller {
             cx.unmodeled();
             return;
         }
+        if o == 0x0c && v != 2 {
+            cx.fail("unsupported flash storage initialization value");
+            return;
+        }
+        if matches!(o, 0x28 | 0x2c | 0x30) && v != u64::from(u32::MAX) {
+            cx.fail("unsupported flash storage setup value");
+            return;
+        }
+        if matches!(o, 0x68 | 0x78) && v != 0 {
+            cx.fail("unsupported flash storage setup value");
+            return;
+        }
+        if o == 0x64 && v != 0 {
+            cx.fail("unsupported flash storage setup value");
+            return;
+        }
         let v = v as u32;
         let result = match o {
+            0x0c => {
+                self.state.regs[o as usize / 4] = v;
+                Ok(())
+            }
+            0x28 | 0x2c | 0x30 => {
+                self.state.regs[o as usize / 4] = v;
+                Ok(())
+            }
+            0x68 | 0x78 => {
+                self.state.regs[o as usize / 4] = v;
+                Ok(())
+            }
+            0x64 => {
+                self.state.regs[o as usize / 4] = v;
+                Ok(())
+            }
             0x80 => {
                 if !self.state.active || !self.descriptor.programs(self.cmd()) {
                     Err("unsupported flash storage FIFO write".into())
@@ -420,5 +463,155 @@ mod tests {
         controller.begin().unwrap();
         assert_eq!(controller.rx().unwrap(), 0x20);
         assert_eq!(storage.lock().unwrap().session.reads.bytes, 5);
+    }
+
+    #[test]
+    fn initialization_register_accepts_only_two_and_is_saved() {
+        use fujimod_emulator_devices::test_host::recording::RecordingHost;
+
+        let storage = Arc::new(Mutex::new(Storage::new(vec![0; 0x100]).unwrap()));
+        let mut controller = Controller::new(storage, Descriptor::for_jedec(0x20bb20).unwrap());
+        let mut host = RecordingHost::default();
+        let mut cx = Cx::new(&mut host, 0, 0, 0);
+
+        controller.write(&mut cx, 0xff90a00c, 4, 2);
+        assert_eq!(cx.refusal(), None);
+        assert_eq!(controller.state.regs[0x0c / 4], 2);
+        let saved = controller.save();
+
+        controller.write(&mut cx, 0xff90a00c, 4, 0);
+        assert!(cx.refusal().is_some());
+        controller.restore(&saved).unwrap();
+        assert_eq!(controller.state.regs[0x0c / 4], 2);
+
+        let mut read_host = RecordingHost::default();
+        let mut read_cx = Cx::new(&mut read_host, 0, 0, 0);
+        assert_eq!(controller.read(&mut read_cx, 0xff90a00c, 4), 0);
+        assert!(read_cx.refusal().is_some());
+
+        let mut invalid_host = RecordingHost::default();
+        let mut invalid_cx = Cx::new(&mut invalid_host, 0, 0, 0);
+        controller.write(&mut invalid_cx, 0xff90a00c, 4, 3);
+        assert!(invalid_cx.refusal().is_some());
+        assert_eq!(controller.state.regs[0x0c / 4], 2);
+
+        let mut width_host = RecordingHost::default();
+        let mut width_cx = Cx::new(&mut width_host, 0, 0, 0);
+        controller.write(&mut width_cx, 0xff90a00c, 2, 2);
+        assert!(width_cx.refusal().is_some());
+        assert_eq!(controller.state.regs[0x0c / 4], 2);
+    }
+
+    #[test]
+    fn setup_registers_accept_ordered_all_ones_and_are_saved() {
+        use fujimod_emulator_devices::test_host::recording::RecordingHost;
+
+        let storage = Arc::new(Mutex::new(Storage::new(vec![0; 0x100]).unwrap()));
+        let mut controller = Controller::new(storage, Descriptor::for_jedec(0x20bb20).unwrap());
+        let mut host = RecordingHost::default();
+        let mut cx = Cx::new(&mut host, 0, 0, 0);
+        for offset in [0x28, 0x2c, 0x30] {
+            controller.write(&mut cx, 0xff90a000 + offset as u64, 4, u32::MAX.into());
+            assert_eq!(controller.state.regs[offset / 4], u32::MAX);
+        }
+        assert_eq!(cx.refusal(), None);
+        let saved = controller.save();
+
+        let mut read_host = RecordingHost::default();
+        let mut read_cx = Cx::new(&mut read_host, 0, 0, 0);
+        for offset in [0x28, 0x2c, 0x30] {
+            assert_eq!(
+                controller.read(&mut read_cx, 0xff90a000 + offset as u64, 4),
+                0
+            );
+        }
+        assert!(read_cx.refusal().is_some());
+
+        let mut invalid_host = RecordingHost::default();
+        let mut invalid_cx = Cx::new(&mut invalid_host, 0, 0, 0);
+        controller.write(&mut invalid_cx, 0xff90a028, 4, 0xffff_fffe);
+        assert!(invalid_cx.refusal().is_some());
+
+        let mut width_host = RecordingHost::default();
+        let mut width_cx = Cx::new(&mut width_host, 0, 0, 0);
+        controller.write(&mut width_cx, 0xff90a028, 2, u32::MAX.into());
+        assert!(width_cx.refusal().is_some());
+
+        controller.restore(&saved).unwrap();
+        for offset in [0x28, 0x2c, 0x30] {
+            assert_eq!(controller.state.regs[offset / 4], u32::MAX);
+        }
+    }
+
+    #[test]
+    fn setup_zero_registers_are_write_only_and_saved() {
+        use fujimod_emulator_devices::test_host::recording::RecordingHost;
+
+        let storage = Arc::new(Mutex::new(Storage::new(vec![0; 0x100]).unwrap()));
+        let mut controller = Controller::new(storage, Descriptor::for_jedec(0x20bb20).unwrap());
+        let mut host = RecordingHost::default();
+        let mut cx = Cx::new(&mut host, 0, 0, 0);
+        for offset in [0x68_usize, 0x78, 0x98] {
+            controller.write(&mut cx, 0xff90a000 + offset as u64, 4, 0);
+            assert_eq!(controller.state.regs[offset / 4], 0);
+        }
+        assert_eq!(cx.refusal(), None);
+        let saved = controller.save();
+
+        let mut read_host = RecordingHost::default();
+        let mut read_cx = Cx::new(&mut read_host, 0, 0, 0);
+        for offset in [0x68_u64, 0x78] {
+            controller.read(&mut read_cx, 0xff90a000 + offset, 4);
+        }
+        assert!(read_cx.refusal().is_some());
+        assert_eq!(controller.read(&mut cx, 0xff90a098, 4), 0);
+        assert_eq!(cx.refusal(), None);
+
+        let mut invalid_host = RecordingHost::default();
+        let mut invalid_cx = Cx::new(&mut invalid_host, 0, 0, 0);
+        controller.write(&mut invalid_cx, 0xff90a068, 4, 1);
+        assert!(invalid_cx.refusal().is_some());
+
+        let mut width_host = RecordingHost::default();
+        let mut width_cx = Cx::new(&mut width_host, 0, 0, 0);
+        controller.write(&mut width_cx, 0xff90a078, 2, 0);
+        assert!(width_cx.refusal().is_some());
+        controller.restore(&saved).unwrap();
+        for offset in [0x68, 0x78, 0x98] {
+            assert_eq!(controller.state.regs[offset / 4], 0);
+        }
+    }
+
+    #[test]
+    fn zero_setup_register_is_write_only_exact_and_saved() {
+        use fujimod_emulator_devices::test_host::recording::RecordingHost;
+
+        let storage = Arc::new(Mutex::new(Storage::new(vec![0; 0x100]).unwrap()));
+        let mut controller = Controller::new(storage, Descriptor::for_jedec(0x20bb20).unwrap());
+        controller.state.regs[0x64 / 4] = 0x55;
+        let mut host = RecordingHost::default();
+
+        let mut write_cx = Cx::new(&mut host, 0, 0, 0);
+        controller.write(&mut write_cx, 0xff90a064, 4, 0);
+        assert_eq!(write_cx.refusal(), None);
+        assert_eq!(controller.state.regs[0x64 / 4], 0);
+        let saved = controller.save();
+
+        let mut read_cx = Cx::new(&mut host, 0, 0, 0);
+        controller.read(&mut read_cx, 0xff90a064, 4);
+        assert!(read_cx.is_unmodeled());
+
+        let mut value_cx = Cx::new(&mut host, 0, 0, 0);
+        controller.write(&mut value_cx, 0xff90a064, 4, 1);
+        assert!(value_cx.refusal().is_some());
+        assert_eq!(controller.state.regs[0x64 / 4], 0);
+
+        let mut width_cx = Cx::new(&mut host, 0, 0, 0);
+        controller.write(&mut width_cx, 0xff90a064, 2, 0);
+        assert!(width_cx.is_unmodeled());
+
+        controller.state.regs[0x64 / 4] = 0x99;
+        controller.restore(&saved).unwrap();
+        assert_eq!(controller.state.regs[0x64 / 4], 0);
     }
 }
