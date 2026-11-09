@@ -23,7 +23,15 @@ pub(super) struct Connection {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 enum Part {
-    PowerController { rtc_seconds: u32, rtc_valid: bool },
+    PowerController {
+        rtc_seconds: u32,
+        rtc_valid: bool,
+        /// Optional scenario override for register 0 (the power-ready state).
+        /// The stock profile leaves it at the declared `0x200` default; a
+        /// bounded case can supply the bit-15 candidate `0x8200`.
+        #[serde(default)]
+        register_0: Option<u16>,
+    },
     SerialCalibrationRegisters { miso_high: bool },
     FixedMiso { miso_high: bool, bits: u8, mode: u8 },
     BisConfigurationRegisters { revision: [u8; 2], idle_high: bool },
@@ -153,9 +161,13 @@ fn endpoint(part: Part, controls: Option<Arc<dyn Controls>>) -> Result<Box<dyn E
         Part::PowerController {
             rtc_seconds,
             rtc_valid,
+            register_0,
         } => {
             let mut part = PowerController::new();
             part.configure_rtc(rtc_seconds, rtc_valid);
+            if let Some(value) = register_0 {
+                part.set_register(0, value);
+            }
             match controls
                 .map(|controls| (controls.register_ladders(), controls))
                 .filter(|(registers, _)| !registers.is_empty())
@@ -270,6 +282,7 @@ mod tests {
             Part::PowerController {
                 rtc_seconds: 0,
                 rtc_valid: true,
+                register_0: None,
             },
             Some(controls),
         )
@@ -300,6 +313,33 @@ mod tests {
             Arc::new(fujimod_emulator_parts_controls::absent::AbsentControls);
         let mut endpoint = attach(controls);
         assert_eq!(read(endpoint.as_mut(), 0x34), 0);
+    }
+
+    #[test]
+    fn register_0_scenario_override_distinguishes_the_power_ready_bit() {
+        let mut default_part = endpoint(
+            Part::PowerController {
+                rtc_seconds: 0,
+                rtc_valid: false,
+                register_0: None,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(read(default_part.as_mut(), 0), 0x200, "stock default");
+        assert_eq!(read(default_part.as_mut(), 0) & 0x8000, 0);
+
+        let mut ready_part = endpoint(
+            Part::PowerController {
+                rtc_seconds: 0,
+                rtc_valid: false,
+                register_0: Some(0x8200),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(read(ready_part.as_mut(), 0), 0x8200, "bit-15 candidate");
+        assert_eq!(read(ready_part.as_mut(), 0) & 0x8000, 0x8000);
     }
 
     #[test]
