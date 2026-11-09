@@ -3,6 +3,7 @@ use crate::flash_storage::Shared;
 use fujimod_emulator_devices::{Cx, Device};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 #[derive(Serialize, Deserialize)]
 struct State {
     regs: Vec<u32>,
@@ -13,6 +14,13 @@ struct State {
     #[serde(default)]
     rx_fifo: std::collections::VecDeque<u8>,
     configuration_complete: bool,
+    volatile_registers: BTreeMap<u32, u8>,
+}
+#[derive(Clone, Copy)]
+struct VolatileRegisterWrite {
+    opcode: u8,
+    address: u32,
+    value: u8,
 }
 /// Explicit command vocabulary and erase geometry for a selected NOR device.
 #[derive(Clone, Copy)]
@@ -21,10 +29,12 @@ pub struct Descriptor {
     reads: &'static [u8],
     programs: &'static [u8],
     erases: &'static [(u8, usize)],
+    volatile_register_writes: &'static [VolatileRegisterWrite],
 }
 impl Descriptor {
     pub fn for_jedec(jedec: u32) -> Result<Self, String> {
-        let (reads, programs, erases): (&[u8], &[u8], &[(u8, usize)]) = match jedec {
+        let (reads, programs, erases, volatile_register_writes):
+            (&[u8], &[u8], &[(u8, usize)], &[VolatileRegisterWrite]) = match jedec {
             0x20bb20 => (
                 &[0x03, 0x13, 0x0b, 0x0c, 0xeb, 0xec],
                 &[0x02, 0x12, 0x32, 0x34],
@@ -34,11 +44,17 @@ impl Descriptor {
                     (0xd8, 0x10000),
                     (0xdc, 0x10000),
                 ],
+                &[],
             ),
             0x2c5b1b => (
                 &[0x13, 0xfd, 0xcc],
                 &[0x12],
                 &[(0x21, 0x1000), (0xdc, 0x20000)],
+                &[VolatileRegisterWrite {
+                    opcode: 0x81,
+                    address: 1,
+                    value: 0x14,
+                }],
             ),
             _ => return Err(format!("unsupported serial-flash descriptor {jedec:#x}")),
         };
@@ -47,6 +63,7 @@ impl Descriptor {
             reads,
             programs,
             erases,
+            volatile_register_writes,
         })
     }
     fn reads(self, cmd: u8) -> bool {
@@ -59,6 +76,12 @@ impl Descriptor {
         self.erases
             .iter()
             .find_map(|&(opcode, size)| (opcode == cmd).then_some(size))
+    }
+    fn volatile_register_write(self, cmd: u8) -> Option<VolatileRegisterWrite> {
+        self.volatile_register_writes
+            .iter()
+            .copied()
+            .find(|write| write.opcode == cmd)
     }
 }
 pub struct Controller {
@@ -79,6 +102,7 @@ impl Controller {
                 tx: Vec::new(),
                 rx_fifo: Default::default(),
                 configuration_complete: false,
+                volatile_registers: BTreeMap::new(),
             },
             flash_storage,
             descriptor,
@@ -167,6 +191,7 @@ impl Controller {
                 self.state.complete = true;
             }
             cmd if self.descriptor.programs(cmd) => {}
+            cmd if self.descriptor.volatile_register_write(cmd).is_some() => {}
             cmd if self.descriptor.erase_size(cmd).is_some() => {
                 let size = self.descriptor.erase_size(cmd).unwrap();
                 flash_storage.erase(self.state.regs[0x50 / 4] as u64, size)?;
@@ -177,6 +202,19 @@ impl Controller {
         Ok(())
     }
     fn stop(&mut self) -> Result<(), String> {
+        if let Some(write) = self.descriptor.volatile_register_write(self.cmd()) {
+            if self.state.regs[0x50 / 4] != write.address
+                || self.state.tx.as_slice() != [write.value]
+            {
+                return Err("unsupported serial-flash volatile register write".into());
+            }
+            let mut flash_storage = self.flash_storage.lock().unwrap();
+            if !flash_storage.session.write_enable {
+                return Err("serial-flash volatile register write without WREN".into());
+            }
+            flash_storage.session.write_enable = false;
+            self.state.volatile_registers.insert(write.address, write.value);
+        }
         if self.descriptor.programs(self.cmd()) && !self.state.tx.is_empty() {
             self.flash_storage
                 .lock()
@@ -316,7 +354,10 @@ impl Device for Controller {
                 Ok(())
             }
             0x80 => {
-                if !self.state.active || !self.descriptor.programs(self.cmd()) {
+                if !self.state.active
+                    || !(self.descriptor.programs(self.cmd())
+                        || self.descriptor.volatile_register_write(self.cmd()).is_some())
+                {
                     Err("unsupported flash storage FIFO write".into())
                 } else {
                     self.state.tx.push(v as u8);
@@ -440,6 +481,44 @@ mod tests {
                 assert_eq!(c.rx().unwrap(), 0x5a);
             }
         }
+    }
+
+    #[test]
+    fn selected_volatile_register_write_retains_one_byte_without_programming_array() {
+        let storage = Arc::new(Mutex::new(Storage::new(vec![0x5a; 0x100]).unwrap()));
+        let mut controller =
+            Controller::new(storage.clone(), Descriptor::for_jedec(0x2c5b1b).unwrap());
+        controller.state.regs[0] = 1;
+        controller.state.regs[0x40 / 4] = 0x06;
+        controller.begin().unwrap();
+        assert!(storage.lock().unwrap().session.write_enable);
+
+        controller.state.regs[0x40 / 4] = 0x81;
+        controller.state.regs[0x50 / 4] = 1;
+        controller.state.regs[0xa0 / 4] = 0;
+        controller.begin().unwrap();
+        controller.state.tx.push(0x14);
+        controller.stop().unwrap();
+        assert_eq!(controller.state.volatile_registers.get(&1), Some(&0x14));
+        assert_eq!(storage.lock().unwrap().read(0, 0x100).unwrap(), vec![0x5a; 0x100]);
+        assert!(!storage.lock().unwrap().session.write_enable);
+        let saved = controller.save();
+        controller.state.volatile_registers.clear();
+        controller.restore(&saved).unwrap();
+        assert_eq!(controller.state.volatile_registers.get(&1), Some(&0x14));
+
+        controller.state.regs[0x40 / 4] = 0x06;
+        controller.begin().unwrap();
+        controller.state.regs[0x40 / 4] = 0x81;
+        controller.state.regs[0x50 / 4] = 2;
+        controller.begin().unwrap();
+        controller.state.tx.push(0x14);
+        assert!(controller.stop().is_err());
+        assert_eq!(controller.state.volatile_registers.get(&1), Some(&0x14));
+        controller.state.regs[0x50 / 4] = 1;
+        controller.begin().unwrap();
+        controller.state.tx.push(0x15);
+        assert!(controller.stop().is_err());
     }
 
     #[test]

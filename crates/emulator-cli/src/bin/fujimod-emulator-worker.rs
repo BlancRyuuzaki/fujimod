@@ -106,6 +106,22 @@ struct Processor {
 struct Ram {
     base: u64,
     size: usize,
+    #[serde(default = "default_ram_permissions", deserialize_with = "ram_permissions")]
+    permissions: u32,
+}
+fn default_ram_permissions() -> u32 {
+    3
+}
+fn ram_permissions<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let permissions = u32::deserialize(deserializer)?;
+    if matches!(permissions, 1 | 3) {
+        Ok(permissions)
+    } else {
+        Err(serde::de::Error::custom("RAM permissions must be 1 or 3"))
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -556,7 +572,12 @@ impl Worker {
         let dma_mappings = config
             .ram
             .iter()
-            .map(|r| board::memory::BusMapping::ram(r.base, r.size))
+            .map(|r| board::memory::BusMapping {
+                address: r.base,
+                physical: r.base,
+                size: r.size,
+                permissions: r.permissions,
+            })
             .collect();
         let graph = factory::Graph {
             decoders: vec![],
@@ -788,4 +809,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         worker.board.finish().map_err(io::Error::other)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Ram;
+
+    #[test]
+    fn ram_permissions_default_and_accept_read_only() {
+        let default: Ram = serde_json::from_str(r#"{"base":4096,"size":4096}"#).unwrap();
+        assert_eq!(default.permissions, 3);
+
+        let read_only: Ram =
+            serde_json::from_str(r#"{"base":4096,"size":4096,"permissions":1}"#).unwrap();
+        assert_eq!(read_only.permissions, 1);
+        assert!(serde_json::from_str::<Ram>(
+            r#"{"base":4096,"size":4096,"permissions":2}"#
+        )
+        .is_err());
+    }
 }
