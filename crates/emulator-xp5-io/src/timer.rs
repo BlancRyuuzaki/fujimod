@@ -204,6 +204,11 @@ impl Device for Timer {
                     ) as u64;
                 }
             }
+            if w == 0 && self.general[n].count.enabled {
+                return self.general[n]
+                    .count
+                    .current(Duration::from_nanos(cx.now())) as u64;
+            }
             return self.general[n].words[w] as u64;
         }
         if (0x200..0x200 + self.general_len() as u64 * 4).contains(&offset) {
@@ -418,6 +423,34 @@ mod tests {
             c.deadline(Duration::from_nanos(10_000_021)),
             Duration::from_nanos(20_000_021)
         );
+    }
+    #[test]
+    fn running_general_word0_reads_the_live_count() {
+        let mut timer = Timer::new(0);
+        let mut host = Host::default();
+        for (offset, value) in [
+            (0x14, 0x10000),
+            (0x110, u32::MAX),
+            (0x114, u32::MAX),
+            (0, 0x20002),
+        ] {
+            timer.write(
+                &mut Cx::new(&mut host, 0, 0, 0),
+                offset,
+                4,
+                u64::from(value),
+            );
+        }
+        host.now = Duration::from_micros(2000);
+        let elapsed = u64::from(u32::MAX) - timer.read(&mut Cx::new(&mut host, 0, 0, 0), 0x110, 4);
+        assert_eq!(elapsed, 2000 * 48);
+        assert_eq!(
+            timer.read(&mut Cx::new(&mut host, 0, 0, 0), 0x114, 4),
+            u64::from(u32::MAX)
+        );
+        timer.write(&mut Cx::new(&mut host, 0, 0, 0), 0, 4, 0x20000);
+        timer.write(&mut Cx::new(&mut host, 0, 0, 0), 0x110, 4, 1234);
+        assert_eq!(timer.read(&mut Cx::new(&mut host, 0, 0, 0), 0x110, 4), 1234);
     }
     #[derive(Default)]
     struct Host {

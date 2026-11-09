@@ -103,11 +103,43 @@ struct Processor {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RamBusWindow {
+    base: u64,
+    size: usize,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Ram {
     base: u64,
     size: usize,
     #[serde(default = "default_ram_permissions", deserialize_with = "ram_permissions")]
     permissions: u32,
+    bus_window: Option<RamBusWindow>,
+}
+impl Ram {
+    fn dma_mapping(&self) -> Result<(u64, usize, u32), String> {
+        let (base, size) = self
+            .bus_window
+            .as_ref()
+            .map(|window| (window.base, window.size))
+            .unwrap_or((self.base, self.size));
+        let ram_size = u64::try_from(self.size).map_err(|_| "RAM size exceeds address range")?;
+        let window_size = u64::try_from(size)
+            .map_err(|_| "RAM bus window size exceeds address range")?;
+        let ram_end = self
+            .base
+            .checked_add(ram_size)
+            .ok_or("RAM physical range overflows")?;
+        let window_end = base
+            .checked_add(window_size)
+            .ok_or("RAM bus window range overflows")?;
+        if size == 0 || base < self.base || window_end > ram_end {
+            return Err(
+                "RAM bus window must be nonempty and inside its physical RAM region".into(),
+            );
+        }
+        Ok((base, size, self.permissions))
+    }
 }
 fn default_ram_permissions() -> u32 {
     3
@@ -572,13 +604,16 @@ impl Worker {
         let dma_mappings = config
             .ram
             .iter()
-            .map(|r| board::memory::BusMapping {
-                address: r.base,
-                physical: r.base,
-                size: r.size,
-                permissions: r.permissions,
+            .map(|r| {
+                let (base, size, permissions) = r.dma_mapping()?;
+                Ok(board::memory::BusMapping {
+                    address: base,
+                    physical: base,
+                    size,
+                    permissions,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>()?;
         let graph = factory::Graph {
             decoders: vec![],
             processors,
@@ -819,6 +854,7 @@ mod tests {
     fn ram_permissions_default_and_accept_read_only() {
         let default: Ram = serde_json::from_str(r#"{"base":4096,"size":4096}"#).unwrap();
         assert_eq!(default.permissions, 3);
+        assert_eq!(default.dma_mapping().unwrap(), (4096, 4096, 3));
 
         let read_only: Ram =
             serde_json::from_str(r#"{"base":4096,"size":4096,"permissions":1}"#).unwrap();
@@ -827,5 +863,32 @@ mod tests {
             r#"{"base":4096,"size":4096,"permissions":2}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn ram_bus_window_selects_only_a_valid_physical_subrange() {
+        let ram: Ram = serde_json::from_str(
+            r#"{"base":16384,"size":16384,"bus_window":{"base":17408,"size":10400}}"#,
+        )
+        .unwrap();
+        assert_eq!(ram.dma_mapping().unwrap(), (0x4400, 0x28a0, 3));
+
+        let read_only: Ram = serde_json::from_str(
+            r#"{"base":16384,"size":16384,"permissions":1,"bus_window":{"base":17408,"size":10400}}"#,
+        )
+        .unwrap();
+        assert_eq!(read_only.dma_mapping().unwrap(), (0x4400, 0x28a0, 1));
+
+        let invalid: Ram = serde_json::from_str(
+            r#"{"base":16384,"size":16384,"bus_window":{"base":31744,"size":4096}}"#,
+        )
+        .unwrap();
+        assert!(invalid.dma_mapping().is_err());
+
+        let empty: Ram = serde_json::from_str(
+            r#"{"base":16384,"size":16384,"bus_window":{"base":17408,"size":0}}"#,
+        )
+        .unwrap();
+        assert!(empty.dma_mapping().is_err());
     }
 }
