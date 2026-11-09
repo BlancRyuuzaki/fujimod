@@ -2,6 +2,7 @@
 //!
 //! Each implementation is a separate module with its own declared wiring. A
 //! body names exactly one; nothing here chooses by firmware or camera identity.
+use crate::absent::AbsentControls;
 use crate::{ladder_keys, resistor_keys};
 use fujimod_emulator_devices::parts::controls::Controls;
 use fujimod_emulator_devices::parts::pins::DriveInput;
@@ -37,12 +38,21 @@ impl KeyInput for ladder_keys::LadderKeys {
     }
 }
 
+impl KeyInput for AbsentControls {
+    fn start(&self, _: Duration) {}
+    fn enqueue(&self, _: Duration, _: Key, _: bool) -> Result<(), String> {
+        Err("key input is unsupported because no key model is declared".into())
+    }
+}
+
 /// The declared key model of one body. Transports that accept a model as
 /// data read it as the model's options tagged with its `kind`
-/// (`resistor-keys` or `ladder-keys`).
+/// (`absent`, `resistor-keys`, or `ladder-keys`).
 #[derive(Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ControlsOptions {
+    /// The body has no declared physical key model.
+    Absent,
     /// GPIO shutter and dial pads plus seven keys sampled on two ADC channels.
     ResistorKeys(resistor_keys::Options),
     /// Keys read as ADC resistor-ladder bands or power-controller register
@@ -54,6 +64,7 @@ impl ControlsOptions {
     /// Construct the declared model. GPIO-driving models take the board's pins.
     pub fn open(self, pins: Arc<dyn DriveInput>) -> Result<Arc<dyn KeyInput>, String> {
         Ok(match self {
+            Self::Absent => Arc::new(AbsentControls),
             Self::ResistorKeys(options) => Arc::new(resistor_keys::ResistorKeys::new(pins, options)?),
             Self::LadderKeys(options) => Arc::new(ladder_keys::LadderKeys::new(options)?),
         })
@@ -83,6 +94,18 @@ mod tests {
         assert_eq!(keys.register_sample(52), Some(554));
         let error = keys.enqueue(Duration::from_nanos(1), Key::Back, true).unwrap_err();
         assert!(error.contains("no declared ladder rung"), "{error}");
+    }
+
+    #[test]
+    fn absent_controls_open_idle_and_refuse_key_edges() {
+        let options: ControlsOptions = serde_json::from_value(json!({"kind":"absent"})).unwrap();
+        let keys = options.open(Pins::shared()).unwrap();
+        keys.start(Duration::from_secs(1));
+        assert_eq!(keys.sample(0, 4095), 4095);
+        let error = keys
+            .enqueue(Duration::from_secs(1), Key::Menu, true)
+            .unwrap_err();
+        assert!(error.contains("unsupported"), "{error}");
     }
 
     #[test]

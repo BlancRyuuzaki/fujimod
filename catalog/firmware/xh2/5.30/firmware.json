@@ -1,0 +1,164 @@
+{
+  "$schema": "https://fujimod.com/schemas/firmware.schema.json",
+  "schema": 1,
+  "id": "xh2-530",
+  "body_id": "xh2",
+  "version": "5.30",
+  "update": {
+    "size": 110302544,
+    "sha256": "be47168cb075ef726e67cb4bb08175a896047a3b0de2bcb6e65333b22cfcb203"
+  },
+  "boot_rom": null,
+  "installation": {
+    "flash_offset": 628,
+    "entry_labels": {
+      "0x58420": "experimental EL3 entry candidate"
+    },
+    "loader_validation": null,
+    "image_sections": [
+      {
+        "name": "segment-0",
+        "address": 262144,
+        "size": 123712,
+        "sha256": "a73aee09924485ab65ba9b2747488403aced37b576378b1a2d1cc951fa5d80db"
+      },
+      {
+        "name": "segment-4",
+        "address": 17829888,
+        "size": 12042160,
+        "sha256": "3aacc331157312a03531266cd9aca0daea28597b9f3535bb6141105ad7354b4d"
+      }
+    ]
+  },
+  "generated_facts": null,
+  "layouts": {
+    "profiles": {
+      "xh2-530-experimental": {
+        "flash_image": {
+          "dat_origin": 628,
+          "xor": 255
+        },
+        "preload": [],
+        "gic_initial": {},
+        "gic_redistributor_initial": [],
+        "cpu": [
+          {
+            "id": 0,
+            "pc": 361504,
+            "running": true,
+            "entry": {
+              "level": "el3t",
+              "pstate": 972,
+              "regs": {
+                "x0": 21896268,
+                "x1": 98896
+              }
+            },
+            "sysregs": {
+              "CPACR_EL1": 3145728,
+              "ICC_IGRPEN0_EL1": 0,
+              "ICC_IGRPEN1_EL1": 0,
+              "ICC_PMR_EL1": 0,
+              "SCTLR_EL1": 0,
+              "SP_EL0": 129088,
+              "SP_EL1": 0,
+              "VBAR_EL1": 0,
+              "ELR_EL3": 0,
+              "SCR_EL3": 3072,
+              "SPSR_EL3": 4,
+              "SP_EL3": 0
+            }
+          },
+          {
+            "id": 1,
+            "pc": 361504,
+            "running": true,
+            "entry": {
+              "level": "el3t",
+              "pstate": 972,
+              "regs": {
+                "x0": 21896268,
+                "x1": 98896
+              }
+            },
+            "sysregs": {
+              "CPACR_EL1": 3145728,
+              "ICC_IGRPEN0_EL1": 0,
+              "ICC_IGRPEN1_EL1": 0,
+              "ICC_PMR_EL1": 0,
+              "SCTLR_EL1": 0,
+              "SP_EL0": 157760,
+              "SP_EL1": 0,
+              "VBAR_EL1": 0,
+              "ELR_EL3": 0,
+              "SCR_EL3": 3072,
+              "SPSR_EL3": 4,
+              "SP_EL3": 0
+            }
+          },
+          {
+            "id": 2,
+            "pc": 361504,
+            "running": true,
+            "entry": {
+              "level": "el3t",
+              "pstate": 972,
+              "regs": {
+                "x0": 21896268,
+                "x1": 98896
+              }
+            },
+            "sysregs": {
+              "CPACR_EL1": 3145728,
+              "ICC_IGRPEN0_EL1": 0,
+              "ICC_IGRPEN1_EL1": 0,
+              "ICC_PMR_EL1": 0,
+              "SCTLR_EL1": 0,
+              "SP_EL0": 186432,
+              "SP_EL1": 0,
+              "VBAR_EL1": 0,
+              "ELR_EL3": 0,
+              "SCR_EL3": 3072,
+              "SPSR_EL3": 4,
+              "SP_EL3": 0
+            }
+          },
+          {
+            "id": 3,
+            "pc": 361504,
+            "running": true,
+            "entry": {
+              "level": "el3t",
+              "pstate": 972,
+              "regs": {
+                "x0": 21896268,
+                "x1": 98896
+              }
+            },
+            "sysregs": {
+              "CPACR_EL1": 3145728,
+              "ICC_IGRPEN0_EL1": 0,
+              "ICC_IGRPEN1_EL1": 0,
+              "ICC_PMR_EL1": 0,
+              "SCTLR_EL1": 0,
+              "SP_EL0": 215104,
+              "SP_EL1": 0,
+              "VBAR_EL1": 0,
+              "ELR_EL3": 0,
+              "SCR_EL3": 3072,
+              "SPSR_EL3": 4,
+              "SP_EL3": 0
+            }
+          }
+        ],
+        "limits": [
+          "Experimental continuation candidate matching the four-core emulator fixture; no physical four-core execution is established.",
+          "EL3t entry, x0/x1, boot-core SP_EL0, CPACR_EL1 FPEN, SCR_EL3 RW/ST, and SPSR_EL3 EL1t mode are source-backed; other inherited register values are candidates.",
+          "Per-core stacks for cores 1-3 are candidate offsets from the boot-core stack, not measured physical stacks.",
+          "Initial image regions identify registered initialized segment bytes; they do not establish physical RAM placement, BSS contents, or hardware validation."
+        ]
+      }
+    },
+    "views": {}
+  }
+}

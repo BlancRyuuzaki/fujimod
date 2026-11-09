@@ -1696,6 +1696,52 @@
           "denominator": 1
         },
         "board_ticks_per_second": 1000000000
+      },
+      "xh2-experimental": {
+        "cpu_model": "Cortex-A53",
+        "runtime_abi": "armv8a-shared-v1",
+        "limits": [
+          "Experimental X-H2 startup selection: CPU identity, counter frequency, companion mapping and timing remain XP5 candidates, not measured X-H2 machine facts.",
+          "Only timer, clock-gate, pin-control and clock-bank windows consumed by the current startup path are declared; accesses to other unqualified processor windows refuse."
+        ],
+        "windows": [
+          {
+            "name": "timer",
+            "base": 4287660032,
+            "size": 4096,
+            "kind": "timer"
+          },
+          {
+            "name": "clock_gates",
+            "base": 4287676416,
+            "size": 4096,
+            "kind": "clock-gates",
+            "options": {
+              "configuration_word": 0
+            }
+          },
+          {
+            "name": "pin_control",
+            "base": 4287643648,
+            "size": 4096,
+            "kind": "pin-control"
+          },
+          {
+            "name": "clock_banks",
+            "base": 4288675840,
+            "size": 131072,
+            "kind": "clock-banks"
+          }
+        ],
+        "engines": [
+          "unicorn",
+          "hypervisor"
+        ],
+        "instructions_per_tick": {
+          "numerator": 1,
+          "denominator": 1
+        },
+        "board_ticks_per_second": 1000000000
       }
     }
   }

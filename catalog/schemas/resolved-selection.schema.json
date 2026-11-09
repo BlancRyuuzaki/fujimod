@@ -954,6 +954,24 @@
       ],
       "type": "object"
     },
+    "BodyControlModel": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Physical control behavior is undeclared; key edges are refused.",
+          "properties": {
+            "kind": {
+              "const": "absent",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "BodyHardware": {
       "additionalProperties": false,
       "description": "Additional body-specific physical wiring.",
@@ -1079,6 +1097,17 @@
             "array",
             "null"
           ]
+        },
+        "control_model": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BodyControlModel"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Explicit physical control model for this profile."
         },
         "controllers": {
           "anyOf": [

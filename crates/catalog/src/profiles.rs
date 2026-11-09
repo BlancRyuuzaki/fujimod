@@ -848,11 +848,22 @@ pub struct Touch {
     pub ticks_per_second: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum BodyControlModel {
+    /// Physical control behavior is undeclared; key edges are refused.
+    Absent,
+}
+
 /// Declared body profile facts.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct BodyProfile {
+    /// Explicit physical control model for this profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_model: Option<BodyControlModel>,
     /// Body-declared register behavior overriding the selected processor defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub register_maps: Option<RegisterLayouts>,

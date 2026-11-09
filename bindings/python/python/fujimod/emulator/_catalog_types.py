@@ -342,6 +342,13 @@ class BodyConnection(TypedDict, total=False):
     signals: Required[list[ConnectionSignal]]
 
 
+type BodyControlModel = BodyControlModelVariant0
+
+
+class BodyControlModelVariant0(TypedDict, total=False):
+    kind: Required[Literal["absent"]]
+
+
 class BodyHardware(TypedDict, total=False):
     bus_drain: NotRequired[BusDrain | None]
     gpio_feedback: Required[list[GpioFeedback]]
@@ -358,6 +365,7 @@ class BodyProfile(TypedDict, total=False):
     construction: NotRequired[ConstructionProfile | None]
     control_bus_notes: NotRequired[str | None]
     control_bus_order: NotRequired[list[str] | None]
+    control_model: NotRequired[BodyControlModel | None]
     controllers: NotRequired[HardwareControllerModels | None]
     counter_feedback: NotRequired[str | None]
     dram_basis: Required[str]
