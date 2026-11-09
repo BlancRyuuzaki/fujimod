@@ -94,6 +94,7 @@ pub fn startup_from_profile(
     let processors = cpus
         .iter()
         .map(|cpu| {
+            cpu.validate()?;
             let index = usize::try_from(cpu.id).map_err(|_| "CPU id exceeds host address space")?;
             let processor = soc.processors.get(index).ok_or_else(|| {
                 format!("firmware CPU {} is absent from the selected SoC", cpu.id)
@@ -721,5 +722,94 @@ mod bus_drain_tests {
         selection.body.hardware.as_mut().unwrap().bus_drain = None;
         let error = windows(&selection, "xp5").err().unwrap();
         assert!(error.contains("no bus-drain address"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod firmware_entry_tests {
+    use super::startup_from_profile;
+    use fujimod_catalog::firmware::{Entry, EntryLevel};
+    use fujimod_catalog_resolution::ResolvedConfiguration;
+    use fujimod_emulator::board::{
+        bus::{Bus, Mode},
+        factory,
+    };
+    use fujimod_emulator_cpu::{Register, timeline::Ratio};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn el3t_catalog_entry_initializes_native_cpu_and_refuses_wrong_mode() {
+        let resolved = ResolvedConfiguration::bundled("xt5-431").unwrap();
+        let mut profile = resolved
+            .reference
+            .firmware
+            .layouts
+            .as_ref()
+            .unwrap()
+            .profiles
+            .get("xt5-431")
+            .unwrap()
+            .clone();
+        let cpu = &mut profile.cpu.as_mut().unwrap()[0];
+        cpu.pc = 0x1234_0000;
+        cpu.cpsr = None;
+        cpu.regs = None;
+        cpu.entry = Some(Entry {
+            level: EntryLevel::El3t,
+            pstate: 0x3cc,
+            regs: BTreeMap::from([("x0".into(), 0x1122), ("x1".into(), 0x3344)]),
+        });
+        cpu.sysregs.sp_el0 = 0x5566_7788;
+        cpu.validate().unwrap();
+        let startup = startup_from_profile(&resolved, &profile, 1).unwrap();
+        let start = startup.processors.into_iter().next().unwrap();
+        let graph = factory::Graph {
+            processors: vec![factory::Processor {
+                model: fujimod_emulator_cpu::Model::ArmV8A,
+                registers: start.registers,
+                released: true,
+                mprofile: None,
+                rprofile: None,
+            }],
+            ram: vec![],
+            dma_mappings: vec![],
+            decoders: vec![],
+            mappings: vec![],
+            peripherals: vec![],
+            instructions_per_tick: Ratio::new(1, 1).unwrap(),
+        };
+        let board = graph
+            .build(
+                factory::Options::new(factory::Engine::Unicorn)
+                    .with_translation_cache_size_bytes(1 << 20),
+                Bus::new(Mode::Strict),
+                None,
+            )
+            .unwrap();
+        assert_eq!(board.read_register(0, Register::Pc).unwrap(), 0x1234_0000);
+        assert_eq!(board.read_register(0, Register::Pstate).unwrap(), 0x3cc);
+        assert_eq!(board.read_register(0, Register::X(0)).unwrap(), 0x1122);
+        assert_eq!(board.read_register(0, Register::X(1)).unwrap(), 0x3344);
+        assert_eq!(
+            board
+                .read_register(
+                    0,
+                    Register::Arm64System(
+                        fujimod_emulator_cpu::arm64::system_register("SP_EL0").unwrap()
+                    )
+                )
+                .unwrap(),
+            0x5566_7788
+        );
+
+        profile.cpu.as_mut().unwrap()[0]
+            .entry
+            .as_mut()
+            .unwrap()
+            .pstate = 0x3c5;
+        let error = startup_from_profile(&resolved, &profile, 1)
+            .err()
+            .expect("wrong-mode entry must refuse before Board construction");
+        assert!(error.contains("does not match declared level"), "{error}");
     }
 }
