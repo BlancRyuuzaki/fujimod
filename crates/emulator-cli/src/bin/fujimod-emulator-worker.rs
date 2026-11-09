@@ -348,6 +348,10 @@ enum Command {
         until: u64,
     },
     State,
+    CoreReset { core: usize, asserted: bool },
+    MemoryWriteWatchBegin { ranges: Vec<(u64, u64)>, limit: usize },
+    MemoryWriteWatchState,
+    MemoryWriteWatchEnd,
     MemoryFingerprint,
     Progress,
     InstructionPoints { core: usize, addresses: Vec<u64> },
@@ -455,6 +459,7 @@ struct Worker {
     unmodeled_devices: Vec<String>,
     usb_connections: BTreeMap<u64, usize>,
     instruction_points: BTreeMap<usize, Box<board::observation::InstructionPoints>>,
+    memory_write_watch: Option<Box<board::observation::MemoryWatch>>,
 }
 impl Worker {
     fn new(config: Config) -> Result<Self, String> {
@@ -681,6 +686,7 @@ impl Worker {
             unmodeled_devices,
             usb_connections,
             instruction_points: BTreeMap::new(),
+            memory_write_watch: None,
         })
     }
     fn state(&self) -> Value {
@@ -718,6 +724,35 @@ impl Worker {
                 points.event().map(|address| json!({"core":core,"address":address}))
             }).unwrap_or(Value::Null)),
             Command::State => Ok(self.state()),
+            Command::CoreReset { core, asserted } => {
+                self.board.reset_core(core, asserted)?;
+                Ok(Value::Null)
+            }
+            Command::MemoryWriteWatchBegin { ranges, limit } => {
+                if self.memory_write_watch.is_some() {
+                    return Err("A memory write watch is already active".into());
+                }
+                self.memory_write_watch = Some(self.board.memory_write_watch_begin(
+                    ranges,
+                    limit,
+                    self.board.mappings().to_vec(),
+                )?);
+                Ok(Value::Null)
+            }
+            Command::MemoryWriteWatchState => self
+                .memory_write_watch
+                .as_ref()
+                .map(|watch| Ok(watch.records.borrow().state()))
+                .unwrap_or_else(|| Err("No memory write watch is active".into())),
+            Command::MemoryWriteWatchEnd => {
+                let mut watch = self
+                    .memory_write_watch
+                    .take()
+                    .ok_or("No memory write watch is active")?;
+                let state = watch.records.borrow().state();
+                self.board.memory_watch_end(&mut watch)?;
+                Ok(state)
+            }
             Command::MemoryFingerprint => self.board.memory_fingerprint(),
             Command::ReadMemory {
                 core,
@@ -800,6 +835,9 @@ impl Worker {
                 Ok(json!(frames))
             }
             Command::Close => {
+                if let Some(mut watch) = self.memory_write_watch.take() {
+                    self.board.memory_watch_end(&mut watch)?;
+                }
                 self.board.finish()?;
                 Ok(Value::Null)
             }
@@ -841,6 +879,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     if !finished && let Some(mut worker) = worker {
+        if let Some(mut watch) = worker.memory_write_watch.take() {
+            worker.board.memory_watch_end(&mut watch).map_err(io::Error::other)?;
+        }
         worker.board.finish().map_err(io::Error::other)?;
     }
     Ok(())

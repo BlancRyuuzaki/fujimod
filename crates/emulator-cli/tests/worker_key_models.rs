@@ -151,6 +151,87 @@ fn ladder_key_edges_reach_the_adc_the_guest_reads_and_undeclared_models_are_refu
     worker.close();
 }
 
+#[test]
+fn core_reset_releases_an_arm_core_without_patching_guest_code() {
+    let directory = directory("worker-core-reset");
+    let mut configuration = config(&directory, ladder_keys());
+    let mut held_processor = configuration["processors"][0].clone();
+    held_processor["released"] = json!(false);
+    configuration["processors"].as_array_mut().unwrap().push(held_processor);
+    let mut mapping = configuration["mappings"][0].clone();
+    mapping["core"] = json!(1);
+    configuration["mappings"].as_array_mut().unwrap().push(mapping);
+    let mut peripheral = configuration["peripherals"][0].clone();
+    peripheral["core"] = json!(1);
+    configuration["peripherals"].as_array_mut().unwrap().push(peripheral);
+    let mut worker = Worker::spawn();
+    worker
+        .call(json!({"command":"create","config":configuration}))
+        .unwrap();
+
+    let code = worker
+        .call(json!({"command":"read-memory","core":0,"address":RAM,"size":12}))
+        .unwrap();
+    let result = worker
+        .call(json!({"command":"run-instructions","count":64,"until":null}))
+        .unwrap();
+    assert_eq!(result["instructions"][1], 0);
+    assert!(result["failure"].is_null(), "{result}");
+
+    assert_eq!(
+        worker
+            .call(json!({"command":"core-reset","core":1,"asserted":false}))
+            .unwrap(),
+        Value::Null
+    );
+    let result = worker
+        .call(json!({"command":"run-instructions","count":1,"until":null}))
+        .unwrap();
+    assert!(result["instructions"][1].as_u64().unwrap() > 0, "{result}");
+    assert!(result["failure"].is_null(), "{result}");
+    assert_eq!(
+        worker
+            .call(json!({"command":"read-memory","core":0,"address":RAM,"size":12}))
+            .unwrap(),
+        code
+    );
+    worker.close();
+}
+
+#[test]
+fn memory_write_watch_commands_capture_bounded_cpu_stores_and_end_cleanly() {
+    let directory = directory("worker-memory-write-watch");
+    let mut worker = Worker::spawn();
+    worker
+        .call(json!({"command":"create","config":config(&directory, ladder_keys())}))
+        .unwrap();
+
+    worker
+        .call(json!({"command":"memory-write-watch-begin","ranges":[[RESULT,RESULT + 2]],"limit":8}))
+        .unwrap();
+    let result = worker
+        .call(json!({"command":"run-instructions","count":3,"until":null}))
+        .unwrap();
+    assert!(result["failure"].is_null(), "{result}");
+    let state = worker
+        .call(json!({"command":"memory-write-watch-state"}))
+        .unwrap();
+    assert_eq!(state["enabled"], true);
+    assert_eq!(state["records"].as_array().unwrap().len(), 1, "{state}");
+    assert_eq!(state["records"][0]["physical"], RESULT);
+    assert_eq!(
+        worker
+            .call(json!({"command":"memory-write-watch-end"}))
+            .unwrap(),
+        state
+    );
+    assert!(worker
+        .call(json!({"command":"memory-write-watch-state"}))
+        .unwrap_err()
+        .contains("No memory write watch is active"));
+    worker.close();
+}
+
 fn usb_config(directory: &Path, include_usb_status: bool) -> Value {
     let program = [0xb940_0020u32, 0xb900_0040, 0x17ff_fffe]
         .iter()
