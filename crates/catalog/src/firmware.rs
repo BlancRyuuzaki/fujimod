@@ -182,7 +182,21 @@ impl Cpu {
                 Ok(())
             }
             (false, true) => {
-                for name in self.entry.as_ref().expect("entry is present").regs.keys() {
+                let entry = self.entry.as_ref().expect("entry is present");
+                let expected_mode = match &entry.level {
+                    EntryLevel::El1h => 0x5,
+                    EntryLevel::El2h => 0x9,
+                    EntryLevel::El3h => 0xd,
+                    EntryLevel::El3t => 0xc,
+                };
+                let mode = entry.pstate & 0x1f;
+                if mode != expected_mode {
+                    return Err(format!(
+                        "entry pstate mode {mode:#x} does not match declared level {:?}",
+                        entry.level
+                    ));
+                }
+                for name in entry.regs.keys() {
                     if !is_entry_register_name(name) {
                         return Err(format!("entry register {name:?} is not x0 through x30"));
                     }
@@ -986,6 +1000,14 @@ mod tests {
         cpu(entry_cpu("el3t", serde_json::json!({"x0": 1, "x1": 2})))
             .validate()
             .unwrap();
+    }
+
+    #[test]
+    fn entry_wrong_mode_refuses() {
+        let mut value = entry_cpu("el3t", serde_json::json!({"x0": 1}));
+        value["entry"]["pstate"] = serde_json::json!(0x3cd);
+        let error = cpu(value).validate().unwrap_err();
+        assert!(error.contains("does not match declared level"), "{error}");
     }
 
     #[test]
