@@ -1702,7 +1702,7 @@
         "runtime_abi": "armv8a-shared-v1",
         "limits": [
           "Experimental X-H2 startup selection: CPU identity, counter frequency, companion mapping and timing remain XP5 candidates, not measured X-H2 machine facts.",
-          "Only timer, clock-gate, pin-control and clock-bank windows consumed by the current startup path are declared; accesses to other unqualified processor windows refuse."
+          "The current startup path declares timer, clock, pin-control and general-DMA windows; their X-H2 reset values and downstream device traffic remain experimental candidates. Other processor windows refuse."
         ],
         "windows": [
           {
@@ -1731,6 +1731,27 @@
             "base": 4288675840,
             "size": 131072,
             "kind": "clock-banks"
+          },
+          {
+            "name": "dma",
+            "base": 4287823872,
+            "size": 32768,
+            "kind": "general-dma",
+            "options": {
+              "companion_irq_base": 83
+            }
+          },
+          {
+            "name": "dma_address_high",
+            "base": 4287686472,
+            "size": 64,
+            "kind": "dma-address-high"
+          },
+          {
+            "name": "dma_routes",
+            "base": 4287685888,
+            "size": 32,
+            "kind": "dma-request-routing"
           }
         ],
         "engines": [

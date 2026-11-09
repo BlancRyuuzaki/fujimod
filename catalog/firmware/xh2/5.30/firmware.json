@@ -39,8 +39,15 @@
           "xor": 255
         },
         "preload": [],
-        "gic_initial": {},
-        "gic_redistributor_initial": [],
+        "gic_initial": {
+          "0x0": 1
+        },
+        "gic_redistributor_initial": [
+          {"core": 0, "offset": 20, "size": 4, "value": 0},
+          {"core": 1, "offset": 20, "size": 4, "value": 0},
+          {"core": 2, "offset": 20, "size": 4, "value": 0},
+          {"core": 3, "offset": 20, "size": 4, "value": 0}
+        ],
         "cpu": [
           {
             "id": 0,
@@ -56,9 +63,9 @@
             },
             "sysregs": {
               "CPACR_EL1": 3145728,
-              "ICC_IGRPEN0_EL1": 0,
+              "ICC_IGRPEN0_EL1": 1,
               "ICC_IGRPEN1_EL1": 0,
-              "ICC_PMR_EL1": 0,
+              "ICC_PMR_EL1": 255,
               "SCTLR_EL1": 0,
               "SP_EL0": 129088,
               "SP_EL1": 0,
@@ -83,9 +90,9 @@
             },
             "sysregs": {
               "CPACR_EL1": 3145728,
-              "ICC_IGRPEN0_EL1": 0,
+              "ICC_IGRPEN0_EL1": 1,
               "ICC_IGRPEN1_EL1": 0,
-              "ICC_PMR_EL1": 0,
+              "ICC_PMR_EL1": 255,
               "SCTLR_EL1": 0,
               "SP_EL0": 157760,
               "SP_EL1": 0,
@@ -110,9 +117,9 @@
             },
             "sysregs": {
               "CPACR_EL1": 3145728,
-              "ICC_IGRPEN0_EL1": 0,
+              "ICC_IGRPEN0_EL1": 1,
               "ICC_IGRPEN1_EL1": 0,
-              "ICC_PMR_EL1": 0,
+              "ICC_PMR_EL1": 255,
               "SCTLR_EL1": 0,
               "SP_EL0": 186432,
               "SP_EL1": 0,
@@ -137,9 +144,9 @@
             },
             "sysregs": {
               "CPACR_EL1": 3145728,
-              "ICC_IGRPEN0_EL1": 0,
+              "ICC_IGRPEN0_EL1": 1,
               "ICC_IGRPEN1_EL1": 0,
-              "ICC_PMR_EL1": 0,
+              "ICC_PMR_EL1": 255,
               "SCTLR_EL1": 0,
               "SP_EL0": 215104,
               "SP_EL1": 0,
@@ -152,9 +159,10 @@
           }
         ],
         "limits": [
-          "Experimental continuation candidate matching the four-core emulator fixture; no physical four-core execution is established.",
+          "Experimental four-core startup candidate; no physical four-core execution is established.",
           "EL3t entry, x0/x1, boot-core SP_EL0, CPACR_EL1 FPEN, SCR_EL3 RW/ST, and SPSR_EL3 EL1t mode are source-backed; other inherited register values are candidates.",
           "Per-core stacks for cores 1-3 are candidate offsets from the boot-core stack, not measured physical stacks.",
+          "Initial group-0 distributor enable, redistributor awake state, CPU priority mask 255 and group-0 interface enables are candidate inherited GIC state, not measured reset values.",
           "Initial image regions identify registered initialized segment bytes; they do not establish physical RAM placement, BSS contents, or hardware validation."
         ]
       }
