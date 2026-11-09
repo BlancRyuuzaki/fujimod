@@ -7424,11 +7424,58 @@
         }
       ]
     },
-    "firmware_update": null,
-    "updater": null,
+    "firmware_update": {
+      "hold": [
+        {
+          "id": "disp_back_button"
+        }
+      ]
+    },
+    "updater": {
+      "public_version": [
+        5,
+        48
+      ],
+      "version_getter": {
+        "address": 21608276,
+        "size": 88,
+        "sha256": "ffacc13afd1a75fccf8457865241dd8241a91645cf60d14d8e41778533015ba5"
+      },
+      "configuration": {
+        "kind": "reader",
+        "address": 21605932
+      },
+      "getter_arguments": 1,
+      "comparison": {
+        "address": 45780664,
+        "size": 568,
+        "sha256": "6e0a82179b7169ee35beaff15aeaf1a38dad8400092dbcfc8aab8e76b69ab4f8"
+      },
+      "target_major": 39145784,
+      "target_minor": 39145788,
+      "current_major": 39145792,
+      "current_minor": 39145796,
+      "version_producer": {
+        "address": 48813404,
+        "size": 164,
+        "sha256": "439becc1a204f1d6b9b1a929e764eff78e2026afe4c836670d9e55239aa830aa"
+      },
+      "producer_stop": 48813440,
+      "version_context_pointer": 65097312,
+      "version_context": 39145256,
+      "current_major_setter": {
+        "address": 48818828,
+        "size": 56,
+        "sha256": "c08955ef1673357e0497a086659bb0c82bcc1e478a16aca3f105ee034446ed67"
+      },
+      "current_minor_setter": {
+        "address": 48818884,
+        "size": 56,
+        "sha256": "ea415e555ce5736cedcde0cefb62c889b6040a7ac6c62eda2bdb77103b27e4a0"
+      }
+    },
     "missing": [
-      "version-independent stock updater acceptance",
-      "XP5 bindings: setup/header: No unique aligned AArch64 reset register-clear sequence"
+      "XP5 bindings: sd_route: expected one complete instruction contract, found 0"
     ]
   },
   {
@@ -15777,11 +15824,17 @@
         }
       ]
     },
-    "firmware_update": null,
+    "firmware_update": {
+      "hold": [
+        {
+          "id": "disp_back_bluetooth_button"
+        }
+      ]
+    },
     "updater": null,
     "missing": [
       "version-independent stock updater acceptance",
-      "XP5 bindings: setup/header: No unique aligned AArch64 reset register-clear sequence"
+      "XP5 bindings: sd_host: expected one complete instruction contract, found 0"
     ]
   },
   {
