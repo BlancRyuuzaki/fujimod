@@ -285,6 +285,23 @@ impl Gic {
                 // are RAO/WI; Enable is retained per core.
                 Ok(7 | u64::from(self.state.interfaces[core].system_register_enable) * 8)
             }
+            0xe64d => {
+                if value.is_some_and(|word| word & !15 != 0) {
+                    return Err("unsupported GICv3 ICC_SRE_EL2 bits".into());
+                }
+                // This system-interface-only model selects the permitted
+                // RAO/WI implementation of SRE, DIB, DFB, and Enable.
+                Ok(15)
+            }
+            0xf667 => {
+                if let Some(word) = value {
+                    if !matches!(word, 0 | 3) {
+                        return Err("unsupported asymmetric GICv3 Group 1 enables".into());
+                    }
+                    self.state.interfaces[core].enabled[1] = word == 3;
+                }
+                Ok(if self.state.interfaces[core].enabled[1] { 3 } else { 0 })
+            }
             0xc230 => {
                 if let Some(v) = value {
                     self.state.interfaces[core].pmr = v as u8;
@@ -631,6 +648,16 @@ mod tests {
         g.restore(&saved).unwrap();
         assert_eq!(g.system(0, 0xf665, None).unwrap(), 15);
         assert!(g.system(0, 0xf665, Some(16)).is_err());
+    }
+    #[test]
+    fn el2_sre_and_el3_group1_accept_only_modeled_settings() {
+        let mut g = super::Gic::new(vec![0], 128).unwrap();
+        assert_eq!(g.system(0, 0xe64d, Some(9)).unwrap(), 15);
+        assert!(g.system(0, 0xe64d, Some(16)).is_err());
+        assert_eq!(g.system(0, 0xf667, Some(3)).unwrap(), 3);
+        assert_eq!(g.system(0, 0xf667, None).unwrap(), 3);
+        assert!(g.system(0, 0xf667, Some(1)).is_err());
+        assert_eq!(g.system(0, 0xf667, None).unwrap(), 3);
     }
     use super::*;
     fn enabled(affinities: Vec<u32>) -> Gic {

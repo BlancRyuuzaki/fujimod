@@ -37,6 +37,8 @@ pub fn system_register(name: &str) -> Result<super::arm::SystemRegister, String>
         "ICC_IGRPEN0_EL1" => 0xc666,
         "ICC_IGRPEN1_EL1" => 0xc667,
         "ICC_SRE_EL1" => 0xc665,
+        "ICC_SRE_EL2" => 0xe64d,
+        "ICC_IGRPEN1_EL3" => 0xf667,
         _ => u16::from_str_radix(name.trim_start_matches("0x"), 16)
             .map_err(|_| format!("unknown sysreg {name}"))?,
     };
@@ -621,7 +623,9 @@ pub fn framework_instruction(word: u32) -> bool {
             || r.crn == 14
             || r.crn == 15
             || encoding == 0xc230
+            || encoding == 0xe64d
             || encoding == 0xf665
+            || encoding == 0xf667
             || (r.op0 == 3 && r.op1 == 0 && r.crn == 12 && (8..=15).contains(&r.crm))
     } else {
         matches!(word, 0xd503205f | 0xd503207f | 0xd503209f | 0xd50320bf)

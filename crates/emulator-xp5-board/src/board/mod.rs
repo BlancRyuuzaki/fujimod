@@ -4,7 +4,7 @@ use fujimod_emulator_devices::graph::{DeviceGraph, DeviceWindow};
 use fujimod_emulator_devices::parts::controls::Controls;
 use fujimod_emulator_xp5_io::{
     adc, discarded_read, gates, gpio, i2c, mailbox, memory_configuration, reset_handshake,
-    sd_controller_wrapper, timer, usb_connection_status, write_only_registers,
+    register_input, sd_controller_wrapper, timer, usb_connection_status, write_only_registers,
 };
 use fujimod_emulator_xp5_display::{display, panel_clock, panel_serial};
 use fujimod_emulator_xp5_storage::{flash_storage, flash_storage_controller, flash_storage_dma};
@@ -42,6 +42,29 @@ fn register_with_resources(
     let clocks = &resources.clocks;
     let companion = resources.companion.as_ref().map(|c| c.pins.companion);
     match window.kind.as_str() {
+        "register-input" => {
+            if window.size != 4
+                || window.options.len() != 1
+                || !window.options.contains_key("value")
+            {
+                return Err("register-input requires a 4-byte window and only value".into());
+            }
+            let value = window
+                .options
+                .get("value")
+                .and_then(toml::Value::as_integer)
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or("register-input requires an unsigned 32-bit value")?;
+            bus.register(
+                window.base,
+                window.size,
+                Box::new(register_input::RegisterInput::new(
+                    window.base,
+                    window.size,
+                    value,
+                )?),
+            )?;
+        }
         "unmodeled-bus-drain" => {
             if !window.options.is_empty() { return Err("unmodeled bus drain takes no options".into()); }
             bus.register(window.base, window.size, Box::new(UnmodeledBusDrain))?;

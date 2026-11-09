@@ -78,6 +78,34 @@ mod tests {
     }
 
     #[test]
+    fn unicorn_routes_gic_system_interface_setup() {
+        let mut board = board();
+        let msr = |register: u32, source: u32| 0xd500_0000 | register << 5 | source;
+        let mrs = |register: u32, target: u32| 0xd520_0000 | register << 5 | target;
+        let code = [
+            msr(0xe64d, 0),
+            mrs(0xe64d, 1),
+            msr(0xf667, 4),
+            mrs(0xf667, 5),
+            0xd503_201f,
+        ];
+        board
+            .write_memory(
+                0,
+                0x1000,
+                &code.into_iter().flat_map(u32::to_le_bytes).collect::<Vec<_>>(),
+            )
+            .unwrap();
+        board.write_register(0, Register::X(0), 9).unwrap();
+        board.write_register(0, Register::X(4), 3).unwrap();
+        board.run_for_instructions(5, 1000).unwrap();
+        assert_eq!(board.read_register(0, Register::X(1)).unwrap(), 15);
+        assert_eq!(board.read_register(0, Register::X(5)).unwrap(), 3);
+        assert_eq!(board.read_register(0, Register::Pc).unwrap(), 0x1014);
+        assert_eq!(board.instruction_counts(), [5]);
+    }
+
+    #[test]
     fn unicorn_counters_consume_guest_ticks_and_wfi_advances_pc_once() {
         let mut board = board();
         let msr = |r: u32, rt: u32| 0xd5000000 | r << 5 | rt;
@@ -322,8 +350,11 @@ impl State {
             let r = arm::SystemRegister::from_encoding(encoding);
             let framework = fujimod_emulator_cpu::arm64::framework_instruction(word);
             if framework {
-                if encoding == 0xf665 && pstate & 12 != 12 {
-                    return Err("ICC_SRE_EL3 requires EL3".into());
+                if matches!(encoding, 0xf665 | 0xf667) && pstate & 12 != 12 {
+                    return Err("ICC EL3 register requires EL3".into());
+                }
+                if encoding == 0xe64d && pstate & 12 < 8 {
+                    return Err("ICC_SRE_EL2 requires EL2 or EL3".into());
                 }
                 if pstate & 12 == 0 {
                     return Err("AArch64 EL0 framework register access is unsupported".into());
