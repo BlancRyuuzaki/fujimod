@@ -136,6 +136,33 @@ fn register_with_resources(
                 Box::new(i2c::IdleI2c::new(window.base, idle_lines)?),
             )?;
         }
+        "i2c-register-clients" => {
+            if !matches!(window.base, 0xff925000 | 0xff926000)
+                || window.size != 0x1000 || window.options.keys().any(|key| {
+                !matches!(key.as_str(), "irq" | "idle_lines" | "addresses" | "writable_registers")
+            }) {
+                return Err("invalid register-client I2C window or options".into());
+            }
+            let integer = |key: &str| -> Result<u32, String> {
+                window.options.get(key)
+                    .and_then(toml::Value::as_integer)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| format!("register-client I2C requires {key}"))
+            };
+            let bytes = |key: &str| -> Result<Vec<u8>, String> {
+                window.options.get(key)
+                    .and_then(toml::Value::as_array)
+                    .ok_or_else(|| format!("register-client I2C requires {key}"))?
+                    .iter().map(|value| {
+                        value.as_integer().and_then(|number| u8::try_from(number).ok())
+                            .ok_or_else(|| format!("invalid register-client I2C {key}"))
+                    }).collect()
+            };
+            bus.register(window.base, window.size, Box::new(
+                i2c::RegisterClientsI2c::new(window.base, integer("irq")?,
+                    integer("idle_lines")?, bytes("addresses")?, bytes("writable_registers")?)?
+            ))?;
+        }
         "battery-i2c" => {
             if window.base != 0xff925000 || window.size != 0x1000 {
                 return Err("invalid battery I2C1 window".into());

@@ -69,7 +69,7 @@ pub fn register_all(
     let mut connections = BTreeMap::new();
     let mut serials = vec![];
     for w in windows.iter().filter(|w| w.kind == "pl022") {
-        if w.base != 0xff911000 || w.size != 0x1000 {
+        if !matches!(w.base, 0xff911000 | 0xff915000) || w.size != 0x1000 {
             return Err("invalid XP5 PL022 window".into());
         }
         let wiring: SerialWiring = options(w)?;
