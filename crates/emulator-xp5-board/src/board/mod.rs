@@ -242,15 +242,23 @@ fn register_with_resources(
             )?;
         }
         "write-only-registers" => {
-            if !window.options.is_empty() {
-                return Err("write-only-registers takes no options".into());
+            if window.options.keys().any(|option| option != "width") {
+                return Err("write-only-registers accepts only width".into());
             }
+            let width = match window.options.get("width") {
+                None => 4,
+                Some(value) => value.as_integer()
+                    .and_then(|value| u8::try_from(value).ok())
+                    .filter(|width| matches!(width, 2 | 4))
+                    .ok_or("write-only-registers width must be 2 or 4")?,
+            };
             bus.register(
                 window.base,
                 window.size,
                 Box::new(write_only_registers::WriteOnlyRegisters::new(
                     window.base,
                     window.size,
+                    width,
                 )?),
             )?;
         }
