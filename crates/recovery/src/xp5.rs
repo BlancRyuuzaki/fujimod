@@ -459,7 +459,7 @@ pub(crate) fn package_with_storage(
         put(&mut program, host_prelude, setup.host_prelude.len() as u32)?;
         for (n, op) in setup.host_prelude.iter().enumerate() {
             require(
-                op.kind <= 5
+                op.kind <= 6
                     && (op.kind == 2
                         || if op.kind == 3 || op.kind == 5 {
                             mmio_halfword(op.address)
@@ -470,7 +470,8 @@ pub(crate) fn package_with_storage(
                         || (op.mask <= u16::MAX.into() && op.value <= u16::MAX.into()))
                     && (op.kind != 5
                         || (op.mask != 0 && op.mask <= u16::MAX.into()
-                            && (1..=10_000).contains(&op.value))),
+                            && (1..=10_000).contains(&op.value)))
+                    && (op.kind != 6 || (op.mask == 0 && op.value < 3)),
                 "Invalid XP5 SD host prelude operation",
             )?;
             let at = host_prelude + 8 + n * 24;
@@ -832,19 +833,23 @@ mod tests {
     #[test]
     fn host_prelude_handshake_serializes_and_bounds_attempts() {
         let (data, mut setup, ram) = fixture();
-        setup.host_prelude = vec![Operation {
-            address: 0xff9b222c,
-            mask: 1,
-            value: 1000,
-            kind: 5,
-        }];
+        setup.host_prelude = vec![
+            Operation { address: 0xff9b222c, mask: 1, value: 1000, kind: 5 },
+            Operation { address: 0xff9b2244, mask: 0, value: 0, kind: 6 },
+        ];
         let files = package(&data, &setup, Some(ram.clone()), 0,
                             StartupStop::AfterCrcWithErrorPackets, false).unwrap();
         let at = 0xc000 + template::SETUP_SD_HOST_PRELUDE;
-        assert_eq!(word(&files[0].bytes, at).unwrap(), 1);
+        assert_eq!(word(&files[0].bytes, at).unwrap(), 2);
         assert_eq!(word(&files[0].bytes, at + 16).unwrap(), 1);
         assert_eq!(word(&files[0].bytes, at + 20).unwrap(), 1000);
         assert_eq!(word(&files[0].bytes, at + 24).unwrap(), 5);
+        assert_eq!(word(&files[0].bytes, at + 8 + 24 + 12).unwrap(), 0);
+        assert_eq!(word(&files[0].bytes, at + 8 + 24 + 16).unwrap(), 6);
+        setup.host_prelude[1].value = 3;
+        assert!(package(&data, &setup, Some(ram.clone()), 0,
+                        StartupStop::AfterCrcWithErrorPackets, false).is_err());
+        setup.host_prelude[1].value = 0;
         setup.host_prelude[0].value = 0;
         assert!(package(&data, &setup, Some(ram.clone()), 0,
                         StartupStop::AfterCrcWithErrorPackets, false).is_err());

@@ -7818,6 +7818,12 @@
           "kind": 5
         },
         {
+          "address": 4288356932,
+          "mask": 0,
+          "value": 0,
+          "kind": 6
+        },
+        {
           "address": 4288356904,
           "mask": 65280,
           "value": 48896,
@@ -7828,6 +7834,18 @@
           "mask": 7,
           "value": 7,
           "kind": 3
+        },
+        {
+          "address": 4288356900,
+          "mask": 0,
+          "value": 1,
+          "kind": 6
+        },
+        {
+          "address": 4288356448,
+          "mask": 0,
+          "value": 2,
+          "kind": 6
         },
         {
           "address": 4287678784,
@@ -8151,6 +8169,18 @@
             "decoded_size": 12042160,
             "sha256": "3aacc331157312a03531266cd9aca0daea28597b9f3535bb6141105ad7354b4d"
           },
+          "offset": 2782204,
+          "size": 88,
+          "sha256": "67fec65b53d9563494e13886d31bbe96c29ec0232955ad4f9654be97407a4722"
+        },
+        {
+          "source": {
+            "dat_offset": 3146356,
+            "size": 5415597,
+            "compression": "method4",
+            "decoded_size": 12042160,
+            "sha256": "3aacc331157312a03531266cd9aca0daea28597b9f3535bb6141105ad7354b4d"
+          },
           "offset": 2783004,
           "size": 116,
           "sha256": "e36001773b7dae3746172e420ba1b243fdc49672ec0dceac170aacd013fe411e"
@@ -8259,9 +8289,33 @@
             "decoded_size": 12042160,
             "sha256": "3aacc331157312a03531266cd9aca0daea28597b9f3535bb6141105ad7354b4d"
           },
+          "offset": 2788788,
+          "size": 332,
+          "sha256": "c83673b96efcd4ea9cf5824b27c916dc1b1964f8df492665bb01dc26cf7f649b"
+        },
+        {
+          "source": {
+            "dat_offset": 3146356,
+            "size": 5415597,
+            "compression": "method4",
+            "decoded_size": 12042160,
+            "sha256": "3aacc331157312a03531266cd9aca0daea28597b9f3535bb6141105ad7354b4d"
+          },
           "offset": 2789120,
           "size": 156,
           "sha256": "bff89bdb67193c30054c3f94f5e4edf5e8fd2f678ca2af46ac3ea0d65b916969"
+        },
+        {
+          "source": {
+            "dat_offset": 3146356,
+            "size": 5415597,
+            "compression": "method4",
+            "decoded_size": 12042160,
+            "sha256": "3aacc331157312a03531266cd9aca0daea28597b9f3535bb6141105ad7354b4d"
+          },
+          "offset": 2789324,
+          "size": 56,
+          "sha256": "10dbc6bce640af9ec6463311f0b29895486e6e65ca627a710487e472c87ef0e5"
         },
         {
           "source": {
