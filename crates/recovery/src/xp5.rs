@@ -1,5 +1,6 @@
 //! Raw XP5 entry, serial NOR preparation, and optional post-DDR FAT32 loading.
 use crate::image::{self, File, Result, Source, extent, put, require, word};
+use crate::StartupStop;
 use serde::{Deserialize, Serialize};
 mod banks;
 pub use banks::Banks;
@@ -187,14 +188,33 @@ pub fn package(
     setup: &Setup,
     ram: Option<Vec<u8>>,
     success_hold_seconds: u32,
+    stop: StartupStop,
+    prepare_installed_flash: bool,
 ) -> Result<Vec<File>> {
-    package_with_storage(inverted, setup, ram, success_hold_seconds, None)
+    package_with_storage(
+        inverted,
+        setup,
+        ram,
+        success_hold_seconds,
+        stop,
+        prepare_installed_flash,
+        None,
+    )
 }
 
 pub(crate) fn package_with_storage(
-    inverted: &[u8], setup: &Setup, ram: Option<Vec<u8>>, success_hold_seconds: u32,
+    inverted: &[u8],
+    setup: &Setup,
+    ram: Option<Vec<u8>>,
+    success_hold_seconds: u32,
+    stop: StartupStop,
+    prepare_installed_flash: bool,
     storage: Option<&[u8]>,
 ) -> Result<Vec<File>> {
+    require(
+        stop == StartupStop::Continue || ram.is_some(),
+        "Diagnostic stop requires an SD image",
+    )?;
     let prefix = setup.verify(inverted)?;
     let copied_end = setup.base + setup.low_length as u64;
     // XP5 raw-entry SRAM reserves its upper workspace for the boot service.
@@ -236,10 +256,10 @@ pub(crate) fn package_with_storage(
         "XP5 prelude exceeds private stack",
     )?;
     let cfg = template::XP5_SETUP_CONFIGURATION;
-    let mut empty = vec![0; 208];
+    let mut empty = vec![0; 216];
     empty[0] = 2;
     require(
-        extent(&program, cfg, 208)? == empty,
+        extent(&program, cfg, 216)? == empty,
         "XP5 setup configuration template changed",
     )?;
     let flash = &setup.flash;
@@ -316,7 +336,8 @@ pub(crate) fn package_with_storage(
         // two billion iterations per second, 2,048 units take >= 1.024 s.
         u64::from(success_hold_seconds) * 2_048,
     )?;
-    put64(&mut program, cfg + 200, u64::from(ram.is_none()))?;
+    put64(&mut program, cfg + 200, u64::from(ram.is_none() || prepare_installed_flash))?;
+    put64(&mut program, cfg + 208, u64::from(stop != StartupStop::Continue))?;
     let restore = template::XP5_SETUP_RETURN_BRANCH;
     require(
         word(&program, restore)? == 0x14000000,
@@ -414,15 +435,16 @@ pub(crate) fn package_with_storage(
         }
         let request = template::SETUP_SD_REQUEST;
         require(
-            extent(&program, request, 40)? == [1u64, 0, 0, 0, 0].map(u64::to_le_bytes).concat(),
+            extent(&program, request, 48)? == [2u64, 0, 0, 0, 0, 0].map(u64::to_le_bytes).concat(),
             "XP5 request template changed",
         )?;
         for (n, value) in [
-            1,
+            2,
             ram.len() as u64,
             u64::from(crate::xp4::crc32(&ram)),
             100,
             100000,
+            stop as u64,
         ]
         .into_iter()
         .enumerate()
@@ -593,7 +615,7 @@ mod tests {
         let (data, s, ram) = fixture();
         for payload in [None, Some(ram.clone())] {
             let combined = payload.is_some();
-            let files = package(&data, &s, payload, 0).unwrap();
+            let files = package(&data, &s, payload, 0, StartupStop::Continue, false).unwrap();
             let raw = &files[0].bytes;
             assert_eq!(files.len(), if combined { 2 } else { 1 });
             assert_eq!(files[0].name, "marble_init.bin");
@@ -642,11 +664,11 @@ mod tests {
         let (data, s, ram) = fixture();
         assert_eq!(crate::StartupOptions::default().success_hold_seconds, 0);
         for payload in [None, Some(ram)] {
-            let normal = package(&data, &s, payload.clone(), 0).unwrap();
+            let normal = package(&data, &s, payload.clone(), 0, StartupStop::Continue, false).unwrap();
             let at = 0xc000 + template::XP5_SETUP_CONFIGURATION + 192;
             assert_eq!(&normal[0].bytes[at..at + 8], &[0; 8]);
             for seconds in [1, 3, u32::MAX] {
-                let held = package(&data, &s, payload.clone(), seconds).unwrap();
+                let held = package(&data, &s, payload.clone(), seconds, StartupStop::Continue, false).unwrap();
                 let mut expected = normal[0].bytes.clone();
                 put64(&mut expected, at, u64::from(seconds) * 2_048).unwrap();
                 assert_eq!(expected, held[0].bytes);
@@ -656,37 +678,62 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn diagnostic_stops_change_only_the_stop_request() {
+        let (data, setup, ram) = fixture();
+        let normal = package(&data, &setup, Some(ram.clone()), 0, StartupStop::Continue, false).unwrap();
+        let at = 0xc000 + template::SETUP_SD_REQUEST + 40;
+        for stop in [StartupStop::AfterCardInit, StartupStop::AfterSetup, StartupStop::AfterCrc] {
+            assert!(package(&data, &setup, None, 0, stop, false).is_err());
+            let checked = package(&data, &setup, Some(ram.clone()), 0, stop, false).unwrap();
+            let mut expected = normal[0].bytes.clone();
+            put64(&mut expected, 0xc000 + template::XP5_SETUP_CONFIGURATION + 208, 1).unwrap();
+            put64(&mut expected, at, stop as u64).unwrap();
+            assert_eq!(checked[0].bytes, expected);
+            assert_eq!(checked[1].bytes, normal[1].bytes);
+        }
+    }
+    #[test]
+    fn installed_flash_preparation_changes_only_the_entry_source() {
+        let (data, setup, ram) = fixture();
+        let normal = package(&data, &setup, Some(ram.clone()), 0, StartupStop::AfterCrc, false).unwrap();
+        let prepared = package(&data, &setup, Some(ram), 0, StartupStop::AfterCrc, true).unwrap();
+        let mut expected = normal[0].bytes.clone();
+        put64(&mut expected, 0xc000 + template::XP5_SETUP_CONFIGURATION + 200, 1).unwrap();
+        assert_eq!(prepared[0].bytes, expected);
+        assert_eq!(prepared[1].bytes, normal[1].bytes);
+    }
 
     #[test]
     fn changed_source_and_incomplete_bindings_refuse() {
         let (data, s, ram) = fixture();
         let mut changed = data.clone();
         changed[0x1000] ^= 1;
-        assert!(package(&changed, &s, None, 0).is_err());
+        assert!(package(&changed, &s, None, 0, StartupStop::Continue, false).is_err());
         let mut changed = s.clone();
         changed.flash.pins.clear();
-        assert!(package(&data, &changed, None, 0).is_err());
+        assert!(package(&data, &changed, None, 0, StartupStop::Continue, false).is_err());
         let mut changed = s.clone();
         changed.initializer.sha256 = "0".repeat(64);
-        assert!(package(&data, &changed, None, 0).is_err());
+        assert!(package(&data, &changed, None, 0, StartupStop::Continue, false).is_err());
         let mut changed = s.clone();
         changed.board.operations[0].kind = 3;
-        assert!(package(&data, &changed, Some(ram.clone()), 0).is_err());
+        assert!(package(&data, &changed, Some(ram.clone()), 0, StartupStop::Continue, false).is_err());
         let mut changed = s.clone();
         changed.gate_offset = 0x940;
-        assert!(package(&data, &changed, Some(ram), 0).is_err());
+        assert!(package(&data, &changed, Some(ram), 0, StartupStop::Continue, false).is_err());
         let mut changed = s.clone();
         changed.stack = s.base + 0x38000;
-        assert!(package(&data, &changed, None, 0).is_err());
+        assert!(package(&data, &changed, None, 0, StartupStop::Continue, false).is_err());
     }
     #[test]
     fn oversized_header_and_changed_payload_refuse() {
         let (mut data, mut s, mut ram) = fixture();
         ram[0x20] ^= 1;
-        assert!(package(&data, &s, Some(ram), 0).is_err());
+        assert!(package(&data, &s, Some(ram), 0, StartupStop::Continue, false).is_err());
         put(&mut data, 0x14, 254).unwrap();
         s.prefix = source(&data[..0x40000]);
         s.proofs[0].source = s.prefix.clone();
-        assert!(package(&data, &s, None, 0).is_err());
+        assert!(package(&data, &s, None, 0, StartupStop::Continue, false).is_err());
     }
 }

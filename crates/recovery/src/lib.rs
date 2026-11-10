@@ -28,6 +28,18 @@ pub use xp5::{
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct StartupOptions {
     pub success_hold_seconds: u32,
+    pub stop: StartupStop,
+    pub prepare_installed_flash: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u64)]
+pub enum StartupStop {
+    #[default]
+    Continue = 0,
+    AfterSetup = 1,
+    AfterCrc = 2,
+    AfterCardInit = 3,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -242,6 +254,8 @@ impl Recipe {
             matches!(self.generation, Generation::Xp5),
             "Stage one requires XP5",
         )?;
+        require(options.stop == StartupStop::Continue, "Diagnostic stop requires an SD image")?;
+        require(!options.prepare_installed_flash, "Stage one already prepares installed flash")?;
         require(
             source.len() == self.source_size,
             "Update size differs from recipe",
@@ -258,6 +272,8 @@ impl Recipe {
             setup,
             None,
             options.success_hold_seconds,
+            StartupStop::Continue,
+            false,
         )
     }
     /// Boot files retain the stock updater and storage drivers. DAT is copied
@@ -337,6 +353,14 @@ impl Recipe {
         require(
             options.success_hold_seconds == 0 || matches!(self.generation, Generation::Xp5),
             "Success hold requires XP5",
+        )?;
+        require(
+            options.stop == StartupStop::Continue || matches!(self.generation, Generation::Xp5),
+            "Diagnostic stop requires XP5",
+        )?;
+        require(
+            !options.prepare_installed_flash || matches!(self.generation, Generation::Xp5),
+            "Installed-flash preparation requires XP5",
         )?;
         require(
             source.len() == self.source_size,
@@ -421,6 +445,8 @@ impl Recipe {
                         setup,
                         Some(image::transform(&inverted, plan)?),
                         options.success_hold_seconds,
+                        options.stop,
+                        options.prepare_installed_flash,
                         storage,
                     )?
                 }

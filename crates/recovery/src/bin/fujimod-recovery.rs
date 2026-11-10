@@ -1,12 +1,14 @@
 //! Offline construction and catalog inspection. No device access.
-use fujimod_recovery::{Recipe, StartupOptions, availability};
+use fujimod_recovery::{Recipe, StartupOptions, StartupStop, availability};
 use std::{env, fs, path::PathBuf};
 fn construction_args(
     args: &[String],
     allow_hold: bool,
-) -> Result<(&str, &str, &str, u32), Box<dyn std::error::Error>> {
+    allow_flash: bool,
+) -> Result<(&str, &str, &str, u32, bool), Box<dyn std::error::Error>> {
     let mut positional = Vec::new();
     let mut hold = None;
+    let mut flash = false;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         if arg == "--success-hold-seconds" {
@@ -21,6 +23,14 @@ fn construction_args(
                 Some(value.parse::<u32>().map_err(
                     |_| "--success-hold-seconds requires a non-negative 32-bit integer",
                 )?);
+        } else if arg == "--prepare-installed-flash" {
+            if !allow_flash {
+                return Err("--prepare-installed-flash requires startup, card-init-check, setup-check or read-check".into());
+            }
+            if flash {
+                return Err("--prepare-installed-flash was specified twice".into());
+            }
+            flash = true;
         } else if arg.starts_with("--") {
             return Err(format!("Unknown construction option: {arg}").into());
         } else {
@@ -35,6 +45,7 @@ fn construction_args(
         positional[1],
         positional[2],
         hold.unwrap_or(0),
+        flash,
     ))
 }
 
@@ -53,8 +64,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&rows)?);
         }
         Some(
-            command @ ("build" | "green-led" | "startup" | "card-startup" | "stage-one"
-            | "rescue-baseline"),
+            command @ ("build" | "green-led" | "startup" | "card-init-check" | "setup-check" | "read-check" | "card-startup"
+            | "stage-one" | "rescue-baseline"),
         ) => {
             let mut inputs = args[1..].to_vec();
             let storage = if command == "card-startup" {
@@ -65,10 +76,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 None
             };
-            let (firmware, dat, output, success_hold_seconds) =
-                construction_args(&inputs, matches!(command, "startup" | "stage-one"))?;
+            let (firmware, dat, output, success_hold_seconds, prepare_installed_flash) =
+                construction_args(&inputs, matches!(command, "startup" | "stage-one"),
+                                  matches!(command, "startup" | "card-init-check" | "setup-check" | "read-check"))?;
             let options = StartupOptions {
                 success_hold_seconds,
+                stop: match command {
+                    "card-init-check" => StartupStop::AfterCardInit,
+                    "setup-check" => StartupStop::AfterSetup,
+                    "read-check" => StartupStop::AfterCrc,
+                    _ => StartupStop::Continue,
+                },
+                prepare_installed_flash,
             };
             let recipe = Recipe::bundled(firmware)?.ok_or("Missing recovery recipe")?;
             let source = fs::read(dat)?;
@@ -96,7 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => {
             return Err(
-                "Usage: fujimod-recovery list | build|green-led|startup|stage-one|rescue-baseline FIRMWARE DAT NEW_DIRECTORY [--success-hold-seconds N] | card-startup FIRMWARE DAT STORAGE_IMAGE NEW_DIRECTORY"
+                "Usage: fujimod-recovery list | build|green-led|startup|card-init-check|setup-check|read-check|stage-one|rescue-baseline FIRMWARE DAT NEW_DIRECTORY [--success-hold-seconds N] [--prepare-installed-flash] | card-startup FIRMWARE DAT STORAGE_IMAGE NEW_DIRECTORY"
                     .into(),
             );
         }
@@ -113,16 +132,16 @@ mod tests {
     #[test]
     fn success_hold_defaults_to_zero_and_accepts_either_position() {
         assert_eq!(
-            construction_args(&args(&["camera", "update", "output"]), true).unwrap(),
-            ("camera", "update", "output", 0)
+            construction_args(&args(&["camera", "update", "output"]), true, true).unwrap(),
+            ("camera", "update", "output", 0, false)
         );
         for values in [
             args(&["camera", "update", "output", "--success-hold-seconds", "3"]),
             args(&["--success-hold-seconds", "3", "camera", "update", "output"]),
         ] {
             assert_eq!(
-                construction_args(&values, true).unwrap(),
-                ("camera", "update", "output", 3)
+                construction_args(&values, true, true).unwrap(),
+                ("camera", "update", "output", 3, false)
             );
         }
     }
@@ -138,7 +157,7 @@ mod tests {
                         "--success-hold-seconds",
                         value
                     ]),
-                    true
+                    true, false
                 )
                 .is_err()
             );
@@ -146,7 +165,7 @@ mod tests {
         assert!(
             construction_args(
                 &args(&["camera", "update", "output", "--success-hold-seconds"]),
-                true
+                true, false
             )
             .is_err()
         );
@@ -161,16 +180,26 @@ mod tests {
                     "--success-hold-seconds",
                     "0"
                 ]),
-                true
+                true, false
             )
             .is_err()
         );
         assert!(
             construction_args(
                 &args(&["camera", "update", "output", "--success-hold-seconds", "3"]),
-                false
+                false, false
             )
             .is_err()
         );
+    }
+    #[test]
+    fn installed_flash_option_is_explicit_and_only_allowed_for_full_xp5_builds() {
+        let command = args(&["camera", "update", "output", "--prepare-installed-flash"]);
+        assert_eq!(construction_args(&command, false, true).unwrap(),
+                   ("camera", "update", "output", 0, true));
+        assert!(construction_args(&command, true, false).is_err());
+        let duplicate = args(&["camera", "update", "output", "--prepare-installed-flash",
+                               "--prepare-installed-flash"]);
+        assert!(construction_args(&duplicate, false, true).is_err());
     }
 }

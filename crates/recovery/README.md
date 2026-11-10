@@ -153,6 +153,25 @@ no filesystem, USB, camera, or network access.
 
 The native CLI exposes `list`, `build FIRMWARE DAT NEW_DIRECTORY`, and
 `startup FIRMWARE DAT NEW_DIRECTORY`, and `stage-one FIRMWARE DAT NEW_DIRECTORY`.
+For an XP5 transport check, `read-check FIRMWARE DAT NEW_DIRECTORY` builds the
+same card image as `startup` but makes its first stage stop after the complete
+`ffboot.bin` read and CRC32 match. The status lamp starts green, changes to
+orange when the card entry prelude hands off to stock setup, and turns steady
+red after the read and CRC32 match. It does not release the other cores or
+execute the loaded image, so red identifies successful card transport
+independently of image handoff. If the lamp remains green or orange, inspect
+the earlier prelude, initial card mount, stock setup and card-read stages.
+`card-init-check FIRMWARE DAT NEW_DIRECTORY` stops with a steady red lamp
+after the initial card mount, before stock setup. `setup-check FIRMWARE DAT
+NEW_DIRECTORY` stops with steady red after stock setup returns, before the
+second card initialization and `ffboot.bin` read. Orange without red in the
+setup check does not distinguish the first card mount from stock setup.
+Neither diagnostic executes the loaded image.
+For XP5 `startup`, `card-init-check`, `setup-check` and `read-check`, `--prepare-installed-flash` runs the
+checked installed-flash controller initialization and timing scan before
+continuing stock setup. It changes only that entry-source choice; the SD image
+and its CRC remain the same. Use it when the stock setup needs that installed
+flash state, and keep its dependency on readable installed flash explicit.
 
 `rescue-baseline FIRMWARE DAT NEW_DIRECTORY` reconstructs the original XP4 cold
 pair before firmware-reader redirection. `Recipe::build_rescue_baseline` exposes
