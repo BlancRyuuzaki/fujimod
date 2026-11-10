@@ -25,7 +25,7 @@ fn construction_args(
                 )?);
         } else if arg == "--prepare-installed-flash" {
             if !allow_flash {
-                return Err("--prepare-installed-flash requires startup, card-init-check, setup-check or read-check".into());
+                return Err("--prepare-installed-flash requires startup, card-init-check, card-error-check, setup-check or read-check".into());
             }
             if flash {
                 return Err("--prepare-installed-flash was specified twice".into());
@@ -64,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&rows)?);
         }
         Some(
-            command @ ("build" | "green-led" | "startup" | "card-init-check" | "setup-check" | "read-check" | "card-startup"
+            command @ ("build" | "green-led" | "startup" | "card-init-check" | "card-error-check" | "setup-check" | "read-check" | "card-startup"
             | "stage-one" | "rescue-baseline"),
         ) => {
             let mut inputs = args[1..].to_vec();
@@ -78,11 +78,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let (firmware, dat, output, success_hold_seconds, prepare_installed_flash) =
                 construction_args(&inputs, matches!(command, "startup" | "stage-one"),
-                                  matches!(command, "startup" | "card-init-check" | "setup-check" | "read-check"))?;
+                                  matches!(command, "startup" | "card-init-check" | "card-error-check" | "setup-check" | "read-check"))?;
             let options = StartupOptions {
                 success_hold_seconds,
                 stop: match command {
                     "card-init-check" => StartupStop::AfterCardInit,
+                    "card-error-check" => StartupStop::AfterCardInitWithErrorBlink,
                     "setup-check" => StartupStop::AfterSetup,
                     "read-check" => StartupStop::AfterCrc,
                     _ => StartupStop::Continue,
@@ -115,7 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => {
             return Err(
-                "Usage: fujimod-recovery list | build|green-led|startup|card-init-check|setup-check|read-check|stage-one|rescue-baseline FIRMWARE DAT NEW_DIRECTORY [--success-hold-seconds N] [--prepare-installed-flash] | card-startup FIRMWARE DAT STORAGE_IMAGE NEW_DIRECTORY"
+                "Usage: fujimod-recovery list | build|green-led|startup|card-init-check|card-error-check|setup-check|read-check|stage-one|rescue-baseline FIRMWARE DAT NEW_DIRECTORY [--success-hold-seconds N] [--prepare-installed-flash] | card-startup FIRMWARE DAT STORAGE_IMAGE NEW_DIRECTORY"
                     .into(),
             );
         }

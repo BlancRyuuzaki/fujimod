@@ -167,7 +167,12 @@ NEW_DIRECTORY` stops with steady red after stock setup returns, before the
 second card initialization and `ffboot.bin` read. Orange without red in the
 setup check does not distinguish the first card mount from stock setup.
 Neither diagnostic executes the loaded image.
-For XP5 `startup`, `card-init-check`, `setup-check` and `read-check`, `--prepare-installed-flash` runs the
+`card-error-check FIRMWARE DAT NEW_DIRECTORY` also stops after the initial
+card mount. It shows steady red on success, or repeatedly blinks the red lamp
+for the failed step: two blinks for board setup, three for host setup, four
+for card initialization, and five for the FAT32 mount. A single blink means
+the first-stage request or card configuration was rejected before setup.
+For XP5 `startup`, `card-init-check`, `card-error-check`, `setup-check` and `read-check`, `--prepare-installed-flash` runs the
 checked installed-flash controller initialization and timing scan before
 continuing stock setup. It changes only that entry-source choice; the SD image
 and its CRC remain the same. Use it when the stock setup needs that installed

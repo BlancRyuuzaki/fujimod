@@ -40,6 +40,7 @@ pub enum StartupStop {
     AfterSetup = 1,
     AfterCrc = 2,
     AfterCardInit = 3,
+    AfterCardInitWithErrorBlink = 4,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

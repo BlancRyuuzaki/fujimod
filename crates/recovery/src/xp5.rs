@@ -683,7 +683,8 @@ mod tests {
         let (data, setup, ram) = fixture();
         let normal = package(&data, &setup, Some(ram.clone()), 0, StartupStop::Continue, false).unwrap();
         let at = 0xc000 + template::SETUP_SD_REQUEST + 40;
-        for stop in [StartupStop::AfterCardInit, StartupStop::AfterSetup, StartupStop::AfterCrc] {
+        for stop in [StartupStop::AfterCardInit, StartupStop::AfterCardInitWithErrorBlink,
+                     StartupStop::AfterSetup, StartupStop::AfterCrc] {
             assert!(package(&data, &setup, None, 0, stop, false).is_err());
             let checked = package(&data, &setup, Some(ram.clone()), 0, stop, false).unwrap();
             let mut expected = normal[0].bytes.clone();
