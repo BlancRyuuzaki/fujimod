@@ -87,6 +87,8 @@ pub struct Setup {
     pub flash: Flash,
     pub lamp: Lamp,
     pub board: Board,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_prelude: Vec<Operation>,
     pub proofs: Vec<SourceProof>,
     pub banks: Banks,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -443,6 +445,37 @@ pub(crate) fn package_with_storage(
             put(&mut program, at + 12, op.value)?;
             put(&mut program, at + 16, op.kind)?;
         }
+        let host_prelude = template::SETUP_SD_HOST_PRELUDE;
+        require(
+            setup.host_prelude.len() <= 16,
+            "XP5 host prelude exceeds operation limit",
+        )?;
+        require(
+            extent(&program, host_prelude, 8 + 16 * 24)?
+                .iter()
+                .all(|v| *v == 0),
+            "XP5 host prelude template changed",
+        )?;
+        put(&mut program, host_prelude, setup.host_prelude.len() as u32)?;
+        for (n, op) in setup.host_prelude.iter().enumerate() {
+            require(
+                op.kind <= 4
+                    && (op.kind == 2
+                        || if op.kind == 3 {
+                            mmio_halfword(op.address)
+                        } else {
+                            mmio(op.address)
+                        })
+                    && (op.kind != 3 && op.kind != 4
+                        || (op.mask <= u16::MAX.into() && op.value <= u16::MAX.into())),
+                "Invalid XP5 SD host prelude operation",
+            )?;
+            let at = host_prelude + 8 + n * 24;
+            put64(&mut program, at, op.address)?;
+            put(&mut program, at + 8, op.mask)?;
+            put(&mut program, at + 12, op.value)?;
+            put(&mut program, at + 16, op.kind)?;
+        }
         let request = template::SETUP_SD_REQUEST;
         require(
             extent(&program, request, 48)? == [2u64, 0, 0, 0, 0, 0].map(u64::to_le_bytes).concat(),
@@ -597,6 +630,7 @@ mod tests {
                     kind: 0,
                 }],
             },
+            host_prelude: vec![],
             proofs: vec![SourceProof {
                 source: prefix,
                 offset: 0,
@@ -750,6 +784,46 @@ mod tests {
         assert!(package(&data, &setup, Some(ram.clone()), 0, StartupStop::Continue, false).is_err());
         setup.board.operations[0].mask = 0x1100;
         setup.board.operations[1].address += 2;
+        assert!(package(&data, &setup, Some(ram), 0, StartupStop::Continue, false).is_err());
+    }
+    #[test]
+    fn host_prelude_serializes_separately_and_enforces_its_limit() {
+        let (data, mut setup, ram) = fixture();
+        setup.host_prelude = vec![Operation {
+            address: 0xff907000,
+            mask: 0x10,
+            value: 0x10,
+            kind: 1,
+        }];
+        let files = package(
+            &data,
+            &setup,
+            Some(ram.clone()),
+            0,
+            StartupStop::Continue,
+            false,
+        )
+        .unwrap();
+        let at = 0xc000 + template::SETUP_SD_HOST_PRELUDE;
+        assert_eq!(word(&files[0].bytes, at).unwrap(), 1);
+        assert_eq!(word(&files[0].bytes, at + 4).unwrap(), 0);
+        assert_eq!(
+            u64::from_le_bytes(files[0].bytes[at + 8..at + 16].try_into().unwrap()),
+            0xff907000
+        );
+        assert_eq!(word(&files[0].bytes, at + 16).unwrap(), 0x10);
+        assert_eq!(word(&files[0].bytes, at + 20).unwrap(), 0x10);
+        assert_eq!(word(&files[0].bytes, at + 24).unwrap(), 1);
+
+        setup.host_prelude = vec![
+            Operation {
+                address: 0xff907000,
+                mask: 0,
+                value: 0,
+                kind: 0,
+            };
+            17
+        ];
         assert!(package(&data, &setup, Some(ram), 0, StartupStop::Continue, false).is_err());
     }
     #[test]
