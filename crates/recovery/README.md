@@ -169,9 +169,11 @@ setup check does not distinguish the first card mount from stock setup.
 Neither diagnostic executes the loaded image.
 `card-error-check FIRMWARE DAT NEW_DIRECTORY` also stops after the initial
 card mount. It shows steady red on success, or repeatedly blinks the red lamp
-for the failed step: two blinks for board setup, three for host setup, four
-for card initialization, and five for the FAT32 mount. A single blink means
-the first-stage request or card configuration was rejected before setup.
+for the failed step: two blinks for board setup, four for card initialization,
+and five for the FAT32 mount. Host setup gives six blinks for invalid
+arguments, seven for a clock timeout, or eight for a handshake timeout. A
+single blink means the first-stage request or card configuration was rejected
+before setup.
 For XP5 `startup`, `card-init-check`, `card-error-check`, `setup-check` and `read-check`, `--prepare-installed-flash` runs the
 checked installed-flash controller initialization and timing scan before
 continuing stock setup. It changes only that entry-source choice; the SD image
