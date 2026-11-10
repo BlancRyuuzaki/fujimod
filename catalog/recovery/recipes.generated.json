@@ -7812,6 +7812,18 @@
       },
       "host_prelude": [
         {
+          "address": 4288356904,
+          "mask": 65280,
+          "value": 48896,
+          "kind": 3
+        },
+        {
+          "address": 4288356926,
+          "mask": 7,
+          "value": 7,
+          "kind": 3
+        },
+        {
           "address": 4287678784,
           "mask": 2,
           "value": 2,
@@ -8133,9 +8145,33 @@
             "decoded_size": 12042160,
             "sha256": "3aacc331157312a03531266cd9aca0daea28597b9f3535bb6141105ad7354b4d"
           },
+          "offset": 2783004,
+          "size": 116,
+          "sha256": "e36001773b7dae3746172e420ba1b243fdc49672ec0dceac170aacd013fe411e"
+        },
+        {
+          "source": {
+            "dat_offset": 3146356,
+            "size": 5415597,
+            "compression": "method4",
+            "decoded_size": 12042160,
+            "sha256": "3aacc331157312a03531266cd9aca0daea28597b9f3535bb6141105ad7354b4d"
+          },
           "offset": 2783456,
           "size": 92,
           "sha256": "227ff786b0d1c158340d05d3ccac8112ef5500baea0fc104510d4df9a8ee12f4"
+        },
+        {
+          "source": {
+            "dat_offset": 3146356,
+            "size": 5415597,
+            "compression": "method4",
+            "decoded_size": 12042160,
+            "sha256": "3aacc331157312a03531266cd9aca0daea28597b9f3535bb6141105ad7354b4d"
+          },
+          "offset": 2783752,
+          "size": 100,
+          "sha256": "aa054d6e66f0968206b3be0ec19c85e5c419554eb2876e38af08e27ab0bcb944"
         },
         {
           "source": {
