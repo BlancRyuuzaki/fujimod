@@ -459,15 +459,18 @@ pub(crate) fn package_with_storage(
         put(&mut program, host_prelude, setup.host_prelude.len() as u32)?;
         for (n, op) in setup.host_prelude.iter().enumerate() {
             require(
-                op.kind <= 4
+                op.kind <= 5
                     && (op.kind == 2
-                        || if op.kind == 3 {
+                        || if op.kind == 3 || op.kind == 5 {
                             mmio_halfword(op.address)
                         } else {
                             mmio(op.address)
                         })
                     && (op.kind != 3 && op.kind != 4
-                        || (op.mask <= u16::MAX.into() && op.value <= u16::MAX.into())),
+                        || (op.mask <= u16::MAX.into() && op.value <= u16::MAX.into()))
+                    && (op.kind != 5
+                        || (op.mask != 0 && op.mask <= u16::MAX.into()
+                            && (1..=10_000).contains(&op.value))),
                 "Invalid XP5 SD host prelude operation",
             )?;
             let at = host_prelude + 8 + n * 24;
@@ -825,6 +828,30 @@ mod tests {
             17
         ];
         assert!(package(&data, &setup, Some(ram), 0, StartupStop::Continue, false).is_err());
+    }
+    #[test]
+    fn host_prelude_handshake_serializes_and_bounds_attempts() {
+        let (data, mut setup, ram) = fixture();
+        setup.host_prelude = vec![Operation {
+            address: 0xff9b222c,
+            mask: 1,
+            value: 1000,
+            kind: 5,
+        }];
+        let files = package(&data, &setup, Some(ram.clone()), 0,
+                            StartupStop::AfterCrcWithErrorPackets, false).unwrap();
+        let at = 0xc000 + template::SETUP_SD_HOST_PRELUDE;
+        assert_eq!(word(&files[0].bytes, at).unwrap(), 1);
+        assert_eq!(word(&files[0].bytes, at + 16).unwrap(), 1);
+        assert_eq!(word(&files[0].bytes, at + 20).unwrap(), 1000);
+        assert_eq!(word(&files[0].bytes, at + 24).unwrap(), 5);
+        setup.host_prelude[0].value = 0;
+        assert!(package(&data, &setup, Some(ram.clone()), 0,
+                        StartupStop::AfterCrcWithErrorPackets, false).is_err());
+        setup.host_prelude[0].value = 1000;
+        setup.host_prelude[0].address += 1;
+        assert!(package(&data, &setup, Some(ram), 0,
+                        StartupStop::AfterCrcWithErrorPackets, false).is_err());
     }
     #[test]
     fn oversized_header_and_changed_payload_refuse() {

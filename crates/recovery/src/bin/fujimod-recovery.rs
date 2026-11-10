@@ -25,7 +25,7 @@ fn construction_args(
                 )?);
         } else if arg == "--prepare-installed-flash" {
             if !allow_flash {
-                return Err("--prepare-installed-flash requires startup, card-init-check, card-error-check, setup-check or read-check".into());
+                return Err("--prepare-installed-flash requires startup, card-init-check, card-error-check, setup-check, read-check or card-read-check".into());
             }
             if flash {
                 return Err("--prepare-installed-flash was specified twice".into());
@@ -64,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&rows)?);
         }
         Some(
-            command @ ("build" | "green-led" | "startup" | "card-init-check" | "card-error-check" | "setup-check" | "read-check" | "card-startup"
+            command @ ("build" | "green-led" | "startup" | "card-init-check" | "card-error-check" | "setup-check" | "read-check" | "card-read-check" | "card-startup"
             | "stage-one" | "rescue-baseline"),
         ) => {
             let mut inputs = args[1..].to_vec();
@@ -78,16 +78,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let (firmware, dat, output, success_hold_seconds, prepare_installed_flash) =
                 construction_args(&inputs, matches!(command, "startup" | "stage-one"),
-                                  matches!(command, "startup" | "card-init-check" | "card-error-check" | "setup-check" | "read-check"))?;
+                                  matches!(command, "startup" | "card-init-check" | "card-error-check" | "setup-check" | "read-check" | "card-read-check"))?;
             let options = StartupOptions {
                 success_hold_seconds,
-                stop: match command {
-                    "card-init-check" => StartupStop::AfterCardInit,
-                    "card-error-check" => StartupStop::AfterCardInitWithErrorBlink,
-                    "setup-check" => StartupStop::AfterSetup,
-                    "read-check" => StartupStop::AfterCrc,
-                    _ => StartupStop::Continue,
-                },
+                stop: startup_stop(command),
                 prepare_installed_flash,
             };
             let recipe = Recipe::bundled(firmware)?.ok_or("Missing recovery recipe")?;
@@ -116,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => {
             return Err(
-                "Usage: fujimod-recovery list | build|green-led|startup|card-init-check|card-error-check|setup-check|read-check|stage-one|rescue-baseline FIRMWARE DAT NEW_DIRECTORY [--success-hold-seconds N] [--prepare-installed-flash] | card-startup FIRMWARE DAT STORAGE_IMAGE NEW_DIRECTORY"
+                "Usage: fujimod-recovery list | build|green-led|startup|card-init-check|card-error-check|setup-check|read-check|card-read-check|stage-one|rescue-baseline FIRMWARE DAT NEW_DIRECTORY [--success-hold-seconds N] [--prepare-installed-flash] | card-startup FIRMWARE DAT STORAGE_IMAGE NEW_DIRECTORY"
                     .into(),
             );
         }
@@ -124,11 +118,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn startup_stop(command: &str) -> StartupStop {
+    match command {
+        "card-init-check" => StartupStop::AfterCardInit,
+        "card-error-check" => StartupStop::AfterCardInitWithErrorBlink,
+        "setup-check" => StartupStop::AfterSetup,
+        "read-check" => StartupStop::AfterCrc,
+        "card-read-check" => StartupStop::AfterCrcWithErrorPackets,
+        _ => StartupStop::Continue,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::construction_args;
+    use super::{construction_args, startup_stop, StartupStop};
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|s| s.to_string()).collect()
+    }
+    #[test]
+    fn card_read_check_selects_stop_five_while_read_check_stays_stop_two() {
+        assert_eq!(
+            startup_stop("card-read-check"),
+            StartupStop::AfterCrcWithErrorPackets
+        );
+        assert_eq!(startup_stop("card-read-check") as u64, 5);
+        assert_eq!(startup_stop("read-check"), StartupStop::AfterCrc);
+        assert_eq!(startup_stop("read-check") as u64, 2);
     }
     #[test]
     fn success_hold_defaults_to_zero_and_accepts_either_position() {

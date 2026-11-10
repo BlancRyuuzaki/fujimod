@@ -7812,6 +7812,12 @@
       },
       "host_prelude": [
         {
+          "address": 4288356908,
+          "mask": 1,
+          "value": 1000,
+          "kind": 5
+        },
+        {
           "address": 4288356904,
           "mask": 65280,
           "value": 48896,
@@ -8220,6 +8226,18 @@
           "offset": 2785120,
           "size": 248,
           "sha256": "7a5891206200a441744406a3c3a0dbb68b5ccfff4c90e3c0a8a43d08a42e0efb"
+        },
+        {
+          "source": {
+            "dat_offset": 3146356,
+            "size": 5415597,
+            "compression": "method4",
+            "decoded_size": 12042160,
+            "sha256": "3aacc331157312a03531266cd9aca0daea28597b9f3535bb6141105ad7354b4d"
+          },
+          "offset": 2785852,
+          "size": 172,
+          "sha256": "513afb240fa524cac2c2af72d4ecba8ef8c28f1a469bb144240a2c80b7b6b700"
         },
         {
           "source": {
