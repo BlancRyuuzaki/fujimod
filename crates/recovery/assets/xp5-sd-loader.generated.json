@@ -1,31 +1,32 @@
 {
   "schema": 1,
-  "image_bytes": 24048,
+  "image_bytes": 24304,
   "prelude_stack_max": 80,
   "symbols": {
     "xp5_setup_entry": 0,
-    "xp5_setup_configuration": 16864,
+    "xp5_setup_configuration": 17088,
     "xp5_setup_return_branch": 184,
-    "xp5_setup_stack": 22000,
-    "xp5_setup_stack_top": 24048,
+    "xp5_setup_stack": 22256,
+    "xp5_setup_stack_top": 24304,
     "setup_sd_initialize": 208,
-    "setup_sd_request": 16776,
-    "setup_sd_progress": 21824,
-    "setup_sd_board_initialize": 5264,
-    "setup_sd_board_host_initialize": 5344,
-    "sd_card_initialize": 6384,
+    "setup_sd_request": 17000,
+    "setup_sd_progress": 22080,
+    "setup_sd_board_initialize": 5376,
+    "setup_sd_board_host_initialize": 5456,
+    "sd_card_initialize": 6576,
     "setup_sd_error_blinks": 4512,
     "setup_sd_card_error_detail": 4608,
-    "setup_sd_board": 15288,
-    "setup_sd_host_prelude": 16072,
-    "a64_boot_ready": 21952,
-    "a64_boot_zero_gate": 12456,
-    "setup_sd_card_boot": 16560,
+    "setup_sd_ocr_timeout_reason": 4672,
+    "setup_sd_board": 15512,
+    "setup_sd_host_prelude": 16296,
+    "a64_boot_ready": 22208,
+    "a64_boot_zero_gate": 12680,
+    "setup_sd_card_boot": 16784,
     "setup_sd_phy_imem": 1696,
     "setup_sd_phy_dmem": 1712,
     "setup_sd_layout_marker": 1728,
     "setup_sd_flash_info": 1744,
-    "setup_sd_runtime": 16824,
+    "setup_sd_runtime": 17048,
     "setup_sd_firmware_read": 1776,
     "setup_sd_training_backup": 2592,
     "setup_sd_firmware_initialize": 2656
@@ -52,17 +53,27 @@
       "symbol": "boot_setup_delay"
     },
     {
-      "offset": 4796,
+      "offset": 4844,
       "kind": 283,
       "symbol": "boot_setup_delay"
     },
     {
-      "offset": 4812,
+      "offset": 4860,
       "kind": 283,
       "symbol": "boot_setup_delay"
     },
     {
-      "offset": 4852,
+      "offset": 4900,
+      "kind": 283,
+      "symbol": "boot_setup_delay"
+    },
+    {
+      "offset": 4916,
+      "kind": 283,
+      "symbol": "boot_setup_delay"
+    },
+    {
+      "offset": 4956,
       "kind": 283,
       "symbol": "boot_setup_delay"
     }
