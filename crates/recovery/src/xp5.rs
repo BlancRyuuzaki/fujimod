@@ -17,6 +17,18 @@ pub struct Operation {
     pub value: u32,
     pub kind: u32,
 }
+/// One root SD host setup tried in order by a diagnostic loader. Times are
+/// milliseconds; `clock_configuration_field` is 0-3 or `u32::MAX` to leave
+/// the field unchanged.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostVariant {
+    pub identification_divider: u32,
+    pub clock_configuration_field: u32,
+    pub power_off_ms: u32,
+    pub power_on_ms: u32,
+    pub clock_on_ms: u32,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Board {
@@ -89,6 +101,8 @@ pub struct Setup {
     pub board: Board,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_prelude: Vec<Operation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_variants: Vec<HostVariant>,
     pub proofs: Vec<SourceProof>,
     pub banks: Banks,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -486,6 +500,40 @@ pub(crate) fn package_with_storage(
             put(&mut program, at + 12, op.value)?;
             put(&mut program, at + 16, op.kind)?;
         }
+        let variants = template::SETUP_SD_HOST_VARIANTS;
+        require(
+            setup.host_variants.len() <= 8,
+            "XP5 host variants exceed their limit",
+        )?;
+        require(
+            extent(&program, variants, 8 + 8 * 24)?.iter().all(|v| *v == 0),
+            "XP5 host variant template changed",
+        )?;
+        put(&mut program, variants, setup.host_variants.len() as u32)?;
+        for (n, variant) in setup.host_variants.iter().enumerate() {
+            require(
+                (1..=0xff).contains(&variant.identification_divider)
+                    && (variant.clock_configuration_field <= 3
+                        || variant.clock_configuration_field == u32::MAX)
+                    && [variant.power_off_ms, variant.power_on_ms, variant.clock_on_ms]
+                        .iter()
+                        .all(|ms| *ms <= 2000),
+                "Invalid XP5 host variant",
+            )?;
+            let at = variants + 8 + n * 24;
+            for (k, value) in [
+                variant.identification_divider,
+                variant.clock_configuration_field,
+                variant.power_off_ms,
+                variant.power_on_ms,
+                variant.clock_on_ms,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                put(&mut program, at + 4 * k, value)?;
+            }
+        }
         let request = template::SETUP_SD_REQUEST;
         require(
             extent(&program, request, 48)? == [2u64, 0, 0, 0, 0, 0].map(u64::to_le_bytes).concat(),
@@ -641,6 +689,7 @@ mod tests {
                 }],
             },
             host_prelude: vec![],
+            host_variants: vec![],
             proofs: vec![SourceProof {
                 source: prefix,
                 offset: 0,
@@ -835,6 +884,42 @@ mod tests {
             17
         ];
         assert!(package(&data, &setup, Some(ram), 0, StartupStop::Continue, false).is_err());
+    }
+    #[test]
+    fn host_variants_serialize_in_order_and_are_bounded() {
+        let (data, mut setup, ram) = fixture();
+        let variant = HostVariant {
+            identification_divider: 0x3e,
+            clock_configuration_field: u32::MAX,
+            power_off_ms: 500,
+            power_on_ms: 250,
+            clock_on_ms: 10,
+        };
+        setup.host_variants = vec![variant.clone(); 2];
+        setup.host_variants[0].identification_divider = 0xfa;
+        let build = |setup: &Setup| {
+            package(&data, setup, Some(ram.clone()), 0, StartupStop::Continue, false)
+        };
+        let files = build(&setup).unwrap();
+        let at = 0xc000 + template::SETUP_SD_HOST_VARIANTS;
+        let words: Vec<u32> = (0..14)
+            .map(|n| word(&files[0].bytes, at + 4 * n).unwrap())
+            .collect();
+        assert_eq!(
+            words,
+            [2, 0, 0xfa, u32::MAX, 500, 250, 10, 0, 0x3e, u32::MAX, 500, 250, 10, 0]
+        );
+        for broken in [
+            HostVariant { identification_divider: 0, ..variant.clone() },
+            HostVariant { identification_divider: 0x100, ..variant.clone() },
+            HostVariant { clock_configuration_field: 4, ..variant.clone() },
+            HostVariant { power_off_ms: 2001, ..variant.clone() },
+        ] {
+            setup.host_variants = vec![broken];
+            assert!(build(&setup).is_err());
+        }
+        setup.host_variants = vec![variant; 9];
+        assert!(build(&setup).is_err());
     }
     #[test]
     fn host_prelude_handshake_serializes_and_bounds_attempts() {
