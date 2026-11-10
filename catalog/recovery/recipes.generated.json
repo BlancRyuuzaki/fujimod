@@ -7824,28 +7824,10 @@
           "kind": 6
         },
         {
-          "address": 4288356904,
-          "mask": 65280,
-          "value": 48896,
-          "kind": 3
-        },
-        {
-          "address": 4288356926,
-          "mask": 7,
-          "value": 7,
-          "kind": 3
-        },
-        {
-          "address": 4288356900,
-          "mask": 0,
-          "value": 1,
-          "kind": 6
-        },
-        {
-          "address": 4288356448,
-          "mask": 0,
-          "value": 2,
-          "kind": 6
+          "address": 4288348160,
+          "mask": 33932100,
+          "value": 1000,
+          "kind": 7
         },
         {
           "address": 4287678784,
@@ -8268,6 +8250,18 @@
           "offset": 2785852,
           "size": 172,
           "sha256": "513afb240fa524cac2c2af72d4ecba8ef8c28f1a469bb144240a2c80b7b6b700"
+        },
+        {
+          "source": {
+            "dat_offset": 3146356,
+            "size": 5415597,
+            "compression": "method4",
+            "decoded_size": 12042160,
+            "sha256": "3aacc331157312a03531266cd9aca0daea28597b9f3535bb6141105ad7354b4d"
+          },
+          "offset": 2788480,
+          "size": 80,
+          "sha256": "c512a5a1ab73520dd565c674b427ca9deb20d6d70ccfc28acc3e1818e957b2b9"
         },
         {
           "source": {

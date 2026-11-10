@@ -459,8 +459,9 @@ pub(crate) fn package_with_storage(
         put(&mut program, host_prelude, setup.host_prelude.len() as u32)?;
         for (n, op) in setup.host_prelude.iter().enumerate() {
             require(
-                op.kind <= 6
+                op.kind <= 7
                     && (op.kind == 2
+                        || op.kind == 7
                         || if op.kind == 3 || op.kind == 5 {
                             mmio_halfword(op.address)
                         } else {
@@ -471,7 +472,12 @@ pub(crate) fn package_with_storage(
                     && (op.kind != 5
                         || (op.mask != 0 && op.mask <= u16::MAX.into()
                             && (1..=10_000).contains(&op.value)))
-                    && (op.kind != 6 || (op.mask == 0 && op.value < 3)),
+                    && (op.kind != 6 || (op.mask == 0 && op.value < 3))
+                    && (op.kind != 7
+                        || (op.address == setup.board.host
+                            && op.mask != 0
+                            && op.mask & 3 == 0
+                            && (1..=1000).contains(&op.value))),
                 "Invalid XP5 SD host prelude operation",
             )?;
             let at = host_prelude + 8 + n * 24;
@@ -855,6 +861,27 @@ mod tests {
                         StartupStop::AfterCrcWithErrorPackets, false).is_err());
         setup.host_prelude[0].value = 1000;
         setup.host_prelude[0].address += 1;
+        assert!(package(&data, &setup, Some(ram), 0,
+                        StartupStop::AfterCrcWithErrorPackets, false).is_err());
+    }
+
+    #[test]
+    fn host_continuation_requires_selected_root_and_bounded_gate() {
+        let (data, mut setup, ram) = fixture();
+        setup.host_prelude = vec![Operation {
+            address: setup.board.host, mask: 0x205c344, value: 1000, kind: 7,
+        }];
+        assert!(package(&data, &setup, Some(ram.clone()), 0,
+                        StartupStop::AfterCrcWithErrorPackets, false).is_ok());
+        setup.host_prelude[0].address += 4;
+        assert!(package(&data, &setup, Some(ram.clone()), 0,
+                        StartupStop::AfterCrcWithErrorPackets, false).is_err());
+        setup.host_prelude[0].address = setup.board.host;
+        setup.host_prelude[0].mask |= 1;
+        assert!(package(&data, &setup, Some(ram.clone()), 0,
+                        StartupStop::AfterCrcWithErrorPackets, false).is_err());
+        setup.host_prelude[0].mask &= !1;
+        setup.host_prelude[0].value = 1001;
         assert!(package(&data, &setup, Some(ram), 0,
                         StartupStop::AfterCrcWithErrorPackets, false).is_err());
     }
