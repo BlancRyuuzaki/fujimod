@@ -108,6 +108,9 @@ fn branch(at: u64, target: u64, link: bool) -> Result<u32> {
 fn mmio(address: u64) -> bool {
     (0xf0000000..0xfffff000).contains(&address) && address.is_multiple_of(4)
 }
+fn mmio_halfword(address: u64) -> bool {
+    (0xf0000000..0xfffff000).contains(&address) && address.is_multiple_of(2)
+}
 impl Setup {
     fn verify(&self, inverted: &[u8]) -> Result<Vec<u8>> {
         let prefix = self.prefix.read(inverted)?;
@@ -424,7 +427,14 @@ pub(crate) fn package_with_storage(
         put(&mut program, cfg + 12, board.operations.len() as u32)?;
         for (n, op) in board.operations.iter().enumerate() {
             require(
-                op.kind <= 2 && (op.kind == 2 || mmio(op.address)),
+                op.kind <= 4
+                    && (op.kind == 2 || if op.kind == 3 {
+                        mmio_halfword(op.address)
+                    } else {
+                        mmio(op.address)
+                    })
+                    && (op.kind != 3 && op.kind != 4
+                        || (op.mask <= u16::MAX.into() && op.value <= u16::MAX.into())),
                 "Invalid XP5 SD operation",
             )?;
             let at = cfg + 16 + n * 24;
@@ -718,7 +728,7 @@ mod tests {
         changed.initializer.sha256 = "0".repeat(64);
         assert!(package(&data, &changed, None, 0, StartupStop::Continue, false).is_err());
         let mut changed = s.clone();
-        changed.board.operations[0].kind = 3;
+        changed.board.operations[0].kind = 5;
         assert!(package(&data, &changed, Some(ram.clone()), 0, StartupStop::Continue, false).is_err());
         let mut changed = s.clone();
         changed.gate_offset = 0x940;
@@ -726,6 +736,21 @@ mod tests {
         let mut changed = s.clone();
         changed.stack = s.base + 0x38000;
         assert!(package(&data, &changed, None, 0, StartupStop::Continue, false).is_err());
+    }
+
+    #[test]
+    fn board_operations_accept_checked_halfword_widths() {
+        let (data, mut setup, ram) = fixture();
+        setup.board.operations = vec![
+            Operation { address: 0xff906002, mask: 0x1100, value: 0x1100, kind: 3 },
+            Operation { address: 0xff906004, mask: 1, value: 1, kind: 4 },
+        ];
+        package(&data, &setup, Some(ram.clone()), 0, StartupStop::Continue, false).unwrap();
+        setup.board.operations[0].mask = 0x10000;
+        assert!(package(&data, &setup, Some(ram.clone()), 0, StartupStop::Continue, false).is_err());
+        setup.board.operations[0].mask = 0x1100;
+        setup.board.operations[1].address += 2;
+        assert!(package(&data, &setup, Some(ram), 0, StartupStop::Continue, false).is_err());
     }
     #[test]
     fn oversized_header_and_changed_payload_refuse() {

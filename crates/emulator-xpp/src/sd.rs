@@ -64,6 +64,7 @@ impl Controller {
             initialization_fault: host::InitializationFault::None,
             high_speed: options.high_speed,
             ram_banks: options.ram_banks.clone(),
+            capabilities_1: None,
         };
         let host = if let Some(irq) = irq {
             SdHost::new(
