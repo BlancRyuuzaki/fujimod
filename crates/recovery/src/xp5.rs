@@ -431,11 +431,11 @@ pub(crate) fn package_with_storage(
         let board = &setup.board;
         let cfg = template::SETUP_SD_BOARD;
         require(
-            board.operations.len() <= 32 && board.timeout_setting <= 14 && mmio(board.host),
+            board.operations.len() <= 48 && board.timeout_setting <= 14 && mmio(board.host),
             "Invalid XP5 SD binding",
         )?;
         require(
-            extent(&program, cfg, 16 + 32 * 24)?.iter().all(|v| *v == 0),
+            extent(&program, cfg, 16 + 48 * 24)?.iter().all(|v| *v == 0),
             "XP5 board template changed",
         )?;
         put64(&mut program, cfg, board.host)?;
