@@ -67,6 +67,7 @@ impl Controller {
             capabilities_1: None,
             initialized_by_boot_rom: false,
             supply: None,
+            retained_registers: vec![],
         };
         let host = if let Some(irq) = irq {
             SdHost::new(

@@ -67,6 +67,19 @@ pub struct Options {
     /// The GPIO output pad that enables the card supply.
     #[serde(default)]
     pub supply: Option<Supply>,
+    /// Vendor registers (offsets 0x100..0x200) the guest only stores and
+    /// reads back. Each holds its last write and resets to zero; no side
+    /// effect is modeled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retained_registers: Vec<RetainedRegister>,
+}
+/// One declared vendor register outside the modeled SDHCI set.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RetainedRegister {
+    pub offset: u16,
+    /// Access width in bytes: 2 or 4.
+    pub size: u8,
 }
 /// A card supply enable pad and the shortest power-off that resets the card.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -178,6 +191,7 @@ pub struct SdHost {
     rom_fifo_ready: bool,
     faults: Vec<DataFault>,
     fault_history: Vec<DataFaultEvent>,
+    retained: Vec<u32>,
 }
 /// CMD6 status (SD Physical Layer 4.3.10) of a card whose group 1 offers
 /// default and high speed and whose groups 2-6 offer function 0 only.
@@ -273,6 +287,32 @@ impl SdHost {
         if options.supply.is_some_and(|s| s.off_min_ticks == 0) {
             return Err("SD supply minimum off time must be nonzero".into());
         }
+        let declared = &options.retained_registers;
+        for (index, register) in declared.iter().enumerate() {
+            let start = usize::from(register.offset);
+            let end = start + usize::from(register.size);
+            let modeled = (start.saturating_sub(3)..end).any(|at| {
+                [1u8, 2, 4]
+                    .into_iter()
+                    .any(|size| at + usize::from(size) > start && Self::modeled(&options, at, size))
+            });
+            if !matches!(register.size, 2 | 4)
+                || start % usize::from(register.size) != 0
+                || !(0x100..0x200).contains(&start)
+                || end > 0x200
+                || modeled
+                || declared[..index].iter().any(|other| {
+                    let other_start = usize::from(other.offset);
+                    other_start < end && start < other_start + usize::from(other.size)
+                })
+            {
+                return Err(format!(
+                    "SD retained register {:#x}/{} is misaligned, overlapping or modeled",
+                    register.offset, register.size
+                ));
+            }
+        }
+        let retained = vec![0; declared.len()];
         Ok(Self {
             rom_initialized: options.initialized_by_boot_rom,
             supply: None,
@@ -297,6 +337,7 @@ impl SdHost {
             rom_fifo_ready: false,
             faults: Vec::new(),
             fault_history: Vec::new(),
+            retained,
         })
     }
     /// Declare a data CRC failure for later multi-block transfers.
@@ -1037,6 +1078,9 @@ impl SdHost {
                 };
         }
         let offset = address.wrapping_sub(self.options.base) as usize;
+        if let Some(index) = self.retained_index(offset, size) {
+            return u64::from(self.retained[index]);
+        }
         if !self.valid(offset, size) {
             cx.unmodeled();
             return 0;
@@ -1100,7 +1144,16 @@ impl SdHost {
         self.fifo.publish(ready);
     }
     fn valid(&self, offset: usize, size: u8) -> bool {
-        if self.options.protocol == Protocol::Sdhc {
+        Self::modeled(&self.options, offset, size)
+    }
+    fn retained_index(&self, offset: usize, size: u8) -> Option<usize> {
+        self.options
+            .retained_registers
+            .iter()
+            .position(|r| usize::from(r.offset) == offset && r.size == size)
+    }
+    fn modeled(options: &Options, offset: usize, size: u8) -> bool {
+        if options.protocol == Protocol::Sdhc {
             Registers::valid(offset, size)
                 || matches!(
                     (offset, size),
@@ -1119,8 +1172,8 @@ impl SdHost {
                         | (0x2e, 1)
                         | (0x2f, 1)
                 )
-                || self.options.capabilities_1.is_some() && (offset, size) == (0x44, 4)
-        } else if self.options.protocol == Protocol::Application {
+                || options.capabilities_1.is_some() && (offset, size) == (0x44, 4)
+        } else if options.protocol == Protocol::Application {
             Registers::valid(offset, size)
         } else {
             matches!(
@@ -1302,6 +1355,8 @@ struct Snapshot {
     rom_fifo_ready: bool,
     faults: Vec<DataFault>,
     fault_history: Vec<DataFaultEvent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    retained: Vec<u32>,
 }
 impl Device for SdHost {
     fn card_slot(&self) -> Option<&(dyn fujimod_emulator_devices::capability::CardSlot + 'static)> {
@@ -1340,6 +1395,8 @@ impl Device for SdHost {
             rom_fifo_ready: bool,
             faults: &'a [DataFault],
             fault_history: &'a [DataFaultEvent],
+            #[serde(skip_serializing_if = "<[u32]>::is_empty")]
+            retained: &'a [u32],
         }
         fujimod_emulator_devices::checkpoint::Checkpoint::encode(
             self.name(),
@@ -1366,6 +1423,7 @@ impl Device for SdHost {
                 rom_fifo_ready: self.rom_fifo_ready,
                 faults: &self.faults,
                 fault_history: &self.fault_history,
+                retained: &self.retained,
             },
         )
     }
@@ -1379,6 +1437,9 @@ impl Device for SdHost {
         }
         if state.capabilities_1 != self.options.capabilities_1 {
             return Err("SD Capabilities 1 input differs".into());
+        }
+        if state.retained.len() != self.options.retained_registers.len() {
+            return Err("SD retained register declaration differs".into());
         }
         state
             .reads
@@ -1412,6 +1473,7 @@ impl Device for SdHost {
         self.rom_fifo_ready = s.rom_fifo_ready;
         self.faults = s.faults;
         self.fault_history = s.fault_history;
+        self.retained = s.retained;
         self.publish_reads();
         Ok(())
     }
@@ -1482,6 +1544,14 @@ impl Device for SdHost {
             return;
         }
         let offset = address.wrapping_sub(self.options.base) as usize;
+        if let Some(index) = self.retained_index(offset, size) {
+            if size == 2 && value > u64::from(u16::MAX) || value > u64::from(u32::MAX) {
+                cx.unmodeled();
+            } else {
+                self.retained[index] = value as u32;
+            }
+            return;
+        }
         if !self.valid(offset, size)
             || value
                 > if size == 4 {
@@ -1624,6 +1694,7 @@ mod tests {
                 capabilities_1,
                 initialized_by_boot_rom: false,
                 supply: None,
+                retained_registers: vec![],
             },
             Wiring {
                 card: Card::new(sd_card::Options {
@@ -1661,6 +1732,7 @@ mod tests {
             capabilities_1: None,
             initialized_by_boot_rom: false,
             supply: None,
+            retained_registers: vec![],
         };
         let wiring = Wiring {
             card: Card::new(sd_card::Options {
@@ -1694,6 +1766,63 @@ mod tests {
         let mut unsupported_cx = Cx::new(&mut unsupported_host, 0, 0, 0);
         host.write(&mut unsupported_cx, BASE + 0x3e, 2, 0x40);
         assert!(unsupported_cx.refusal().is_some());
+    }
+    fn retained(offset: u16, size: u8) -> RetainedRegister {
+        RetainedRegister { offset, size }
+    }
+    fn host_with_retained(retained_registers: Vec<RetainedRegister>) -> Result<SdHost, String> {
+        SdHost::new(
+            Options {
+                retained_registers,
+                ..host(Protocol::Sdhc).options.clone()
+            },
+            Wiring {
+                card: Card::new(sd_card::Options {
+                    sectors: 0x800000,
+                    max_dirty_sectors: 65536,
+                })
+                .unwrap(),
+                contacts: Contacts::new(true, false),
+                irq: InterruptLine::Shared(78),
+            },
+        )
+    }
+    #[test]
+    fn retained_vendor_registers_read_back_their_last_write() {
+        use fujimod_emulator_devices::test_host::recording::RecordingHost;
+
+        let mut sd = host_with_retained(vec![retained(0x108, 2), retained(0x124, 4)]).unwrap();
+        let mut recording = RecordingHost::default();
+        let mut cx = Cx::new(&mut recording, 0, 0, 0);
+        assert_eq!(sd.read(&mut cx, BASE + 0x124, 4), 0);
+        sd.write(&mut cx, BASE + 0x124, 4, 0x200);
+        sd.write(&mut cx, BASE + 0x108, 2, 0x1ff);
+        assert_eq!(cx.refusal(), None);
+        assert_eq!(sd.read(&mut cx, BASE + 0x124, 4), 0x200);
+        assert_eq!(sd.read(&mut cx, BASE + 0x108, 2), 0x1ff);
+
+        let restored = sd.checkpoint().unwrap();
+        let mut copy = host_with_retained(sd.options.retained_registers.clone()).unwrap();
+        copy.restore_checkpoint(&restored).unwrap();
+        assert_eq!(copy.read(&mut cx, BASE + 0x124, 4), 0x200);
+        assert!(host(Protocol::Sdhc).validate_checkpoint(&restored).is_err());
+
+        for (offset, size) in [(0x124, 2), (0x10c, 2), (0x128, 4)] {
+            let mut refused = RecordingHost::default();
+            let mut refused_cx = Cx::new(&mut refused, 0, 0, 0);
+            sd.read(&mut refused_cx, BASE + offset, size);
+            assert!(refused_cx.refusal().is_some(), "{offset:#x}/{size}");
+        }
+        for declared in [
+            retained(0x100, 2),
+            retained(0x104, 4),
+            retained(0x3c, 4),
+            retained(0x10a, 4),
+            retained(0x110, 1),
+        ] {
+            assert!(host_with_retained(vec![declared]).is_err(), "{declared:?}");
+        }
+        assert!(host_with_retained(vec![retained(0x110, 4), retained(0x112, 2)]).is_err());
     }
     #[test]
     fn capabilities_1_is_an_explicit_read_only_host_input() {

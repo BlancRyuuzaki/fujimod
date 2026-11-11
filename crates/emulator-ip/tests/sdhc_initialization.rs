@@ -22,6 +22,7 @@ fn options(protocol: Protocol, initialization_fault: InitializationFault) -> Opt
         capabilities_1: None,
         initialized_by_boot_rom: false,
         supply: None,
+        retained_registers: vec![],
     }
 }
 
