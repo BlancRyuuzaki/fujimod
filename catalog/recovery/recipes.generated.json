@@ -8658,6 +8658,54 @@
           "offset": 72444,
           "size": 28,
           "sha256": "a406816aea5d245a3b3bd830177fbd6c49ad7d2801006e68d416d2cfbae219ea"
+        },
+        {
+          "source": {
+            "dat_offset": 164468,
+            "size": 131072,
+            "compression": "raw",
+            "decoded_size": 131072,
+            "sha256": "3d93fb61bb802eca85fabb626b6e95c3951bbf8d982158b3dba488df15288508"
+          },
+          "offset": 8636,
+          "size": 92,
+          "sha256": "3ce11418d6cdcac69968e8e77c8b3690f293a3a755fe34bf388a380fb3767bd5"
+        },
+        {
+          "source": {
+            "dat_offset": 164468,
+            "size": 131072,
+            "compression": "raw",
+            "decoded_size": 131072,
+            "sha256": "3d93fb61bb802eca85fabb626b6e95c3951bbf8d982158b3dba488df15288508"
+          },
+          "offset": 9296,
+          "size": 16,
+          "sha256": "e95e91a99fd37a9d9da00c411c84d2546a799708184a59eccfd68c7b8d6de666"
+        },
+        {
+          "source": {
+            "dat_offset": 164468,
+            "size": 131072,
+            "compression": "raw",
+            "decoded_size": 131072,
+            "sha256": "3d93fb61bb802eca85fabb626b6e95c3951bbf8d982158b3dba488df15288508"
+          },
+          "offset": 9572,
+          "size": 32,
+          "sha256": "9b4e6fa1fe196f01ab9a92253cc3510676df566cd087acc29c3677645c367ca6"
+        },
+        {
+          "source": {
+            "dat_offset": 164468,
+            "size": 131072,
+            "compression": "raw",
+            "decoded_size": 131072,
+            "sha256": "3d93fb61bb802eca85fabb626b6e95c3951bbf8d982158b3dba488df15288508"
+          },
+          "offset": 20772,
+          "size": 52,
+          "sha256": "2f7dacc08151dbf276c5c798d759e0ffc36677efa3fc542393e203818c8864c1"
         }
       ],
       "banks": {
@@ -8767,7 +8815,12 @@
             "what": "Use the card-resident setup register-bank accessors"
           }
         ]
-      }
+      },
+      "secondary_release": [
+        1,
+        2,
+        3
+      ]
     },
     "cold_start": null,
     "file_api": null,

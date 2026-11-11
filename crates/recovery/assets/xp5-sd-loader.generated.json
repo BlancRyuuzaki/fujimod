@@ -22,6 +22,7 @@
     "setup_sd_host_variants": 25208,
     "setup_sd_handoff_ranges": 23784,
     "setup_sd_handoff_values": 32528,
+    "setup_sd_secondary_release": 25408,
     "a64_boot_arrivals": 25840,
     "setup_sd_host_observation_first": 32760,
     "setup_sd_host_variant_results": 32592,
@@ -41,7 +42,7 @@
   },
   "externals": [
     {
-      "offset": 564,
+      "offset": 584,
       "kind": 283,
       "symbol": "boot_setup_initialize"
     },

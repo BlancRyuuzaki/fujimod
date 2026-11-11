@@ -109,6 +109,12 @@ pub struct Setup {
     /// writes to the card's [`handoff_result::NAME`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub handoff_ranges: Vec<HandoffRange>,
+    /// Aff0 of each core (1 to 3) that the loader wakes with Group 0 SGI 0
+    /// once the image is in place, before the boot core runs it. A boot ROM
+    /// that parks the other cores branches them to physical 0 on that SGI.
+    /// Card boot releases the cores it holds itself and takes no list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secondary_release: Vec<u8>,
     pub proofs: Vec<SourceProof>,
     pub banks: Banks,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -559,6 +565,20 @@ pub(crate) fn package_with_storage(
             put64(&mut program, ranges + 8 + n * 16, range.address)?;
             put(&mut program, ranges + 16 + n * 16, range.words)?;
         }
+        let release = template::SETUP_SD_SECONDARY_RELEASE;
+        require(
+            setup.secondary_release.is_empty()
+                || (setup.card_boot.is_none()
+                    && setup.secondary_release.is_sorted_by(|a, b| a < b)
+                    && setup.secondary_release.iter().all(|core| (1..=3).contains(core))),
+            "Invalid XP5 secondary release",
+        )?;
+        require(
+            extent(&program, release, 8)?.iter().all(|v| *v == 0),
+            "XP5 secondary release template changed",
+        )?;
+        let targets = setup.secondary_release.iter().fold(0u64, |mask, core| mask | 1 << core);
+        put64(&mut program, release, targets)?;
         let request = template::SETUP_SD_REQUEST;
         require(
             extent(&program, request, 48)? == [2u64, 0, 0, 0, 0, 0].map(u64::to_le_bytes).concat(),
@@ -719,6 +739,7 @@ mod tests {
             host_prelude: vec![],
             host_variants: vec![],
             handoff_ranges: vec![],
+            secondary_release: vec![],
             proofs: vec![SourceProof {
                 source: prefix,
                 offset: 0,
@@ -974,6 +995,22 @@ mod tests {
         let plain = build(&setup, StartupStop::AfterCrcWithErrorPackets).unwrap();
         assert_eq!(plain.len(), 2);
         assert_eq!(word(&plain[0].bytes, at).unwrap(), 0);
+    }
+    #[test]
+    fn secondary_release_writes_the_sgi_target_list() {
+        let (data, mut setup, ram) = fixture();
+        let build = |setup: &Setup| package(&data, setup, Some(ram.clone()), 0, StartupStop::Continue, false);
+        let at = 0xc000 + template::SETUP_SD_SECONDARY_RELEASE;
+        let plain = build(&setup).unwrap();
+        assert_eq!(word(&plain[0].bytes, at).unwrap(), 0);
+        setup.secondary_release = vec![1, 2, 3];
+        let files = build(&setup).unwrap();
+        assert_eq!(word(&files[0].bytes, at).unwrap(), 0xe);
+        assert_eq!(word(&files[0].bytes, at + 4).unwrap(), 0);
+        for broken in [vec![0], vec![4], vec![2, 1], vec![1, 1]] {
+            setup.secondary_release = broken;
+            assert!(build(&setup).is_err());
+        }
     }
     #[test]
     fn host_prelude_handshake_serializes_and_bounds_attempts() {
