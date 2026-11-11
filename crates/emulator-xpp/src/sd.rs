@@ -65,6 +65,8 @@ impl Controller {
             high_speed: options.high_speed,
             ram_banks: options.ram_banks.clone(),
             capabilities_1: None,
+            initialized_by_boot_rom: false,
+            supply: None,
         };
         let host = if let Some(irq) = irq {
             SdHost::new(

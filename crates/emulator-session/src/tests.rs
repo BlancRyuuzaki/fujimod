@@ -26,6 +26,9 @@ fn card_session() -> Session {
             initialization_fault: sdhc::InitializationFault::None,
             high_speed: false,
             ram_banks: vec![],
+            capabilities_1: None,
+            initialized_by_boot_rom: false,
+            supply: None,
         },
         sdhc::Wiring {
             card,

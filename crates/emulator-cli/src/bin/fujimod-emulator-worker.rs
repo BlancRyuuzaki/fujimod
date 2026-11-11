@@ -200,6 +200,9 @@ struct Gic {
     distributor: u64,
     redistributor: u64,
     stride: u64,
+    /// The implemented Security states; one unless the profile declares two.
+    #[serde(default)]
+    security_states: fujimod_emulator_devices::gic::SecurityStates,
     initial: Vec<GicWrite>,
 }
 impl Gic {
@@ -207,6 +210,7 @@ impl Gic {
         let mut gic = fujimod_emulator_ip_arm::gicv3::Gic::new(
             self.affinities.clone(),
             self.lines,
+            self.security_states,
         )?;
         for write in self.initial {
             match write {

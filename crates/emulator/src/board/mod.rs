@@ -452,6 +452,13 @@ impl Board {
                 && features.architectural_exits
                 && features.instruction_progress
                 && features.tighten_instruction_limit;
+            let security_tracked = board.state.borrow().interrupts.as_ref().is_some_and(|g| {
+                core < g.cores && g.gic.tracks_processor_security()
+            });
+            if security_tracked && batches {
+                // Unbatched processors redeliver it before every instruction.
+                board.cpus[core].stop_on_el3_transitions()?;
+            }
             if !batches {
                 let hook = unsafe {
                     board.cpus[core].install_hook(Hook::Instruction {
@@ -1780,6 +1787,16 @@ impl State {
                 }
             }
         }
+        // The GIC CPU interface signals for each processor's current Security
+        // state; batched processors stop when they enter or leave EL3.
+        let tracked = self
+            .interrupts
+            .as_ref()
+            .filter(|g| g.gic.tracks_processor_security())
+            .map_or(0, |g| g.cores);
+        for (core, cpu) in cpus.iter().enumerate().take(tracked) {
+            self.deliver_processor_security(&**cpu, core)?;
+        }
         if let Some(g) = &self.interrupts {
             for core in 0..g.cores {
                 let pins = g.gic.pins(core)?;
@@ -1898,6 +1915,7 @@ impl State {
                 && (r >> 7) & 15 == 12
                 && (8..=15).contains(&((r >> 3) & 15)))
         {
+            self.deliver_processor_security(cpu, core)?;
             Some(
                 self.interrupts
                     .as_mut()
