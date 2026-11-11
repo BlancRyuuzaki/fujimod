@@ -18,9 +18,10 @@ mod xp5;
 use image::{File, Packaging, Plan, Result, require};
 use serde::{Deserialize, Serialize};
 pub use xp4::{ColdStart, FileApi, Setup};
+pub use xp5::handoff_result as xp5_handoff_result;
 pub use xp5::{
-    Board as SdBoard, CodeProof as Xp5CodeProof, Flash as Xp5Flash, HostVariant as SdHostVariant,
-    Lamp as Xp5Lamp,
+    Board as SdBoard, CodeProof as Xp5CodeProof, Flash as Xp5Flash,
+    HandoffRange as Xp5HandoffRange, HostVariant as SdHostVariant, Lamp as Xp5Lamp,
     Operation as SdOperation, RegisterWrite as Xp5RegisterWrite, Setup as Xp5Setup,
     SourceProof as Xp5SourceProof,
 };

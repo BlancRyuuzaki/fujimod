@@ -6,6 +6,8 @@ mod banks;
 pub use banks::Banks;
 mod card_boot;
 pub use card_boot::CardBoot;
+pub mod handoff_result;
+pub use handoff_result::HandoffRange;
 mod template {
     include!(concat!(env!("OUT_DIR"), "/xp5_sd_loader.rs"));
 }
@@ -103,9 +105,10 @@ pub struct Setup {
     pub host_prelude: Vec<Operation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_variants: Vec<HostVariant>,
-    /// 32-bit words that stop 5 reads after the CRC match and transmits.
+    /// Ranges of 32-bit words that stop 5 reads after the CRC match and
+    /// writes to the card's [`handoff_result::NAME`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub handoff_observations: Vec<u64>,
+    pub handoff_ranges: Vec<HandoffRange>,
     pub proofs: Vec<SourceProof>,
     pub banks: Banks,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -537,27 +540,24 @@ pub(crate) fn package_with_storage(
                 put(&mut program, at + 4 * k, value)?;
             }
         }
-        let observations = template::SETUP_SD_HANDOFF_OBSERVATIONS;
+        let ranges = template::SETUP_SD_HANDOFF_RANGES;
+        handoff_result::check(&setup.handoff_ranges)?;
         require(
-            setup.handoff_observations.len() <= 16
-                && setup
-                    .handoff_observations
-                    .iter()
-                    .all(|a| *a != 0 && a % 4 == 0 && *a <= u64::from(u32::MAX - 3)),
-            "Invalid XP5 handoff observations",
-        )?;
-        require(
-            setup.handoff_observations.is_empty()
+            setup.handoff_ranges.is_empty()
                 || matches!(stop, StartupStop::AfterCrcWithErrorPackets),
-            "XP5 handoff observations require the after-CRC packet stop",
+            "XP5 handoff ranges require the after-CRC packet stop",
         )?;
         require(
-            extent(&program, observations, 8 + 16 * 8)?.iter().all(|v| *v == 0),
-            "XP5 handoff observation template changed",
+            extent(&program, ranges, 8 + handoff_result::RANGES * 16)?.iter().all(|v| *v == 0),
+            "XP5 handoff range template changed",
         )?;
-        put(&mut program, observations, setup.handoff_observations.len() as u32)?;
-        for (n, address) in setup.handoff_observations.iter().enumerate() {
-            put64(&mut program, observations + 8 + n * 8, *address)?;
+        if !setup.handoff_ranges.is_empty() {
+            put(&mut program, ranges, setup.handoff_ranges.len() as u32)?;
+            put(&mut program, ranges + 4, handoff_result::BYTES as u32)?;
+        }
+        for (n, range) in setup.handoff_ranges.iter().enumerate() {
+            put64(&mut program, ranges + 8 + n * 16, range.address)?;
+            put(&mut program, ranges + 16 + n * 16, range.words)?;
         }
         let request = template::SETUP_SD_REQUEST;
         require(
@@ -600,6 +600,9 @@ pub(crate) fn package_with_storage(
             require(storage.is_none(), "Setup has no card storage binding")?;
         }
         files.push(File::new("ffboot.bin", ram)?);
+        if !setup.handoff_ranges.is_empty() {
+            files.push(File::new(handoff_result::NAME, handoff_result::pattern())?);
+        }
     }
     require(
         extent(&program, template::SETUP_SD_PROGRESS, 64)?
@@ -715,7 +718,7 @@ mod tests {
             },
             host_prelude: vec![],
             host_variants: vec![],
-            handoff_observations: vec![],
+            handoff_ranges: vec![],
             proofs: vec![SourceProof {
                 source: prefix,
                 offset: 0,
@@ -948,21 +951,29 @@ mod tests {
         assert!(build(&setup).is_err());
     }
     #[test]
-    fn handoff_observations_serialize_only_for_the_after_crc_stop() {
+    fn handoff_ranges_serialize_and_add_the_result_file_for_the_after_crc_stop() {
         let (data, mut setup, ram) = fixture();
-        setup.handoff_observations = vec![0xff90e104, 0xfa0b0100];
+        setup.handoff_ranges = vec![
+            HandoffRange { address: 0xff90e104, words: 3 },
+            HandoffRange { address: 0xfa0b0100, words: 1 },
+        ];
         let build = |setup: &Setup, stop| package(&data, setup, Some(ram.clone()), 0, stop, false);
         let files = build(&setup, StartupStop::AfterCrcWithErrorPackets).unwrap();
-        let at = 0xc000 + template::SETUP_SD_HANDOFF_OBSERVATIONS;
-        let words: Vec<u32> = (0..6)
+        let at = 0xc000 + template::SETUP_SD_HANDOFF_RANGES;
+        let words: Vec<u32> = (0..10)
             .map(|n| word(&files[0].bytes, at + 4 * n).unwrap())
             .collect();
-        assert_eq!(words, [2, 0, 0xff90e104, 0, 0xfa0b0100, 0]);
+        assert_eq!(words, [2, 1 << 20, 0xff90e104, 0, 3, 0, 0xfa0b0100, 0, 1, 0]);
+        let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["marble_init.bin", "ffboot.bin", handoff_result::NAME]);
+        assert_eq!(files[2].bytes, handoff_result::pattern());
         assert!(build(&setup, StartupStop::Continue).is_err());
-        for broken in [vec![0], vec![0xff90e106], vec![0x1_0000_0000], vec![0xff90e104; 17]] {
-            setup.handoff_observations = broken;
-            assert!(build(&setup, StartupStop::AfterCrcWithErrorPackets).is_err());
-        }
+        setup.handoff_ranges[1].address = 0xfa0b0102;
+        assert!(build(&setup, StartupStop::AfterCrcWithErrorPackets).is_err());
+        setup.handoff_ranges = vec![];
+        let plain = build(&setup, StartupStop::AfterCrcWithErrorPackets).unwrap();
+        assert_eq!(plain.len(), 2);
+        assert_eq!(word(&plain[0].bytes, at).unwrap(), 0);
     }
     #[test]
     fn host_prelude_handshake_serializes_and_bounds_attempts() {
