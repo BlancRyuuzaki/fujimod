@@ -15,6 +15,7 @@ pub use exr2::footer::LoaderFooter;
 pub mod xpp;
 mod xp4;
 mod xp5;
+pub mod ram_patch;
 use image::{File, Packaging, Plan, Result, require};
 use serde::{Deserialize, Serialize};
 pub use xp4::{ColdStart, FileApi, Setup};
@@ -26,12 +27,15 @@ pub use xp5::{
     SourceProof as Xp5SourceProof,
 };
 
-/// Optional diagnostics for XP5 startup construction. Zero preserves normal entry.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Optional diagnostics and RAM-image changes for XP5 startup construction.
+/// The default preserves normal entry and the stock image.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct StartupOptions {
     pub success_hold_seconds: u32,
     pub stop: StartupStop,
     pub prepare_installed_flash: bool,
+    /// Applied to the XP5 RAM image before the loader's CRC is taken.
+    pub ram_patches: ram_patch::RamPatches,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -260,6 +264,7 @@ impl Recipe {
         )?;
         require(options.stop == StartupStop::Continue, "Diagnostic stop requires an SD image")?;
         require(!options.prepare_installed_flash, "Stage one already prepares installed flash")?;
+        require(options.ram_patches.is_empty(), "Stage one has no RAM image to patch")?;
         require(
             source.len() == self.source_size,
             "Update size differs from recipe",
@@ -367,6 +372,10 @@ impl Recipe {
             "Installed-flash preparation requires XP5",
         )?;
         require(
+            options.ram_patches.is_empty() || matches!(self.generation, Generation::Xp5),
+            "RAM patches require XP5",
+        )?;
+        require(
             source.len() == self.source_size,
             "Update size differs from recipe",
         )?;
@@ -444,10 +453,12 @@ impl Recipe {
                             "Missing XP5 post-setup SD loader and handoff facts".into(),
                         )
                     })?;
+                    let mut ram = image::transform(&inverted, plan)?;
+                    options.ram_patches.apply(&mut ram)?;
                     xp5::package_with_storage(
                         &inverted,
                         setup,
-                        Some(image::transform(&inverted, plan)?),
+                        Some(ram),
                         options.success_hold_seconds,
                         options.stop,
                         options.prepare_installed_flash,

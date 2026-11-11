@@ -1,16 +1,38 @@
 //! Offline construction and catalog inspection. No device access.
+use fujimod_recovery::ram_patch::RamPatches;
 use fujimod_recovery::{Recipe, StartupOptions, StartupStop, availability};
-use std::{env, fs, path::PathBuf};
+use std::{env, fs, path::{Path, PathBuf}};
+#[derive(Debug, PartialEq)]
+struct Construction<'a> {
+    firmware: &'a str,
+    dat: &'a str,
+    output: &'a str,
+    success_hold_seconds: u32,
+    prepare_installed_flash: bool,
+    ram_patches: Option<&'a str>,
+}
 fn construction_args(
     args: &[String],
     allow_hold: bool,
     allow_flash: bool,
-) -> Result<(&str, &str, &str, u32, bool), Box<dyn std::error::Error>> {
+    allow_patches: bool,
+) -> Result<Construction<'_>, Box<dyn std::error::Error>> {
     let mut positional = Vec::new();
     let mut hold = None;
     let mut flash = false;
+    let mut patches = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
+        if arg == "--ram-patches" {
+            if !allow_patches {
+                return Err("--ram-patches requires startup".into());
+            }
+            if patches.is_some() {
+                return Err("--ram-patches was specified twice".into());
+            }
+            patches = Some(args.next().ok_or("Missing --ram-patches file")?.as_str());
+            continue;
+        }
         if arg == "--success-hold-seconds" {
             if !allow_hold {
                 return Err("--success-hold-seconds requires startup or stage-one".into());
@@ -40,13 +62,14 @@ fn construction_args(
     if positional.len() != 3 {
         return Err("Expected FIRMWARE DAT NEW_DIRECTORY".into());
     }
-    Ok((
-        positional[0],
-        positional[1],
-        positional[2],
-        hold.unwrap_or(0),
-        flash,
-    ))
+    Ok(Construction {
+        firmware: positional[0],
+        dat: positional[1],
+        output: positional[2],
+        success_hold_seconds: hold.unwrap_or(0),
+        prepare_installed_flash: flash,
+        ram_patches: patches,
+    })
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -76,13 +99,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 None
             };
-            let (firmware, dat, output, success_hold_seconds, prepare_installed_flash) =
+            let Construction { firmware, dat, output, success_hold_seconds, prepare_installed_flash, ram_patches } =
                 construction_args(&inputs, matches!(command, "startup" | "stage-one"),
-                                  matches!(command, "startup" | "card-init-check" | "card-error-check" | "setup-check" | "read-check" | "card-read-check"))?;
+                                  matches!(command, "startup" | "card-init-check" | "card-error-check" | "setup-check" | "read-check" | "card-read-check"),
+                                  command == "startup")?;
             let options = StartupOptions {
                 success_hold_seconds,
                 stop: startup_stop(command),
                 prepare_installed_flash,
+                ram_patches: ram_patches.map(|path| RamPatches::read(Path::new(path))).transpose()?.unwrap_or_default(),
             };
             let recipe = Recipe::bundled(firmware)?.ok_or("Missing recovery recipe")?;
             let source = fs::read(dat)?;
@@ -110,7 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => {
             return Err(
-                "Usage: fujimod-recovery list | build|green-led|startup|card-init-check|card-error-check|setup-check|read-check|card-read-check|stage-one|rescue-baseline FIRMWARE DAT NEW_DIRECTORY [--success-hold-seconds N] [--prepare-installed-flash] | card-startup FIRMWARE DAT STORAGE_IMAGE NEW_DIRECTORY"
+                "Usage: fujimod-recovery list | build|green-led|startup|card-init-check|card-error-check|setup-check|read-check|card-read-check|stage-one|rescue-baseline FIRMWARE DAT NEW_DIRECTORY [--success-hold-seconds N] [--prepare-installed-flash] [--ram-patches FILE] | card-startup FIRMWARE DAT STORAGE_IMAGE NEW_DIRECTORY"
                     .into(),
             );
         }
@@ -131,9 +156,19 @@ fn startup_stop(command: &str) -> StartupStop {
 
 #[cfg(test)]
 mod tests {
-    use super::{construction_args, startup_stop, StartupStop};
+    use super::{construction_args, startup_stop, Construction, StartupStop};
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|s| s.to_string()).collect()
+    }
+    fn parsed(hold: u32, flash: bool, patches: Option<&'static str>) -> Construction<'static> {
+        Construction {
+            firmware: "camera",
+            dat: "update",
+            output: "output",
+            success_hold_seconds: hold,
+            prepare_installed_flash: flash,
+            ram_patches: patches,
+        }
     }
     #[test]
     fn card_read_check_selects_stop_five_while_read_check_stays_stop_two() {
@@ -148,16 +183,16 @@ mod tests {
     #[test]
     fn success_hold_defaults_to_zero_and_accepts_either_position() {
         assert_eq!(
-            construction_args(&args(&["camera", "update", "output"]), true, true).unwrap(),
-            ("camera", "update", "output", 0, false)
+            construction_args(&args(&["camera", "update", "output"]), true, true, false).unwrap(),
+            parsed(0, false, None)
         );
         for values in [
             args(&["camera", "update", "output", "--success-hold-seconds", "3"]),
             args(&["--success-hold-seconds", "3", "camera", "update", "output"]),
         ] {
             assert_eq!(
-                construction_args(&values, true, true).unwrap(),
-                ("camera", "update", "output", 3, false)
+                construction_args(&values, true, true, false).unwrap(),
+                parsed(3, false, None)
             );
         }
     }
@@ -173,7 +208,7 @@ mod tests {
                         "--success-hold-seconds",
                         value
                     ]),
-                    true, false
+                    true, false, false
                 )
                 .is_err()
             );
@@ -181,7 +216,7 @@ mod tests {
         assert!(
             construction_args(
                 &args(&["camera", "update", "output", "--success-hold-seconds"]),
-                true, false
+                true, false, false
             )
             .is_err()
         );
@@ -196,14 +231,14 @@ mod tests {
                     "--success-hold-seconds",
                     "0"
                 ]),
-                true, false
+                true, false, false
             )
             .is_err()
         );
         assert!(
             construction_args(
                 &args(&["camera", "update", "output", "--success-hold-seconds", "3"]),
-                false, false
+                false, false, false
             )
             .is_err()
         );
@@ -211,11 +246,23 @@ mod tests {
     #[test]
     fn installed_flash_option_is_explicit_and_only_allowed_for_full_xp5_builds() {
         let command = args(&["camera", "update", "output", "--prepare-installed-flash"]);
-        assert_eq!(construction_args(&command, false, true).unwrap(),
-                   ("camera", "update", "output", 0, true));
-        assert!(construction_args(&command, true, false).is_err());
+        assert_eq!(construction_args(&command, false, true, false).unwrap(),
+                   parsed(0, true, None));
+        assert!(construction_args(&command, true, false, false).is_err());
         let duplicate = args(&["camera", "update", "output", "--prepare-installed-flash",
                                "--prepare-installed-flash"]);
-        assert!(construction_args(&duplicate, false, true).is_err());
+        assert!(construction_args(&duplicate, false, true, false).is_err());
+    }
+    #[test]
+    fn ram_patches_are_only_accepted_for_startup_and_once() {
+        let command = args(&["camera", "update", "output", "--ram-patches", "patches.json"]);
+        assert_eq!(construction_args(&command, true, true, true).unwrap(),
+                   parsed(0, false, Some("patches.json")));
+        assert!(construction_args(&command, true, true, false).is_err());
+        let duplicate = args(&["camera", "update", "output", "--ram-patches", "a.json",
+                               "--ram-patches", "b.json"]);
+        assert!(construction_args(&duplicate, true, true, true).is_err());
+        assert!(construction_args(&args(&["camera", "update", "output", "--ram-patches"]),
+                                  true, true, true).is_err());
     }
 }
