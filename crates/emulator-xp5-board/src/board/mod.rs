@@ -400,10 +400,13 @@ fn register_with_resources(
             )?;
         }
         "panel-pll" => {
+            let options: panel_clock::Options = toml::Value::Table(window.options.clone())
+                .try_into()
+                .map_err(|e| format!("panel-pll options: {e}"))?;
             bus.register(
                 window.base,
                 window.size,
-                Box::new(panel_clock::PanelPll::new(window.base, clocks.clone())?),
+                Box::new(panel_clock::PanelPll::new(window.base, clocks.clone(), options)?),
             )?;
         }
         "clock-gates" | "power-gates" => {
