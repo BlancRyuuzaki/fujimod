@@ -12,11 +12,13 @@ pub struct WordEdit {
     pub new: u32,
 }
 
-/// Bytes placed past the end of the stock image.
+/// Bytes placed past the end of the stock image, or replacing a stock span
+/// whose current bytes have the SHA-256 `replaces`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Payload {
     pub address: u64,
     pub bytes: Vec<u8>,
+    pub replaces: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -32,6 +34,10 @@ struct PayloadFile {
     /// Relative to the patch file's directory.
     file: String,
     sha256: String,
+    /// SHA-256 of the stock bytes this payload replaces, for a payload
+    /// inside the stock image.
+    #[serde(default)]
+    replaces: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -70,6 +76,7 @@ impl RamPatches {
             payloads.push(Payload {
                 address: row.address,
                 bytes,
+                replaces: row.replaces,
             });
         }
         Ok(Self {
@@ -79,8 +86,9 @@ impl RamPatches {
     }
 
     /// Applies every edit to `ram` or none. Words must lie inside the stock
-    /// image and hold their old value; payloads must lie past its end, where
-    /// the image grows with zeros.
+    /// image and hold their old value. A payload either replaces a stock
+    /// span whose bytes match its `replaces` hash, or lies past the image's
+    /// end, where the image grows with zeros. No two edits overlap.
     pub fn apply(&self, ram: &mut Vec<u8>) -> Result<()> {
         let stock = ram.len() as u64;
         let mut words: Vec<u64> = self.words.iter().map(|w| w.address).collect();
@@ -99,23 +107,39 @@ impl RamPatches {
                 "RAM word edit does not match the stock word",
             )?;
         }
-        let mut spans: Vec<(u64, u64)> = Vec::new();
+        let mut spans: Vec<(u64, u64)> = self
+            .words
+            .iter()
+            .map(|w| (w.address, w.address + 4))
+            .collect();
         for payload in &self.payloads {
             let end = payload.address.checked_add(payload.bytes.len() as u64);
             require(
-                !payload.bytes.is_empty()
-                    && payload.address >= stock
-                    && end.is_some_and(|end| end < 1 << 30),
-                "RAM payload must lie past the stock image and below 1 GiB",
+                !payload.bytes.is_empty() && end.is_some_and(|end| end < 1 << 30),
+                "RAM payload must be non-empty and end below 1 GiB",
             )?;
-            spans.push((payload.address, end.unwrap_or(u64::MAX)));
+            let end = end.unwrap_or(u64::MAX);
+            match &payload.replaces {
+                Some(digest) => {
+                    require(
+                        end <= stock,
+                        "Replacing RAM payload lies outside the stock image",
+                    )?;
+                    image::hash(&ram[payload.address as usize..end as usize], digest)?;
+                }
+                None => require(
+                    payload.address >= stock,
+                    "RAM payload inside the stock image must name the bytes it replaces",
+                )?,
+            }
+            spans.push((payload.address, end));
         }
         spans.sort_unstable();
         require(
             spans.windows(2).all(|pair| pair[0].1 <= pair[1].0),
-            "RAM payloads overlap",
+            "RAM patches overlap",
         )?;
-        let end = spans.last().map_or(stock, |span| span.1);
+        let end = spans.iter().map(|span| span.1).fold(stock, u64::max);
         ram.resize(end as usize, 0);
         for edit in &self.words {
             ram[edit.address as usize..edit.address as usize + 4]
@@ -138,93 +162,90 @@ mod tests {
         (0..64u8).collect()
     }
 
+    fn edit(address: u64, old: u32, new: u32) -> WordEdit {
+        WordEdit { address, old, new }
+    }
+
+    fn payload(address: u64, bytes: &[u8], replaces: Option<&[u8]>) -> Payload {
+        Payload {
+            address,
+            bytes: bytes.to_vec(),
+            replaces: replaces.map(fujimod_firmware::sha256),
+        }
+    }
+
     #[test]
     fn words_and_payloads_apply_and_grow_the_image() {
         let mut ram = image();
+        let stock = image();
         let patches = RamPatches {
-            words: vec![WordEdit {
-                address: 8,
-                old: 0x0b0a0908,
-                new: 0x94000000,
-            }],
-            payloads: vec![Payload {
-                address: 80,
-                bytes: vec![1, 2, 3],
-            }],
+            words: vec![edit(8, 0x0b0a0908, 0x94000000)],
+            payloads: vec![
+                payload(80, &[1, 2, 3], None),
+                payload(16, &[9; 8], Some(&stock[16..24])),
+            ],
         };
         patches.apply(&mut ram).unwrap();
         assert_eq!(ram.len(), 83);
         assert_eq!(word(&ram, 8).unwrap(), 0x94000000);
+        assert_eq!(&ram[16..24], [9; 8]);
+        assert_eq!(&ram[24..64], &stock[24..64]);
         assert!(ram[64..80].iter().all(|v| *v == 0));
         assert_eq!(&ram[80..], [1, 2, 3]);
     }
 
     #[test]
     fn mismatched_or_misplaced_edits_leave_the_image_unchanged() {
-        let good = WordEdit {
-            address: 8,
-            old: 0x0b0a0908,
-            new: 1,
-        };
+        let stock = image();
+        let good = edit(8, 0x0b0a0908, 1);
         for patches in [
             RamPatches {
-                words: vec![WordEdit {
-                    old: 0,
-                    ..good.clone()
-                }],
+                words: vec![edit(8, 0, 1)],
                 payloads: vec![],
             },
             RamPatches {
-                words: vec![WordEdit {
-                    address: 6,
-                    ..good.clone()
-                }],
+                words: vec![edit(6, 0x0b0a0908, 1)],
                 payloads: vec![],
             },
             RamPatches {
-                words: vec![WordEdit {
-                    address: 64,
-                    ..good.clone()
-                }],
+                words: vec![edit(64, 0, 1)],
                 payloads: vec![],
             },
             RamPatches {
                 words: vec![good.clone(), good.clone()],
                 payloads: vec![],
             },
+            // A payload inside the image without the hash of what it replaces.
+            RamPatches {
+                words: vec![],
+                payloads: vec![payload(60, &[1], None)],
+            },
+            // A replacement whose stock bytes differ.
+            RamPatches {
+                words: vec![],
+                payloads: vec![payload(16, &[9; 8], Some(&[0; 8]))],
+            },
+            // A replacement that runs past the image.
+            RamPatches {
+                words: vec![],
+                payloads: vec![payload(60, &[9; 8], Some(&[60, 61, 62, 63, 0, 0, 0, 0]))],
+            },
+            // A word edit inside a replaced span.
             RamPatches {
                 words: vec![good.clone()],
-                payloads: vec![Payload {
-                    address: 60,
-                    bytes: vec![1],
-                }],
+                payloads: vec![payload(8, &[9; 8], Some(&stock[8..16]))],
             },
             RamPatches {
                 words: vec![],
-                payloads: vec![
-                    Payload {
-                        address: 64,
-                        bytes: vec![1, 2],
-                    },
-                    Payload {
-                        address: 65,
-                        bytes: vec![3],
-                    },
-                ],
+                payloads: vec![payload(64, &[1, 2], None), payload(65, &[3], None)],
             },
             RamPatches {
                 words: vec![],
-                payloads: vec![Payload {
-                    address: 64,
-                    bytes: vec![],
-                }],
+                payloads: vec![payload(64, &[], None)],
             },
             RamPatches {
                 words: vec![],
-                payloads: vec![Payload {
-                    address: 1 << 30,
-                    bytes: vec![1],
-                }],
+                payloads: vec![payload(1 << 30, &[1], None)],
             },
         ] {
             let mut ram = image();
@@ -244,23 +265,24 @@ mod tests {
             RamPatches::read(&directory.join("patches.json"))
         };
         let read = write(format!(
-            r#"{{"words":[{{"address":8,"old":1,"new":2}}],"payloads":[{{"address":4096,"file":"payload.bin","sha256":"{sha}"}}]}}"#
+            r#"{{"words":[{{"address":8,"old":1,"new":2}}],"payloads":[{{"address":4096,"file":"payload.bin","sha256":"{sha}"}},{{"address":0,"file":"payload.bin","sha256":"{sha}","replaces":"{sha}"}}]}}"#
         ))
         .unwrap();
-        assert_eq!(
-            read.words,
-            vec![WordEdit {
-                address: 8,
-                old: 1,
-                new: 2
-            }]
-        );
+        assert_eq!(read.words, vec![edit(8, 1, 2)]);
         assert_eq!(
             read.payloads,
-            vec![Payload {
-                address: 4096,
-                bytes: vec![7; 200]
-            }]
+            vec![
+                Payload {
+                    address: 4096,
+                    bytes: vec![7; 200],
+                    replaces: None
+                },
+                Payload {
+                    address: 0,
+                    bytes: vec![7; 200],
+                    replaces: Some(sha.clone())
+                },
+            ]
         );
         let zero = "0".repeat(64);
         assert!(
