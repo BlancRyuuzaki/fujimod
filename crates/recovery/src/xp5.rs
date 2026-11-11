@@ -103,6 +103,9 @@ pub struct Setup {
     pub host_prelude: Vec<Operation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_variants: Vec<HostVariant>,
+    /// 32-bit words that stop 5 reads after the CRC match and transmits.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub handoff_observations: Vec<u64>,
     pub proofs: Vec<SourceProof>,
     pub banks: Banks,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -534,6 +537,28 @@ pub(crate) fn package_with_storage(
                 put(&mut program, at + 4 * k, value)?;
             }
         }
+        let observations = template::SETUP_SD_HANDOFF_OBSERVATIONS;
+        require(
+            setup.handoff_observations.len() <= 16
+                && setup
+                    .handoff_observations
+                    .iter()
+                    .all(|a| *a != 0 && a % 4 == 0 && *a <= u64::from(u32::MAX - 3)),
+            "Invalid XP5 handoff observations",
+        )?;
+        require(
+            setup.handoff_observations.is_empty()
+                || matches!(stop, StartupStop::AfterCrcWithErrorPackets),
+            "XP5 handoff observations require the after-CRC packet stop",
+        )?;
+        require(
+            extent(&program, observations, 8 + 16 * 8)?.iter().all(|v| *v == 0),
+            "XP5 handoff observation template changed",
+        )?;
+        put(&mut program, observations, setup.handoff_observations.len() as u32)?;
+        for (n, address) in setup.handoff_observations.iter().enumerate() {
+            put64(&mut program, observations + 8 + n * 8, *address)?;
+        }
         let request = template::SETUP_SD_REQUEST;
         require(
             extent(&program, request, 48)? == [2u64, 0, 0, 0, 0, 0].map(u64::to_le_bytes).concat(),
@@ -690,6 +715,7 @@ mod tests {
             },
             host_prelude: vec![],
             host_variants: vec![],
+            handoff_observations: vec![],
             proofs: vec![SourceProof {
                 source: prefix,
                 offset: 0,
@@ -920,6 +946,23 @@ mod tests {
         }
         setup.host_variants = vec![variant; 9];
         assert!(build(&setup).is_err());
+    }
+    #[test]
+    fn handoff_observations_serialize_only_for_the_after_crc_stop() {
+        let (data, mut setup, ram) = fixture();
+        setup.handoff_observations = vec![0xff90e104, 0xfa0b0100];
+        let build = |setup: &Setup, stop| package(&data, setup, Some(ram.clone()), 0, stop, false);
+        let files = build(&setup, StartupStop::AfterCrcWithErrorPackets).unwrap();
+        let at = 0xc000 + template::SETUP_SD_HANDOFF_OBSERVATIONS;
+        let words: Vec<u32> = (0..6)
+            .map(|n| word(&files[0].bytes, at + 4 * n).unwrap())
+            .collect();
+        assert_eq!(words, [2, 0, 0xff90e104, 0, 0xfa0b0100, 0]);
+        assert!(build(&setup, StartupStop::Continue).is_err());
+        for broken in [vec![0], vec![0xff90e106], vec![0x1_0000_0000], vec![0xff90e104; 17]] {
+            setup.handoff_observations = broken;
+            assert!(build(&setup, StartupStop::AfterCrcWithErrorPackets).is_err());
+        }
     }
     #[test]
     fn host_prelude_handshake_serializes_and_bounds_attempts() {
