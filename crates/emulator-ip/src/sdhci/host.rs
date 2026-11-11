@@ -67,6 +67,11 @@ pub struct Options {
     /// The GPIO output pad that enables the card supply.
     #[serde(default)]
     pub supply: Option<Supply>,
+    /// Ticks the card holds DAT0 busy while it programs the last block of a
+    /// write. Transfer complete follows the busy period, and commands and data
+    /// stay inhibited until then. Zero completes the write at once.
+    #[serde(default)]
+    pub write_busy_ticks: u64,
     /// Vendor registers (offsets 0x100..0x200) the guest only stores and
     /// reads back. Each holds its last write and resets to zero; no side
     /// effect is modeled.
@@ -136,6 +141,9 @@ enum Phase {
     Ready,
     Sector,
     Boundary,
+    /// The last block of a write is on the card; it programs with DAT0 held
+    /// busy, then the transfer ends with this interrupt status.
+    Programming { status: u16 },
 }
 #[derive(Serialize, Deserialize)]
 struct Request {
@@ -896,6 +904,9 @@ impl SdHost {
             self.regs.set(0x30, self.regs.get(0x30) | ERROR_INTERRUPT);
             return self.signal(cx);
         }
+        if let Phase::Programming { status } = r.phase {
+            return self.finish(cx, r, status);
+        }
         r.due = None;
         self.response = r.response;
         if r.quantity == 0 {
@@ -946,7 +957,7 @@ impl SdHost {
                 return self.data_error(cx, r);
             }
             if r.cursor == r.quantity {
-                return self.finish(cx, r, 2);
+                return self.end_data(cx, r, 2);
             }
             if r.transfer == Transfer::PioRead
                 && let Payload::Read(first) = r.payload
@@ -1024,8 +1035,23 @@ impl SdHost {
             self.regs.set(0x30, self.regs.get(0x30) | 9);
             self.signal(cx)
         } else {
-            self.finish(cx, r, 3 & if rom { self.regs.get(0x34) } else { u16::MAX })
+            self.end_data(cx, r, 3 & if rom { self.regs.get(0x34) } else { u16::MAX })
         }
+    }
+    /// End a data transfer with `status`; a write first waits out the card's
+    /// programming busy.
+    fn end_data(&mut self, cx: &mut Cx<'_>, mut r: Request, status: u16) -> Result<(), String> {
+        if !matches!(r.payload, Payload::Write(_)) || self.options.write_busy_ticks == 0 {
+            return self.finish(cx, r, status);
+        }
+        r.phase = Phase::Programming { status };
+        r.due = Some(
+            cx.now()
+                .checked_add(self.options.write_busy_ticks)
+                .ok_or("SD programming deadline overflow")?,
+        );
+        self.request = Some(r);
+        Ok(())
     }
     fn pio(&mut self, cx: &mut Cx<'_>, write: Option<u32>) -> Result<u32, String> {
         if self.options.protocol == Protocol::Rom {
@@ -1694,6 +1720,7 @@ mod tests {
                 capabilities_1,
                 initialized_by_boot_rom: false,
                 supply: None,
+                write_busy_ticks: 0,
                 retained_registers: vec![],
             },
             Wiring {
@@ -1732,6 +1759,7 @@ mod tests {
             capabilities_1: None,
             initialized_by_boot_rom: false,
             supply: None,
+            write_busy_ticks: 0,
             retained_registers: vec![],
         };
         let wiring = Wiring {
@@ -2487,6 +2515,35 @@ mod tests {
         let mut cx = h.cx();
         m.write(&mut cx, BASE + 12, 4, 0x193a0026);
         assert!(cx.refusal().is_some());
+    }
+    /// On an X-H2 (2026-11-11) a single-block write reached the card, but
+    /// transfer complete did not arrive within 100,000 status polls: the card
+    /// was still programming. Transfer complete follows the declared busy.
+    #[test]
+    fn pio_write_completes_after_the_card_programming_busy() {
+        let mut m = host(Protocol::Application);
+        m.options.write_busy_ticks = 500;
+        let mut h = Ram::new(0x10000);
+        setup(&mut m, &mut h);
+        m.state = State::Transfer;
+        write(&mut m, &mut h, 4, 2, 512);
+        write(&mut m, &mut h, 6, 2, 1);
+        command(&mut m, &mut h, 0x193a0026, 4);
+        due(&mut m, &mut h);
+        for _ in 0..128 {
+            write(&mut m, &mut h, 0x20, 4, 0x12345678);
+        }
+        due(&mut m, &mut h);
+        let written = h.now;
+        assert_eq!(&m.card.sector(4).unwrap()[..4], &[0x78, 0x56, 0x34, 0x12]);
+        assert!(m.busy());
+        assert_eq!(read(&mut m, &mut h, 0x30, 2) & 2, 0);
+        assert_eq!(read(&mut m, &mut h, 0x24, 4) & 3, 3);
+        due(&mut m, &mut h);
+        assert_eq!(h.now, written + 500);
+        assert!(!m.busy());
+        assert_eq!(read(&mut m, &mut h, 0x30, 2) & 2, 2);
+        assert_eq!(read(&mut m, &mut h, 0x24, 4) & 3, 0);
     }
     #[test]
     fn combined_host_keeps_media_across_rom_and_application_register_accesses() {
