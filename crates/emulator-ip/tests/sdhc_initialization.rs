@@ -20,6 +20,8 @@ fn options(protocol: Protocol, initialization_fault: InitializationFault) -> Opt
         high_speed: false,
         ram_banks: vec![],
         capabilities_1: None,
+        initialized_by_boot_rom: false,
+        supply: None,
     }
 }
 

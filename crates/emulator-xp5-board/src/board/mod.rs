@@ -106,7 +106,7 @@ fn register_with_resources(
                 )?),
             )?;
         }
-        "sdhci" => sd::register(bus, window, &mut resources.sd)?,
+        "sdhci" => sd::register(bus, window, &mut resources.sd, &resources.pins)?,
         "boot-control" => {
             if window.base != 0xff90e000 || window.size != 4 {
                 return Err("invalid boot-control source window".into());

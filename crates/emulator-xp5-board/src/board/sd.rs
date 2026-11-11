@@ -57,6 +57,7 @@ pub(super) fn register(
     graph: &mut DeviceGraph,
     window: &DeviceWindow,
     media: &mut BTreeMap<u64, Media>,
+    pins: &fujimod_emulator_devices::xp5::pins::SharedPins,
 ) -> Result<(), String> {
     let host: Host = toml::Value::Table(window.options.clone())
         .try_into()
@@ -67,6 +68,7 @@ pub(super) fn register(
     let Media { card, contacts } = media
         .remove(&window.base)
         .ok_or("SD host requires explicit card media")?;
+    let supply = host.controller.supply.is_some();
     let device = if let Some(irq) = host.irq {
         SdHost::new(
             host.controller,
@@ -79,6 +81,11 @@ pub(super) fn register(
     } else {
         SdHost::new_polled(host.controller, card, contacts)?
     };
+    let device = if supply {
+        device.with_supply(pins.clone())?
+    } else {
+        device
+    };
     graph.register(window.base, window.size, Box::new(device))?;
     Ok(())
 }
@@ -86,6 +93,7 @@ pub(super) fn register(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fujimod_emulator_devices::xp5::pins::Pins;
     fn input() -> MediaInputs {
         MediaInputs {
             base: 0xffd00000,
@@ -117,11 +125,11 @@ mod tests {
         );
         let mut graph = DeviceGraph::new();
         let window=DeviceWindow {base:0xffd00000,size:0x1000,kind:"sdhci".into(),options:toml::from_str("[controller]\nbase=4291821568\nprotocol='sdhc'\ntransfer_ticks=4\nclock_ticks=2\nrca=1\nram_bytes=4294967296").unwrap()};
-        register(&mut graph, &window, &mut media).unwrap();
+        register(&mut graph, &window, &mut media, &Pins::shared()).unwrap();
         assert!(media.is_empty());
         assert!(graph.at(0xffd00000).is_ok());
         assert!(
-            register(&mut graph, &window, &mut media)
+            register(&mut graph, &window, &mut media, &Pins::shared())
                 .unwrap_err()
                 .contains("card media")
         );

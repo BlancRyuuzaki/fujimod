@@ -9,6 +9,7 @@
 use super::{Clocks, registers::Registers};
 use fujimod_emulator_devices::bus::FastReadWord;
 use fujimod_emulator_devices::parts::card_contacts::Contacts;
+use fujimod_emulator_devices::parts::pins::{LowHistory, OutputLowHistory, Pin};
 use fujimod_emulator_devices::parts::read_fifo::ReadFifo;
 use fujimod_emulator_devices::parts::sd_card::Card;
 use fujimod_emulator_devices::parts::sd_card::faults::{DataDirection, DataFault, DataFaultEvent};
@@ -57,6 +58,24 @@ pub struct Options {
     /// Explicit SDHCI Capabilities 1 register input.
     #[serde(default)]
     pub capabilities_1: Option<u32>,
+    /// The card was initialized before this host's guest ran (for example by
+    /// the boot ROM) and ignores initialization until its supply is cycled:
+    /// ACMD41 reports the voltage window with the ready bit clear. Requires
+    /// `supply` to ever leave this state. Absent means a freshly powered card.
+    #[serde(default)]
+    pub initialized_by_boot_rom: bool,
+    /// The GPIO output pad that enables the card supply.
+    #[serde(default)]
+    pub supply: Option<Supply>,
+}
+/// A card supply enable pad and the shortest power-off that resets the card.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Supply {
+    pub pin: Pin,
+    /// Minimum low time, in virtual-time ticks, after which the card forgets
+    /// its earlier initialization. Only a measured working value is known.
+    pub off_min_ticks: u64,
 }
 const MAX_DATA_FAULTS: usize = 32;
 const COMMAND_TIMEOUT_ERROR: u16 = 1;
@@ -66,6 +85,10 @@ pub struct Wiring {
     pub card: Card,
     pub contacts: Contacts,
     pub irq: InterruptLine,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct SupplyEpoch {
+    rising_edges: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum State {
@@ -137,6 +160,9 @@ pub struct SdHost {
     card: Card,
     contacts: Contacts,
     irq: Option<InterruptLine>,
+    supply: Option<Arc<dyn OutputLowHistory>>,
+    supply_seen: SupplyEpoch,
+    rom_initialized: bool,
     regs: Registers,
     clocks: Clocks,
     state: State,
@@ -191,6 +217,38 @@ impl SdHost {
     pub fn new(options: Options, wiring: Wiring) -> Result<Self, String> {
         Self::construct(options, wiring.card, wiring.contacts, Some(wiring.irq))
     }
+    /// Connect the card supply pad declared by `Options::supply`.
+    pub fn with_supply(mut self, history: Arc<dyn OutputLowHistory>) -> Result<Self, String> {
+        let Some(supply) = self.options.supply else {
+            return Err("SD supply history without a declared supply pad".into());
+        };
+        supply.pin.validate()?;
+        self.supply_seen = SupplyEpoch {
+            rising_edges: history.low_history(supply.pin).rising_edges,
+        };
+        self.supply = Some(history);
+        Ok(self)
+    }
+    /// A power cycle at least `off_min_ticks` long resets a card that an
+    /// earlier initializer left initialized. Sampled at each command, so the
+    /// guest need not touch this host while the supply is off.
+    fn observe_supply(&mut self) {
+        let (Some(history), Some(supply)) = (&self.supply, self.options.supply) else {
+            return;
+        };
+        let LowHistory {
+            rising_edges,
+            last_low_ticks,
+        } = history.low_history(supply.pin);
+        if rising_edges != self.supply_seen.rising_edges {
+            self.supply_seen.rising_edges = rising_edges;
+            if last_low_ticks >= supply.off_min_ticks {
+                self.rom_initialized = false;
+                self.state = State::Idle;
+                self.app = false;
+            }
+        }
+    }
     /// An explicitly unconnected interrupt output. Polling is supported; an
     /// enabled interrupt assertion refuses rather than inventing a route.
     pub fn new_polled(options: Options, card: Card, contacts: Contacts) -> Result<Self, String> {
@@ -212,7 +270,13 @@ impl SdHost {
             return Err("Invalid SD latency, RCA or DRAM extent".into());
         }
         let clocks = Clocks::new(&[(options.base + 0x2c, options.clock_ticks)])?;
+        if options.supply.is_some_and(|s| s.off_min_ticks == 0) {
+            return Err("SD supply minimum off time must be nonzero".into());
+        }
         Ok(Self {
+            rom_initialized: options.initialized_by_boot_rom,
+            supply: None,
+            supply_seen: SupplyEpoch::default(),
             options,
             reads: StorageReads::default(),
             card,
@@ -515,13 +579,16 @@ impl SdHost {
                 };
                 let inquiry = argument & 0x00ffffff == 0;
                 response = voltage;
-                if !inquiry {
+                // A card initialized earlier ignores initialization: the
+                // ready bit never sets and the card stays where it is.
+                let ignored = self.rom_initialized && !inquiry;
+                if !inquiry && !ignored {
                     request.state = State::Ready;
                     // SDHC, immediately ready, with no 1.8 V switch accepted.
                     response |= 0xc0000000;
                 }
                 self.state != State::Idle
-                    || (!inquiry
+                    || (!inquiry && !ignored
                         && (argument & !0x51ffff00 != 0
                             || argument & 0x40000000 == 0
                             || argument & voltage == 0))
@@ -676,6 +743,7 @@ impl SdHost {
             self.regs.set(0x30, self.regs.get(0x30) | ERROR_INTERRUPT);
             return self.signal(cx);
         }
+        self.observe_supply();
         let argument = self.regs.word(8);
         let mut r = self.plan(word, argument)?;
         if rom && r.command != 17 && word as u16 != 0 {
@@ -1212,6 +1280,10 @@ struct Snapshot {
     contacts: u8,
     initialization_fault: InitializationFault,
     capabilities_1: Option<u32>,
+    #[serde(default)]
+    rom_initialized: bool,
+    #[serde(default)]
+    supply_seen: SupplyEpoch,
     regs: Registers,
     clocks: Clocks,
     state: State,
@@ -1249,6 +1321,8 @@ impl Device for SdHost {
             contacts: u8,
             initialization_fault: InitializationFault,
             capabilities_1: Option<u32>,
+            rom_initialized: bool,
+            supply_seen: SupplyEpoch,
             regs: &'a Registers,
             clocks: &'a Clocks,
             state: State,
@@ -1275,6 +1349,8 @@ impl Device for SdHost {
                 contacts: self.contacts.checkpoint_level(),
                 initialization_fault: self.options.initialization_fault,
                 capabilities_1: self.options.capabilities_1,
+                rom_initialized: self.rom_initialized,
+                supply_seen: self.supply_seen,
                 regs: &self.regs,
                 clocks: &self.clocks,
                 state: self.state,
@@ -1319,6 +1395,8 @@ impl Device for SdHost {
         let s: Snapshot = saved.decode(self.name())?;
         self.fifo.restore(&s.fifo, s.fifo_position)?;
         self.card = s.card;
+        self.rom_initialized = s.rom_initialized;
+        self.supply_seen = s.supply_seen;
         self.reads = s.reads;
         self.contacts.restore_level(s.contacts);
         self.regs = s.regs;
@@ -1356,6 +1434,10 @@ impl Device for SdHost {
             "response":self.response,"request":request,"fifo":fujimod_emulator_devices::fingerprint::bytes(&fifo),"scratch":fujimod_emulator_devices::fingerprint::bytes(&self.scratch),
             "fifo_position":fifo_position,"rom_fifo_ready":self.rom_fifo_ready,
             "initialization_fault":self.options.initialization_fault,"capabilities_1":self.options.capabilities_1,"faults":self.faults,"fault_history":self.fault_history});
+        if self.options.initialized_by_boot_rom {
+            value["rom_initialized"] = self.rom_initialized.into();
+            value["supply_seen"] = self.supply_seen.rising_edges.into();
+        }
         if self.access_mode != 0 {
             value["access_mode"] = self.access_mode.into();
         }
@@ -1540,6 +1622,8 @@ mod tests {
                 high_speed: false,
                 ram_banks: vec![],
                 capabilities_1,
+                initialized_by_boot_rom: false,
+                supply: None,
             },
             Wiring {
                 card: Card::new(sd_card::Options {
@@ -1575,6 +1659,8 @@ mod tests {
             high_speed: false,
             ram_banks: vec![],
             capabilities_1: None,
+            initialized_by_boot_rom: false,
+            supply: None,
         };
         let wiring = Wiring {
             card: Card::new(sd_card::Options {
@@ -1649,6 +1735,69 @@ mod tests {
             assert!(m.plan(word, 0x12340600).is_ok());
             assert!(m.plan(word, 0x12350600).is_err());
         }
+    }
+    struct FakeSupply(std::sync::Mutex<LowHistory>);
+    impl OutputLowHistory for FakeSupply {
+        fn low_history(&self, _pin: Pin) -> LowHistory {
+            *self.0.lock().unwrap()
+        }
+    }
+    fn acmd41_ocr(m: &mut SdHost, h: &mut Ram) -> u64 {
+        command(m, h, 0x371a0000, 0);
+        due(m, h);
+        command(m, h, 0x29020000, 0x51ff8000);
+        due(m, h);
+        let ocr = read(m, h, 0x10, 4);
+        write(m, h, 0x30, 2, 0xffff);
+        write(m, h, 0x34, 4, u32::MAX.into());
+        ocr
+    }
+    fn supply_host(initialized: bool) -> (SdHost, Arc<FakeSupply>) {
+        let history = Arc::new(FakeSupply(std::sync::Mutex::new(LowHistory {
+            rising_edges: 0,
+            last_low_ticks: 0,
+        })));
+        let mut m = host(Protocol::Sdhc);
+        m.options.initialized_by_boot_rom = initialized;
+        m.rom_initialized = initialized;
+        m.options.supply = Some(Supply {
+            pin: Pin { port: 13, pin: 6 },
+            off_min_ticks: 500,
+        });
+        (m.with_supply(history.clone()).unwrap(), history)
+    }
+    #[test]
+    fn boot_rom_initialized_card_ignores_acmd41_until_supply_cycled_long_enough() {
+        let (mut m, supply) = supply_host(true);
+        let mut h = Ram::new(0x10000);
+        setup(&mut m, &mut h);
+        for _ in 0..3 {
+            assert_eq!(acmd41_ocr(&mut m, &mut h), 0x00ff8000);
+            assert_eq!(m.state, State::Idle);
+        }
+        // A pulse shorter than the minimum off time leaves the card as is.
+        *supply.0.lock().unwrap() = LowHistory {
+            rising_edges: 1,
+            last_low_ticks: 499,
+        };
+        assert_eq!(acmd41_ocr(&mut m, &mut h), 0x00ff8000);
+        *supply.0.lock().unwrap() = LowHistory {
+            rising_edges: 2,
+            last_low_ticks: 500,
+        };
+        assert_eq!(acmd41_ocr(&mut m, &mut h), 0xc0ff8000);
+        assert_eq!(m.state, State::Ready);
+    }
+    #[test]
+    fn card_without_boot_rom_initialization_is_ready_regardless_of_supply() {
+        let (mut m, _supply) = supply_host(false);
+        let mut h = Ram::new(0x10000);
+        setup(&mut m, &mut h);
+        assert_eq!(acmd41_ocr(&mut m, &mut h), 0xc0ff8000);
+        let mut plain = host(Protocol::Sdhc);
+        let mut h = Ram::new(0x10000);
+        setup(&mut plain, &mut h);
+        assert_eq!(acmd41_ocr(&mut plain, &mut h), 0xc0ff8000);
     }
     #[test]
     fn ocr_inquiry_keeps_idle_until_a_supported_voltage_is_selected() {

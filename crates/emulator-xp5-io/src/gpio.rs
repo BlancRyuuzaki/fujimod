@@ -163,9 +163,17 @@ impl Device for Gpio {
             };
             if r == 0 {
                 let risen = !old & pins.ports[p].registers[0];
+                let fallen = old & !pins.ports[p].registers[0];
+                let now = cx.now();
                 for pin in 0..16 {
                     if risen & (1 << pin) != 0 {
                         pins.ports[p].output_rising_edges[pin] += 1;
+                        if let Some(since) = pins.ports[p].output_low_since[pin].take() {
+                            pins.ports[p].output_last_low_ticks[pin] = now.saturating_sub(since);
+                        }
+                    }
+                    if fallen & (1 << pin) != 0 {
+                        pins.ports[p].output_low_since[pin] = Some(now);
                     }
                 }
             }
@@ -314,6 +322,32 @@ mod wiring_tests {
         gpio.write(&mut cx, 0xff907000, 4, (1 << 19) | (1 << 3));
         assert_eq!(pins.lock().unwrap().output_rising_edges(0, 3), 1);
         assert!(cx.refusal().is_none());
+    }
+
+    #[test]
+    fn output_latch_records_the_length_of_each_completed_low_interval() {
+        use fujimod_emulator_devices::parts::pins::{LowHistory, OutputLowHistory, Pin};
+        let pins = Pins::shared();
+        let mut gpio = Gpio::new(0xff907000, pins.clone(), false, Vec::new()).unwrap();
+        let pin = Pin { port: 13, pin: 6 };
+        let set = |gpio: &mut Gpio, now: u64, high: bool| {
+            let mut host = RecordingHost::default();
+            host.now = now;
+            let mut cx = Cx::new(&mut host, 0, 0, 0);
+            gpio.write(&mut cx, 0xff907340, 4, (1u64 << 22) | (u64::from(high) << 6));
+            assert!(cx.refusal().is_none());
+        };
+        set(&mut gpio, 10, true);
+        set(&mut gpio, 100, false);
+        assert_eq!(pins.low_history(pin).last_low_ticks, 0);
+        set(&mut gpio, 700, true);
+        assert_eq!(
+            pins.low_history(pin),
+            LowHistory {
+                rising_edges: 2,
+                last_low_ticks: 600
+            }
+        );
     }
 
     #[test]
