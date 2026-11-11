@@ -10,6 +10,12 @@ use std::sync::Arc;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct DeclaredRegister {
+    address: u8,
+    value: u16,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Wiring {
     source_hz: u64,
     endpoints: Vec<Connection>,
@@ -26,11 +32,11 @@ enum Part {
     PowerController {
         rtc_seconds: u32,
         rtc_valid: bool,
-        /// Optional scenario override for register 0 (the power-ready state).
-        /// The stock profile leaves it at the declared `0x200` default; a
-        /// bounded case can supply the bit-15 candidate `0x8200`.
+        /// Scenario overrides for individual registers, applied after reset
+        /// defaults (register 0 starts at `0x200`). Each address appears once
+        /// and names a plain storage register; the RTC latch is refused.
         #[serde(default)]
-        register_0: Option<u16>,
+        registers: Vec<DeclaredRegister>,
     },
     SerialCalibrationRegisters { miso_high: bool },
     FixedMiso { miso_high: bool, bits: u8, mode: u8 },
@@ -161,12 +167,23 @@ fn endpoint(part: Part, controls: Option<Arc<dyn Controls>>) -> Result<Box<dyn E
         Part::PowerController {
             rtc_seconds,
             rtc_valid,
-            register_0,
+            registers,
         } => {
             let mut part = PowerController::new();
             part.configure_rtc(rtc_seconds, rtc_valid);
-            if let Some(value) = register_0 {
-                part.set_register(0, value);
+            let mut seen = [false; 0x80];
+            for DeclaredRegister { address, value } in registers {
+                if address >= 0x80 || address == 0x27 {
+                    return Err(format!(
+                        "power controller register {address:#x} is not a declarable storage register"
+                    ));
+                }
+                if std::mem::replace(&mut seen[address as usize], true) {
+                    return Err(format!(
+                        "power controller register {address:#x} is declared twice"
+                    ));
+                }
+                part.set_register(address, value);
             }
             match controls
                 .map(|controls| (controls.register_ladders(), controls))
@@ -282,7 +299,7 @@ mod tests {
             Part::PowerController {
                 rtc_seconds: 0,
                 rtc_valid: true,
-                register_0: None,
+                registers: Vec::new(),
             },
             Some(controls),
         )
@@ -316,12 +333,12 @@ mod tests {
     }
 
     #[test]
-    fn register_0_scenario_override_distinguishes_the_power_ready_bit() {
+    fn declared_registers_override_reset_values() {
         let mut default_part = endpoint(
             Part::PowerController {
                 rtc_seconds: 0,
                 rtc_valid: false,
-                register_0: None,
+                registers: Vec::new(),
             },
             None,
         )
@@ -333,13 +350,30 @@ mod tests {
             Part::PowerController {
                 rtc_seconds: 0,
                 rtc_valid: false,
-                register_0: Some(0x8200),
+                registers: vec![
+                    DeclaredRegister { address: 0, value: 0x8200 },
+                    DeclaredRegister { address: 0x10, value: 2 },
+                ],
             },
             None,
         )
         .unwrap();
         assert_eq!(read(ready_part.as_mut(), 0), 0x8200, "bit-15 candidate");
-        assert_eq!(read(ready_part.as_mut(), 0) & 0x8000, 0x8000);
+        assert_eq!(read(ready_part.as_mut(), 0x10), 2);
+        for registers in [
+            vec![DeclaredRegister { address: 0x27, value: 0x200 }],
+            vec![DeclaredRegister { address: 0x80, value: 0 }],
+            vec![
+                DeclaredRegister { address: 0x10, value: 1 },
+                DeclaredRegister { address: 0x10, value: 2 },
+            ],
+        ] {
+            assert!(endpoint(
+                Part::PowerController { rtc_seconds: 0, rtc_valid: false, registers },
+                None,
+            )
+            .is_err());
+        }
     }
 
     #[test]
