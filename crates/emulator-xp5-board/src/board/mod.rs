@@ -365,7 +365,7 @@ fn register_with_resources(
                 Box::new(display::Display::new(window.base, clocks.clone(), config)?),
             )?;
         }
-        "clock-banks" => clocks::register(bus, window.base, window.size)?,
+        "clock-banks" => clocks::register(bus, window.base, window.size, &window.options)?,
         "lz" => lz::register(bus, window.base, window.size)?,
         "panel-spi" => {
             if window.base != 0xff919000 || window.size != 0x1000 {
@@ -641,7 +641,7 @@ pub fn register_all(
                     .filter(|w| w.kind == "panel-pll")
                     .map(|w| w.base)
                     .collect();
-                clocks::register_except(bus, w.base, w.size, &specialized)?;
+                clocks::register_except(bus, w.base, w.size, &specialized, &w.options)?;
             }
             "flash-storage-controller" => {
                 if w.base != 0xff90a000 || w.size != 0x1000 {
