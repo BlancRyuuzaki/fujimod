@@ -7689,6 +7689,42 @@
             "kind": 1
           },
           {
+            "address": 4287656776,
+            "mask": 0,
+            "value": 4194304,
+            "kind": 0
+          },
+          {
+            "address": 4287656772,
+            "mask": 0,
+            "value": 4194304,
+            "kind": 0
+          },
+          {
+            "address": 4287656780,
+            "mask": 0,
+            "value": 805306368,
+            "kind": 0
+          },
+          {
+            "address": 4287656768,
+            "mask": 0,
+            "value": 4194304,
+            "kind": 0
+          },
+          {
+            "address": 4287656772,
+            "mask": 0,
+            "value": 4194368,
+            "kind": 0
+          },
+          {
+            "address": 0,
+            "mask": 0,
+            "value": 500,
+            "kind": 2
+          },
+          {
             "address": 4287677228,
             "mask": 127,
             "value": 127,
@@ -7787,7 +7823,7 @@
           {
             "address": 4288356926,
             "mask": 4352,
-            "value": 4352,
+            "value": 4096,
             "kind": 3
           },
           {
@@ -7795,12 +7831,6 @@
             "mask": 0,
             "value": 1,
             "kind": 2
-          },
-          {
-            "address": 4288356472,
-            "mask": 1,
-            "value": 1,
-            "kind": 4
           },
           {
             "address": 4288356588,
@@ -7811,24 +7841,6 @@
         ]
       },
       "host_prelude": [
-        {
-          "address": 4288356908,
-          "mask": 1,
-          "value": 1000,
-          "kind": 5
-        },
-        {
-          "address": 4288356932,
-          "mask": 0,
-          "value": 0,
-          "kind": 6
-        },
-        {
-          "address": 4288348160,
-          "mask": 33932100,
-          "value": 1000,
-          "kind": 7
-        },
         {
           "address": 4287678784,
           "mask": 2,
@@ -7926,6 +7938,42 @@
           "offset": 2629020,
           "size": 156,
           "sha256": "319b1529410155ee416ce4f1fbad2044f4a5cfd47f82369a8bc2f5397e0a75e8"
+        },
+        {
+          "source": {
+            "dat_offset": 3146356,
+            "size": 5415597,
+            "compression": "method4",
+            "decoded_size": 12042160,
+            "sha256": "3aacc331157312a03531266cd9aca0daea28597b9f3535bb6141105ad7354b4d"
+          },
+          "offset": 2629176,
+          "size": 92,
+          "sha256": "e34c9eac516c8ea0ff7c339396e8662198a3262f9f3f4de7289bf6359519c864"
+        },
+        {
+          "source": {
+            "dat_offset": 3146356,
+            "size": 5415597,
+            "compression": "method4",
+            "decoded_size": 12042160,
+            "sha256": "3aacc331157312a03531266cd9aca0daea28597b9f3535bb6141105ad7354b4d"
+          },
+          "offset": 2629268,
+          "size": 84,
+          "sha256": "b1b45fc6ec9b4e7ca4f3672d27735f4acf32538fa695ff68d25723b5afa690c8"
+        },
+        {
+          "source": {
+            "dat_offset": 3146356,
+            "size": 5415597,
+            "compression": "method4",
+            "decoded_size": 12042160,
+            "sha256": "3aacc331157312a03531266cd9aca0daea28597b9f3535bb6141105ad7354b4d"
+          },
+          "offset": 2629352,
+          "size": 84,
+          "sha256": "ca4c474b0b7f0b3c053c37a79ce848cf4ed3d5a2cbbbe0f0edbea0b4148a6c7e"
         },
         {
           "source": {
@@ -8142,6 +8190,18 @@
           "offset": 2781792,
           "size": 232,
           "sha256": "e805fb7f5be482b265ba0bd0890f9100f984349895b232db3bb94297076b23e3"
+        },
+        {
+          "source": {
+            "dat_offset": 3146356,
+            "size": 5415597,
+            "compression": "method4",
+            "decoded_size": 12042160,
+            "sha256": "3aacc331157312a03531266cd9aca0daea28597b9f3535bb6141105ad7354b4d"
+          },
+          "offset": 2782024,
+          "size": 108,
+          "sha256": "a129dd35b266ab46677f3074445e5f35dc7d91dac4492710eef8fd3f65f5d9cf"
         },
         {
           "source": {
