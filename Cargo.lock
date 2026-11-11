@@ -1776,6 +1776,7 @@ dependencies = [
  "fujimod-emulator-ip-arm",
  "fujimod-emulator-models",
  "fujimod-emulator-parts-controls",
+ "fujimod-emulator-storage",
  "fujimod-emulator-xp5-board",
  "fujimod-emulator-xp5-display",
  "fujimod-emulator-xp5-io",

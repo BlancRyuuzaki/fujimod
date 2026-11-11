@@ -32,6 +32,7 @@ fujimod-emulator-boot.workspace = true
 fujimod-emulator-cpu = { path = "../emulator-cpu" }
 fujimod-emulator-cpu-unicorn = { path = "../emulator-cpu-unicorn" }
 fujimod-emulator-devices = { path = "../emulator-devices" }
+fujimod-emulator-storage.workspace = true
 fujimod-emulator-exr2-board = { path = "../emulator-exr2-board" }
 fujimod-catalog-assets.workspace = true
 serde = { version = "1", features = ["derive"] }

@@ -4,7 +4,8 @@ use fujimod_catalog_assets::Asset;
 use fujimod_emulator::board::{self, Board, InterruptMap, aprofile, bus::Bus, factory, mprofile};
 use fujimod_catalog_assets::files::{Files, Location};
 use fujimod_emulator_cpu::{self as cpu, Access, Model, Register};
-use fujimod_emulator_devices::{graph::{DeviceGraph, DeviceWindow}, parts::{controls::{Controls, Source}, pins::DriveInput}};
+use fujimod_emulator_devices::{capability::CardSlot, graph::{DeviceGraph, DeviceWindow}, parts::{controls::{Controls, Source}, pins::DriveInput}};
+use fujimod_emulator_storage::fat;
 use fujimod_emulator_parts_controls::key_input::{ControlsOptions, Key, KeyInput};
 use fujimod_emulator_xp5_board::board as xp5_board;
 use fujimod_emulator_xp5_display::display;
@@ -396,6 +397,8 @@ enum Command {
         at: Option<u64>,
     },
     UsbConnection { base: u64, connected: bool },
+    /// Read one file from the FAT card in the SD host at `base`.
+    CardRead { base: u64, path: String, max_bytes: usize },
     Frames,
     Close,
 }
@@ -462,6 +465,7 @@ struct Worker {
     archive: u64,
     unmodeled_devices: Vec<String>,
     usb_connections: BTreeMap<u64, usize>,
+    sd_hosts: BTreeMap<u64, usize>,
     instruction_points: BTreeMap<usize, Box<board::observation::InstructionPoints>>,
     memory_write_watch: Option<Box<board::observation::MemoryWatch>>,
 }
@@ -516,6 +520,7 @@ impl Worker {
         let mut graph = DeviceGraph::new();
         let mut unmodeled_devices = vec![];
         let mut usb_connections = BTreeMap::new();
+        let mut sd_hosts = BTreeMap::new();
         let (input, input_source) = match config.devices {
             Devices::Xp5 {
                 windows,
@@ -572,6 +577,9 @@ impl Worker {
                     .filter(|window| window.kind == "usb-connection-status")
                 {
                     usb_connections.insert(window.base, graph.at(window.base)?);
+                }
+                for window in windows.iter().filter(|window| window.kind == "sdhci") {
+                    sd_hosts.insert(window.base, graph.at(window.base)?);
                 }
                 if !resources.sd.is_empty() { return Err("unused SD media configuration".into()); }
                 if !resources.displays.is_empty() {
@@ -689,6 +697,7 @@ impl Worker {
             archive: 0,
             unmodeled_devices,
             usb_connections,
+            sd_hosts,
             instruction_points: BTreeMap::new(),
             memory_write_watch: None,
         })
@@ -816,6 +825,24 @@ impl Worker {
                     Ok(())
                 })?;
                 Ok(json!({"base":base,"connected":connected}))
+            }
+            Command::CardRead {
+                base,
+                path,
+                max_bytes,
+            } => {
+                if !(1..=16 * 1024 * 1024).contains(&max_bytes) {
+                    return Err("card reads require a bound of 1..16 MiB".into());
+                }
+                let host = self
+                    .sd_hosts
+                    .get(&base)
+                    .copied()
+                    .ok_or("no declared SD host at this base")?;
+                let data = self.board.inspect_capability::<dyn CardSlot, _>(host, |host| {
+                    fat::Reader::new(host.readable_card(None)?)?.read(&path, max_bytes)
+                })?;
+                Ok(json!({"hex":hex(&data)}))
             }
             Command::Frames => {
                 let mut frames = vec![];
