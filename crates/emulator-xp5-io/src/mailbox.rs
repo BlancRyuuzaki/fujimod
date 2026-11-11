@@ -75,6 +75,9 @@ impl Device for Mailbox {
         let companion = cx.cpu == self.pins.companion;
         let bit = match (o, companion) {
             (0, false) => 1,
+            // Application cores may leave words in payload slots 1 and 2;
+            // no cause is attached to them.
+            (4 | 8, false) => 0,
             (0xc, false) => 8,
             (0x10, true) => 0x10,
             (0x14, true) => 0x20,
@@ -229,6 +232,18 @@ mod tests {
         assert_eq!(m.save(), saved);
         write(&mut m, &mut h, 0, 0x20, 0xffffffff);
         assert_eq!(m.save()["causes"], 0);
+    }
+    #[test]
+    fn application_payload_words_store_without_a_cause() {
+        let mut m = device();
+        let mut h = TestHost::default();
+        write(&mut m, &mut h, 1, 4, 0x1000_900d);
+        write(&mut m, &mut h, 2, 8, 0x2000_900d);
+        let s = m.save();
+        assert_eq!(s["words"][1], 0x1000_900d);
+        assert_eq!(s["words"][2], 0x2000_900d);
+        assert_eq!(s["causes"], 0);
+        assert!(h.core.is_empty() && h.irqs.is_empty());
     }
     #[test]
     fn invalid_accesses_and_execution_metadata_are_refused_without_mutation() {
