@@ -4189,6 +4189,15 @@
             }
           ]
         },
+        "card-files": {
+          "status": "unavailable",
+          "errors": [
+            {
+              "locator": "card_files.locate",
+              "reason": "FileNotFoundError: [Errno 2] No such file or directory: '<input>'"
+            }
+          ]
+        },
         "controls": {
           "status": "unavailable",
           "errors": [
@@ -4202,8 +4211,12 @@
           "status": "unavailable",
           "errors": [
             {
-              "locator": "inputs",
-              "reason": "firmware image not available"
+              "locator": "app80",
+              "reason": "Checked 185-row dispatch32 table with its dispatcher, 32-byte rows (command@0, handler@8, parameters@16, modes@24, next_mode@28); the 64-bit App80 mailbox and projection are not verified"
+            },
+            {
+              "locator": "framebuffer",
+              "reason": "Runtime scanout is required; static inspection cannot confirm a live framebuffer"
             }
           ]
         },
