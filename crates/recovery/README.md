@@ -221,6 +221,9 @@ pre-setup stack bound and the two relocations against stock setup routines. The
 build script turns that layout into constants and the crate loads the image with
 `include_bytes!`. The image contains empty camera-data placeholders; card
 construction needs only the official DAT and the compiled catalog recipes.
+Card construction also lists the RAM image's all-zero 64 KiB runs after its
+first block in the loader request, at most 16 and the longest first; the
+loader fills them instead of reading them, and its CRC32 still covers them.
 
 The EXR compiled SD loader is `assets/exr-sd-loader.generated.bin`; its
 companion `assets/exr-sd-loader.generated.json` gives the startup loader and

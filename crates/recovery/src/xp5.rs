@@ -120,6 +120,33 @@ pub struct Setup {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub card_boot: Option<CardBoot>,
 }
+/// Request ABI 3: six words, then the count and offset/length pairs of the
+/// RAM prefix's zero runs, which the loader fills instead of reading.
+const REQUEST_BYTES: usize = 56 + ZERO_RUNS * 16;
+const ZERO_RUNS: usize = 16;
+const ZERO_BLOCK: usize = 0x10000;
+
+/// The prefix's all-zero 64 KiB blocks after its first, merged into runs; when
+/// there are more runs than the request holds, the longest are kept.
+fn zero_runs(prefix: &[u8]) -> Vec<(u64, u64)> {
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    for start in (ZERO_BLOCK..prefix.len() / ZERO_BLOCK * ZERO_BLOCK).step_by(ZERO_BLOCK) {
+        if prefix[start..start + ZERO_BLOCK].iter().all(|v| *v == 0) {
+            match runs.last_mut() {
+                Some((offset, bytes)) if *offset + *bytes == start as u64 => {
+                    *bytes += ZERO_BLOCK as u64
+                }
+                _ => runs.push((start as u64, ZERO_BLOCK as u64)),
+            }
+        }
+    }
+    if runs.len() > ZERO_RUNS {
+        runs.sort_by_key(|run| std::cmp::Reverse(run.1));
+        runs.truncate(ZERO_RUNS);
+        runs.sort_unstable();
+    }
+    runs
+}
 fn put64(data: &mut [u8], at: usize, value: u64) -> Result<()> {
     extent(data, at, 8)?;
     data[at..at + 8].copy_from_slice(&value.to_le_bytes());
@@ -580,12 +607,11 @@ pub(crate) fn package_with_storage(
         let targets = setup.secondary_release.iter().fold(0u64, |mask, core| mask | 1 << core);
         put64(&mut program, release, targets)?;
         let request = template::SETUP_SD_REQUEST;
-        require(
-            extent(&program, request, 48)? == [2u64, 0, 0, 0, 0, 0].map(u64::to_le_bytes).concat(),
-            "XP5 request template changed",
-        )?;
+        let mut empty = vec![0; REQUEST_BYTES];
+        empty[0] = 3;
+        require(extent(&program, request, REQUEST_BYTES)? == empty, "XP5 request template changed")?;
         for (n, value) in [
-            2,
+            3,
             ram.len() as u64,
             u64::from(crate::xp4::crc32(&ram)),
             100,
@@ -618,6 +644,19 @@ pub(crate) fn package_with_storage(
             })?;
         } else {
             require(storage.is_none(), "Setup has no card storage binding")?;
+        }
+        // Runs come from the final prefix: card boot patches it above.
+        let bytes = u64::from_le_bytes(extent(&program, request + 8, 8)?.try_into().unwrap());
+        let prefix = extent(&ram, 0, bytes as usize)?;
+        require(
+            word(&program, request + 16)? == crate::xp4::crc32(prefix),
+            "XP5 request CRC differs from the RAM prefix",
+        )?;
+        let runs = zero_runs(prefix);
+        put64(&mut program, request + 48, runs.len() as u64)?;
+        for (n, (offset, length)) in runs.into_iter().enumerate() {
+            put64(&mut program, request + 56 + n * 16, offset)?;
+            put64(&mut program, request + 64 + n * 16, length)?;
         }
         files.push(File::new("ffboot.bin", ram)?);
         if !setup.handoff_ranges.is_empty() {
@@ -755,6 +794,37 @@ mod tests {
         let mut ram = data[0x40000..].to_vec();
         put64(&mut ram, 0x40, 0).unwrap();
         (data, setup, ram)
+    }
+    #[test]
+    fn zero_runs_merge_whole_zero_blocks_after_the_first() {
+        let block = ZERO_BLOCK;
+        let mut prefix = vec![0; 5 * block + 0x800];
+        prefix[3 * block + 7] = 1;
+        assert_eq!(zero_runs(&prefix), [(block as u64, 2 * block as u64), (4 * block as u64, block as u64)]);
+        // More runs than the request holds: the longest stay, in order.
+        let mut many = vec![1; 90 * block];
+        for n in 0..20 {
+            let length = if n == 7 { 3 } else { 1 };
+            many[(2 + 4 * n) * block..(2 + 4 * n + length) * block].fill(0);
+        }
+        let runs = zero_runs(&many);
+        assert_eq!(runs.len(), ZERO_RUNS);
+        assert!(runs.contains(&((30 * block) as u64, 3 * block as u64)));
+        assert!(runs.is_sorted());
+    }
+    #[test]
+    fn the_request_lists_the_ram_prefix_zero_runs() {
+        let (data, s, mut ram) = fixture();
+        ram.resize(5 * ZERO_BLOCK, 0);
+        ram[3 * ZERO_BLOCK] = 9;
+        let files = package(&data, &s, Some(ram.clone()), 0, StartupStop::Continue, false).unwrap();
+        let request = 0xc000 + template::SETUP_SD_REQUEST;
+        let raw = &files[0].bytes;
+        let value = |at: usize| u64::from_le_bytes(raw[request + at..request + at + 8].try_into().unwrap());
+        assert_eq!((value(0), value(8), value(48)), (3, ram.len() as u64, 2));
+        assert_eq!([value(56), value(64), value(72), value(80)],
+                   [0x10000, 0x20000, 0x40000, 0x10000]);
+        assert!(raw[request + 88..request + REQUEST_BYTES].iter().all(|v| *v == 0));
     }
     #[test]
     fn source_checked_setup_prefix_uses_its_declared_extent() {
