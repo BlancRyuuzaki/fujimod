@@ -96,10 +96,47 @@ async fn target(device_id: Option<String>) -> std::result::Result<Target, String
         interface: interfaces[0],
     })
 }
+/// `fujimod-mount` exits with this status when the camera's identity has no
+/// catalog firmware. Retrying cannot succeed until the catalog changes.
+pub const EXIT_UNSUPPORTED_FIRMWARE: i32 = 3;
+
+/// Why [`UsbDevice::connect`] failed.
+#[derive(Debug)]
+pub enum ConnectError {
+    /// The camera answered, but no catalog firmware matches its identity.
+    UnsupportedFirmware {
+        product: String,
+        internal_version: String,
+    },
+    Failed(String),
+}
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedFirmware {
+                product,
+                internal_version,
+            } => write!(f, "No catalog firmware for {product} {internal_version}"),
+            Self::Failed(message) => f.write_str(message),
+        }
+    }
+}
+impl std::error::Error for ConnectError {}
+impl From<String> for ConnectError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+impl From<&str> for ConnectError {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.to_owned())
+    }
+}
+
 fn automatic_firmware(
     device_id: Option<String>,
     catalog: &ReferenceCatalog,
-) -> std::result::Result<String, String> {
+) -> std::result::Result<String, ConnectError> {
     block_on(async {
         let mut target = target(device_id).await?;
         let mut session = target.open().await.map_err(|e| e.to_string())?;
@@ -125,11 +162,18 @@ fn automatic_firmware(
                 ids.insert(facts.firmware_id.clone());
             }
         }
+        if ids.is_empty() {
+            return Err(ConnectError::UnsupportedFirmware {
+                product,
+                internal_version: version,
+            });
+        }
         if ids.len() != 1 {
             return Err(format!(
                 "Expected one catalog firmware for {product} {version}, found {}",
                 ids.len()
-            ));
+            )
+            .into());
         }
         Ok(ids.into_iter().next().unwrap())
     })
@@ -459,7 +503,7 @@ impl UsbDevice {
         device_id: Option<String>,
         limits: DebugMemoryLimits,
         flash_reader: Option<std::path::PathBuf>,
-    ) -> std::result::Result<(Self, Vec<Region>), String> {
+    ) -> std::result::Result<(Self, Vec<Region>), ConnectError> {
         let catalog = ReferenceCatalog::bundled()?;
         let firmware = if firmware == "auto" {
             automatic_firmware(device_id.clone(), &catalog)?
@@ -595,7 +639,7 @@ impl UsbDevice {
             )),
             Err(error) => {
                 let _ = worker.join();
-                Err(error)
+                Err(error.into())
             }
         }
     }

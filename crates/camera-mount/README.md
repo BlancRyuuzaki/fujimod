@@ -56,7 +56,9 @@ cargo run -p fujimod-camera-mount --bin fujimod-mount -- \
 
 Use `--firmware auto` to select the catalog entry matching the connected
 camera's product and internal version. Selection fails if the identity is ambiguous
-or has no published capability.
+or has no published capability. An identity with no catalog firmware exits with
+status 3, so a supervisor can stop retrying a mount that cannot succeed; every
+other failure exits with status 1.
 
 For multiple local processes, `fujimod-usb-agent BUS-PORTS READY-JSON` opens one
 physical camera and publishes a loopback USB proxy endpoint in `READY-JSON`.

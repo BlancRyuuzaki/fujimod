@@ -469,3 +469,22 @@ fn unloading_an_absent_helper_never_acquires_usb() {
         assert_eq!(client.sessions.opens.load(Ordering::SeqCst), 0);
     });
 }
+
+#[test]
+fn an_identity_without_catalog_firmware_is_its_own_connect_error() {
+    let error = ConnectError::UnsupportedFirmware {
+        product: "X-H2".into(),
+        internal_version: "3.51".into(),
+    };
+    assert_eq!(error.to_string(), "No catalog firmware for X-H2 3.51");
+    let boxed: Box<dyn std::error::Error> = error.into();
+    assert!(matches!(
+        boxed.downcast_ref::<ConnectError>(),
+        Some(ConnectError::UnsupportedFirmware { .. })
+    ));
+    assert!(matches!(
+        ConnectError::from("Selected firmware has no readable memory map"),
+        ConnectError::Failed(_)
+    ));
+    assert_ne!(EXIT_UNSUPPORTED_FIRMWARE, 1);
+}
