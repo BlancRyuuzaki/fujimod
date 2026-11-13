@@ -864,6 +864,12 @@ impl Guard {
         let scalar_fcvtzs_x_from_s = word & 0xffff_fc00 == 0x9e38_0000; // FCVTZS X,S.
         let scalar_ucvtf = matches!(word & 0xffff_fc00, 0x1e23_0000 | 0x7e21_d800); // UCVTF S,W and S,S; other conversion widths refuse.
         let scalar_scvtf = word & 0xffff_fc00 == 0x9e22_0000; // SCVTF S,X.
+        let scalar_ucvtf_d_from_w = word & 0xffff_fc00 == 0x1e63_0000; // UCVTF D,W.
+        let scalar_scvtf_d_from_w = word & 0xffff_fc00 == 0x1e62_0000; // SCVTF D,W.
+        let scalar_fcvtzs_w_from_d = word & 0xffff_fc00 == 0x1e78_0000; // FCVTZS W,D.
+        let scalar_fcmpe_d_register = word & 0xff60_fc1f == 0x1e60_2010; // FCMPE D,D.
+        let scalar_fadd_d = word & 0xff60_fc00 == 0x1e60_2800; // FADD D,D,D.
+        let scalar_fdiv_d = word & 0xff60_fc00 == 0x1e60_1800; // FDIV D,D,D.
         let scalar_fp_math = ((word & 0xff20_fc00 == 0x1e20_0800 // FMUL S/D.
             || word & 0xff20_0c00 == 0x1e20_0c00 // FCSEL S/D.
             || word & 0xff20_fc1f == 0x1e20_2000) // FCMP S/D.
@@ -880,6 +886,12 @@ impl Guard {
             || scalar_fcvtzs_x_from_s
             || scalar_ucvtf
             || scalar_scvtf
+            || scalar_ucvtf_d_from_w
+            || scalar_scvtf_d_from_w
+            || scalar_fcvtzs_w_from_d
+            || scalar_fcmpe_d_register
+            || scalar_fadd_d
+            || scalar_fdiv_d
             || scalar_fp_math
         {
             return Ok(());
@@ -1808,6 +1820,39 @@ mod tests {
             .failure
             .unwrap()
             .contains("Unsupported instruction 0x9e620000"));
+    }
+    #[test]
+    fn checked_scalar_double_polynomial_forms_are_narrowly_admitted() {
+        for word in [
+            0x1e63_0000, // UCVTF D0,W0.
+            0x1e62_0001, // SCVTF D1,W0.
+            0x1e60_2820, // FADD D0,D1,D0.
+            0x1e61_1800, // FDIV D0,D0,D1.
+            0x1e61_2010, // FCMPE D0,D1.
+            0x1e78_0000, // FCVTZS W0,D0.
+        ] {
+            let mut b = board(&[word, 0xd65f_03c0]);
+            let r = checked_call(&mut b, options()).unwrap();
+            assert!(r.returned, "{word:#010x}: {:?}", r.failure);
+            assert_eq!(r.instructions, 2, "{word:#010x}");
+        }
+
+        for word in [
+            0x9e63_0000, // UCVTF D0,X0.
+            0x9e62_0000, // SCVTF D0,X0.
+            0x1e20_2820, // FADD S0,S1,S0.
+            0x1e21_1800, // FDIV S0,S0,S1.
+            0x1e21_2010, // FCMPE S0,S1.
+            0x9e78_0000, // FCVTZS X0,D0.
+        ] {
+            let mut b = board(&[word, 0xd65f_03c0]);
+            let r = checked_call(&mut b, options()).unwrap();
+            assert_eq!(r.instructions, 0, "{word:#010x}");
+            assert!(
+                r.failure.unwrap().contains("Unsupported instruction"),
+                "{word:#010x}"
+            );
+        }
     }
     #[test]
     fn scalar_fp_register_math_and_round_toward_zero_are_checked() {
