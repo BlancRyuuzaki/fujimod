@@ -870,6 +870,10 @@ impl Guard {
         let scalar_fcmpe_d_register = word & 0xff60_fc1f == 0x1e60_2010; // FCMPE D,D.
         let scalar_fadd_d = word & 0xff60_fc00 == 0x1e60_2800; // FADD D,D,D.
         let scalar_fdiv_d = word & 0xff60_fc00 == 0x1e60_1800; // FDIV D,D,D.
+        let scalar_fsub_d = word & 0xffe0_fc00 == 0x1e60_3800; // FSUB D,D,D.
+        let scalar_fnmul_d = word & 0xffe0_fc00 == 0x1e60_8800; // FNMUL D,D,D.
+        let scalar_fcvtzu_w_from_d = word & 0xffff_fc00 == 0x1e79_0000; // FCVTZU W,D.
+        let scalar_movi_d = word & 0xfff8_fc00 == 0x2f00_e400; // MOVI Dd,#imm64; vector forms refuse.
         let scalar_fp_math = ((word & 0xff20_fc00 == 0x1e20_0800 // FMUL S/D.
             || word & 0xff20_0c00 == 0x1e20_0c00 // FCSEL S/D.
             || word & 0xff20_fc1f == 0x1e20_2000) // FCMP S/D.
@@ -892,6 +896,10 @@ impl Guard {
             || scalar_fcmpe_d_register
             || scalar_fadd_d
             || scalar_fdiv_d
+            || scalar_fsub_d
+            || scalar_fnmul_d
+            || scalar_fcvtzu_w_from_d
+            || scalar_movi_d
             || scalar_fp_math
         {
             return Ok(());
@@ -1844,6 +1852,57 @@ mod tests {
             0x1e21_1800, // FDIV S0,S0,S1.
             0x1e21_2010, // FCMPE S0,S1.
             0x9e78_0000, // FCVTZS X0,D0.
+        ] {
+            let mut b = board(&[word, 0xd65f_03c0]);
+            let r = checked_call(&mut b, options()).unwrap();
+            assert_eq!(r.instructions, 0, "{word:#010x}");
+            assert!(
+                r.failure.unwrap().contains("Unsupported instruction"),
+                "{word:#010x}"
+            );
+        }
+    }
+    #[test]
+    fn checked_scalar_double_difference_forms_compute_and_stay_narrow() {
+        // FMOV D0,#4; FMOV D1,#1; FMOV D4,#1; FSUB D2,D0,D1; FNMUL D3,D0,D1;
+        // FCVTZU W0,D2; FCVTZU W1,D3; MOVI D4,#0; FMOV X2,D4; RET.
+        let code = [
+            0x1e62_1000,
+            0x1e6e_1001,
+            0x1e6e_1004,
+            0x1e61_3802,
+            0x1e61_8803,
+            0x1e79_0040,
+            0x1e79_0061,
+            0x2f00_e404,
+            0x9e66_0082,
+            0xd65f_03c0,
+        ];
+        let mut b = board(&code);
+        let mut o = options();
+        o.executable = vec![(0x1000, 0x1028)];
+        o.readable = vec![(0x1000, 0x1028), (0x4000, 0x4010), (0x8000, 0xa000)];
+        let r = checked_call(&mut b, o).unwrap();
+        assert!(r.returned, "{:?}", r.failure);
+        assert_eq!(r.registers["x0"], 3);
+        assert_eq!(r.registers["x1"], 0); // Round toward zero saturates negatives to 0.
+        assert_eq!(r.registers["x2"], 0);
+        let mut vector = [0; 16];
+        for (register, bits) in [(2, 0x4008_0000_0000_0000u64), (3, 0xc010_0000_0000_0000)] {
+            b.cpu(0)
+                .unwrap()
+                .read_register(Register::V(register), &mut vector)
+                .unwrap();
+            assert_eq!(u64::from_le_bytes(vector[..8].try_into().unwrap()), bits);
+        }
+
+        for word in [
+            0x1ee0_3800, // FSUB H0,H0,H0.
+            0x1e20_3800, // FSUB S0,S0,S0.
+            0x1e20_8800, // FNMUL S0,S0,S0.
+            0x9e79_0000, // FCVTZU X0,D0.
+            0x6f00_e400, // MOVI V0.2D,#0.
+            0x0f00_e400, // MOVI V0.8B,#0.
         ] {
             let mut b = board(&[word, 0xd65f_03c0]);
             let r = checked_call(&mut b, options()).unwrap();
