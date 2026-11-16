@@ -863,10 +863,11 @@ impl Guard {
         let scalar_fcmpe_zero = word & 0xffbf_fc1f == 0x1e20_2018; // FCMPE S/D,#0.0; width and Rn vary.
         let scalar_fcvtzs_x_from_s = word & 0xffff_fc00 == 0x9e38_0000; // FCVTZS X,S.
         let scalar_ucvtf = matches!(word & 0xffff_fc00, 0x1e23_0000 | 0x7e21_d800); // UCVTF S,W and S,S; other conversion widths refuse.
-        let scalar_scvtf = matches!(word & 0xffff_fc00, 0x9e22_0000 | 0x5e21_d800); // SCVTF S,X and S,S; other conversion widths refuse.
+        let scalar_scvtf = matches!(word & 0xffff_fc00, 0x1e22_0000 | 0x9e22_0000 | 0x5e21_d800); // SCVTF S,W, S,X and S,S; other conversion widths refuse.
         let scalar_ucvtf_d_from_w = word & 0xffff_fc00 == 0x1e63_0000; // UCVTF D,W.
         let scalar_scvtf_d_from_w = word & 0xffff_fc00 == 0x1e62_0000; // SCVTF D,W.
         let scalar_fcvtzs_w_from_d = word & 0xffff_fc00 == 0x1e78_0000; // FCVTZS W,D.
+        let scalar_fcvtzu_w_from_s = word & 0xffff_fc00 == 0x1e39_0000; // FCVTZU W,S.
         let scalar_fcmpe_register = word & 0xffa0_fc1f == 0x1e20_2010; // FCMPE S,S and D,D; only bit 22 varies by width.
         let scalar_fadd = word & 0xffa0_fc00 == 0x1e20_2800; // FADD S/D; only bit 22 varies by width.
         let scalar_fdiv = word & 0xffa0_fc00 == 0x1e20_1800; // FDIV S/D; only bit 22 varies by width.
@@ -894,6 +895,7 @@ impl Guard {
             || scalar_ucvtf_d_from_w
             || scalar_scvtf_d_from_w
             || scalar_fcvtzs_w_from_d
+            || scalar_fcvtzu_w_from_s
             || scalar_fcmpe_register
             || scalar_fadd
             || scalar_fdiv
@@ -1830,6 +1832,34 @@ mod tests {
             .failure
             .unwrap()
             .contains("Unsupported instruction 0x9e620000"));
+    }
+    #[test]
+    fn scalar_scvtf_signed_w_to_s_retires() {
+        let mut b = board(&[
+            0x1e22_0000, // SCVTF S0,W0.
+            0x1e26_0001, // FMOV W1,S0.
+            0xd65f_03c0,
+        ]);
+        let mut o = options();
+        o.arguments = vec![(-640i32 as u32) as u64];
+        let r = checked_call(&mut b, o).unwrap();
+        assert!(r.returned, "{:?}", r.failure);
+        assert_eq!(r.instructions, 3);
+        assert_eq!(r.registers["x1"], (-640.0f32).to_bits() as u64);
+    }
+    #[test]
+    fn scalar_fcvtzu_w_from_s_retires() {
+        let mut b = board(&[
+            0x1e27_0000, // FMOV S0,W0.
+            0x1e39_0001, // FCVTZU W1,S0.
+            0xd65f_03c0,
+        ]);
+        let mut o = options();
+        o.arguments = vec![5.75f32.to_bits() as u64];
+        let r = checked_call(&mut b, o).unwrap();
+        assert!(r.returned, "{:?}", r.failure);
+        assert_eq!(r.instructions, 3);
+        assert_eq!(r.registers["x1"], 5);
     }
     #[test]
     fn checked_scalar_double_polynomial_forms_are_narrowly_admitted() {
