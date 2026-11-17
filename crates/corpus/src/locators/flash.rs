@@ -216,6 +216,43 @@ pub fn flash<L: Lookup>(
     image_origin: u64,
     control_offset: u64,
 ) -> Result<Value> {
+    flash_with_route(
+        index,
+        firmware,
+        processor,
+        jedec_id,
+        image_origin,
+        control_offset,
+        false,
+    )
+}
+
+pub(super) fn mapped_xp5_flash<L: Lookup>(
+    index: &L,
+    firmware: &str,
+    image_origin: u64,
+    control_offset: u64,
+) -> Result<Value> {
+    flash_with_route(
+        index,
+        firmware,
+        "xp5",
+        None,
+        image_origin,
+        control_offset,
+        true,
+    )
+}
+
+fn flash_with_route<L: Lookup>(
+    index: &L,
+    firmware: &str,
+    processor: &str,
+    jedec_id: Option<u32>,
+    image_origin: u64,
+    control_offset: u64,
+    mapped_only: bool,
+) -> Result<Value> {
     if processor == "xp4" {
         return xp4_flash(index, firmware, image_origin);
     }
@@ -311,6 +348,23 @@ pub fn flash<L: Lookup>(
         dispatcher.span("flash read dispatcher"),
         dma.span(dma_shape.range_name()),
     ];
+    if mapped_only {
+        if nand {
+            return Err("mapped E1 metadata requires a serial NOR reader graph".into());
+        }
+        ranges.push(cache.span("destination cache maintenance"));
+        return Ok(json!({
+            "device":{"kind":"serial-nor"},
+            "window":{"address":0xf0000000u64,"size":0x8000000},
+            "e1_window":{"address":0xf0000000u64,"size":0x8000000},
+            "update_image":{"dat_offset":image_origin,"xor":255},
+            "reader":null,
+            "transport":null,
+            "code_ranges":ranges,
+            "state_checks":[],
+            "control":{"offset":control_offset,"size":32768}
+        }));
+    }
     let mut checks = vec![];
     let device = if nand {
         let mode = one(
@@ -814,7 +868,10 @@ fn xpp_register_table_read_mode(routine: &Routine) -> bool {
         routine.code.windows(2).any(|instructions| {
             let immediate = |instruction: &Instruction| {
                 let (register, value) = instruction.operands.split_once(", ")?;
-                Some((register.to_string(), number(value.trim_start_matches('#')).ok()?))
+                Some((
+                    register.to_string(),
+                    number(value.trim_start_matches('#')).ok()?,
+                ))
             };
             let Some((low_register, low_value)) = immediate(&instructions[0]) else {
                 return false;
@@ -1422,9 +1479,13 @@ fn unnamed_reader<L: Lookup>(
 ) -> Result<Routine> {
     let readers = locator.small_routines(0x40, |routine| {
         is_reader(routine)
-            && locator.calls(routine).unwrap_or_default().iter().any(|request| {
-                request.has("mov", "w0, #0x6555") && request.has("movk", "w0, #0x7766, lsl #16")
-            })
+            && locator
+                .calls(routine)
+                .unwrap_or_default()
+                .iter()
+                .any(|request| {
+                    request.has("mov", "w0, #0x6555") && request.has("movk", "w0, #0x7766, lsl #16")
+                })
     });
     one(readers, "flash_read")
 }
@@ -1588,10 +1649,7 @@ mod tests {
             ("str", "w0, [sp, #0x70]"),
             ("mov", "w0, #0x400"),
         ];
-        assert_eq!(
-            DmaShape::of(&code(&queued)),
-            Some(DmaShape::QueuedCommand)
-        );
+        assert_eq!(DmaShape::of(&code(&queued)), Some(DmaShape::QueuedCommand));
         assert_eq!(DmaShape::DirectPoll.range_name(), "flash DMA read");
         assert!(
             DmaShape::QueuedCommand
@@ -1605,10 +1663,7 @@ mod tests {
             let expected = matches!(skip, 4).then_some(DmaShape::QueuedCommand);
             assert_eq!(DmaShape::of(&code(&partial)), expected, "without {skip}");
         }
-        assert_eq!(
-            DmaShape::of(&code(&[("str", "x19, [sp, #0x78]")])),
-            None
-        );
+        assert_eq!(DmaShape::of(&code(&[("str", "x19, [sp, #0x78]")])), None);
     }
 
     #[test]
@@ -1625,7 +1680,12 @@ mod tests {
         assert!(!nor_geometry_matches(&record, 0x20000, 0x1000, 0x100));
         assert!(!nor_geometry_matches(&record, 0x10000, 0x2000, 0x100));
         assert!(!nor_geometry_matches(&record, 0x10000, 0x1000, 0x200));
-        assert!(!nor_geometry_matches(&record[..0x28], 0x10000, 0x1000, 0x100));
+        assert!(!nor_geometry_matches(
+            &record[..0x28],
+            0x10000,
+            0x1000,
+            0x100
+        ));
     }
 
     #[test]

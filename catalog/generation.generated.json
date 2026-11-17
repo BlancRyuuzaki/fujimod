@@ -4181,13 +4181,8 @@
       "internal_version": "3.51",
       "tables": {
         "bulk": {
-          "status": "unavailable",
-          "errors": [
-            {
-              "locator": "bulk",
-              "reason": "firmware image not available"
-            }
-          ]
+          "status": "available",
+          "errors": []
         },
         "card-files": {
           "status": "unavailable",
