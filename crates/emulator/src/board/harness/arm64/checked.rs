@@ -868,7 +868,7 @@ impl Guard {
         let scalar_fsqrt = word & 0xffbf_fc00 == 0x1e21_c000; // FSQRT S/D; only bit 22 varies by width.
         let scalar_fcmpe_zero = word & 0xffbf_fc1f == 0x1e20_2018; // FCMPE S/D,#0.0; width and Rn vary.
         let scalar_fcvtzs_x_from_s = word & 0xffff_fc00 == 0x9e38_0000; // FCVTZS X,S.
-        let scalar_ucvtf = matches!(word & 0xffff_fc00, 0x1e23_0000 | 0x7e21_d800); // UCVTF S,W and S,S; other conversion widths refuse.
+        let scalar_ucvtf = matches!(word & 0xffff_fc00, 0x1e23_0000 | 0x9e23_0000 | 0x7e21_d800); // UCVTF S,W; S,X; S,S; other conversion widths refuse.
         let scalar_scvtf = matches!(word & 0xffff_fc00, 0x1e22_0000 | 0x9e22_0000 | 0x5e21_d800); // SCVTF S,W, S,X and S,S; other conversion widths refuse.
         let scalar_ucvtf_d_from_w = word & 0xffff_fc00 == 0x1e63_0000; // UCVTF D,W.
         let scalar_scvtf_d_from_w = word & 0xffff_fc00 == 0x1e62_0000; // SCVTF D,W.
@@ -1816,6 +1816,19 @@ mod tests {
             assert_eq!(r.instructions, expected_instructions);
             assert_eq!(r.registers["x1"], 640.0f32.to_bits() as u64);
         }
+    }
+    #[test]
+    fn scalar_ucvtf_s_from_x_uses_full_unsigned_register() {
+        let mut b = board(&[
+            0x9e23_0000, // UCVTF S0,X0.
+            0x1e26_0001, // FMOV W1,S0.
+            0xd65f_03c0,
+        ]);
+        let mut o = options();
+        o.arguments = vec![1u64 << 40];
+        let r = checked_call(&mut b, o).unwrap();
+        assert!(r.returned, "{:?}", r.failure);
+        assert_eq!(r.registers["x1"], ((1u64 << 40) as f32).to_bits() as u64);
     }
     #[test]
     fn scalar_scvtf_signed_x_to_s_is_admitted_without_admitting_d_x() {
