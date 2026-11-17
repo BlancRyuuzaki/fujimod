@@ -447,8 +447,19 @@ fn flash_with_route<L: Lookup>(
     } else {
         let id = jedec_id.ok_or("NOR installed JEDEC identity is not established")?;
         let is_selector = |r: &Routine| r.has("add", "x3, x3, #0x20") && r.has("cmp", "w2, #5");
-        let selector =
-            locator.small_routine(0x60, is_selector, "flash_select_supported_jedec_id")?;
+        let named_selector = index
+            .find(
+                Some("flash_select_supported_jedec_id"),
+                None,
+                Some(firmware),
+                Some("main"),
+            )
+            .map_err(|error| error.to_string())?;
+        let selector = if named_selector.is_empty() {
+            locator.small_routine(0x60, is_selector, "flash_select_supported_jedec_id")?
+        } else {
+            locator.named("flash_select_supported_jedec_id", is_selector)?
+        };
         let hits = index
             .select(
                 Some(firmware),
