@@ -868,6 +868,7 @@ impl Guard {
         let scalar_fsqrt = word & 0xffbf_fc00 == 0x1e21_c000; // FSQRT S/D; only bit 22 varies by width.
         let scalar_fcmpe_zero = word & 0xffbf_fc1f == 0x1e20_2018; // FCMPE S/D,#0.0; width and Rn vary.
         let scalar_fcvtzs_x_from_s = word & 0xffff_fc00 == 0x9e38_0000; // FCVTZS X,S.
+        let scalar_fcvtzs_w_from_s = word & 0xffff_fc00 == 0x1e38_0000; // FCVTZS W,S.
         let scalar_ucvtf = matches!(word & 0xffff_fc00, 0x1e23_0000 | 0x9e23_0000 | 0x7e21_d800); // UCVTF S,W; S,X; S,S; other conversion widths refuse.
         let scalar_scvtf = matches!(word & 0xffff_fc00, 0x1e22_0000 | 0x9e22_0000 | 0x5e21_d800); // SCVTF S,W, S,X and S,S; other conversion widths refuse.
         let scalar_ucvtf_d_from_w = word & 0xffff_fc00 == 0x1e63_0000; // UCVTF D,W.
@@ -882,6 +883,7 @@ impl Guard {
         let scalar_fnmul_d = word & 0xffe0_fc00 == 0x1e60_8800; // FNMUL D,D,D.
         let scalar_fcvtzu_w_from_d = word & 0xffff_fc00 == 0x1e79_0000; // FCVTZU W,D.
         let scalar_movi_d = word & 0xfff8_fc00 == 0x2f00_e400; // MOVI Dd,#imm64; vector forms refuse.
+        let movi_2s_zero = word & 0xffff_ffe0 == 0x0f00_0400; // MOVI Vd.2S,#0; only Rd varies.
         let scalar_fp_math = ((word & 0xff20_fc00 == 0x1e20_0800 // FMUL S/D.
             || word & 0xff20_0c00 == 0x1e20_0c00 // FCSEL S/D.
             || word & 0xff20_fc1f == 0x1e20_2000) // FCMP S/D.
@@ -896,6 +898,7 @@ impl Guard {
             || scalar_fsqrt
             || scalar_fcmpe_zero
             || scalar_fcvtzs_x_from_s
+            || scalar_fcvtzs_w_from_s
             || scalar_ucvtf
             || scalar_scvtf
             || scalar_ucvtf_d_from_w
@@ -910,6 +913,7 @@ impl Guard {
             || scalar_fnmul_d
             || scalar_fcvtzu_w_from_d
             || scalar_movi_d
+            || movi_2s_zero
             || scalar_fp_math
         {
             return Ok(());
@@ -1672,6 +1676,34 @@ mod tests {
         assert_eq!(r.instructions, 0);
         assert!(r.failure.unwrap().contains("Unsupported instruction"));
     }
+
+    #[test]
+    fn checked_movi_2s_zero_is_admitted_without_admitting_other_vector_immediates() {
+        let mut b = board(&[
+            0x1e2e_1008, // FMOV S8,#1.0.
+            0x0f00_0408, // MOVI V8.2S,#0.
+            0x1e26_0100, // FMOV W0,S8.
+            0xd65f_03c0,
+        ]);
+        let r = checked_call(&mut b, options()).unwrap();
+        assert!(r.returned, "{:?}", r.failure);
+        assert_eq!(r.instructions, 4);
+        assert_eq!(r.registers["x0"], 0);
+        let mut vector = [0xff; 16];
+        b.cpu(0)
+            .unwrap()
+            .read_register(Register::V(8), &mut vector)
+            .unwrap();
+        assert_eq!(&vector[..8], &[0; 8]);
+
+        let mut b = board(&[0x0f00_0428, 0xd65f_03c0]);
+        let r = checked_call(&mut b, options()).unwrap();
+        assert_eq!(r.instructions, 0);
+        assert!(r
+            .failure
+            .unwrap()
+            .contains("Unsupported instruction 0x0f000428"));
+    }
     #[test]
     fn scalar_fmov_register_transfer_round_trips_integer_bits() {
         for (to_fp, from_fp, input, expected) in [
@@ -1879,6 +1911,30 @@ mod tests {
         assert!(r.returned, "{:?}", r.failure);
         assert_eq!(r.instructions, 3);
         assert_eq!(r.registers["x1"], 5);
+    }
+    #[test]
+    fn scalar_fcvtzs_w_from_s_truncates_both_signs_and_rejects_half_source() {
+        for (input, expected) in [(5.75f32, 5u64), (-5.75f32, (-5i32) as u32 as u64)] {
+            let mut b = board(&[
+                0x1e27_0000, // FMOV S0,W0.
+                0x1e38_0001, // FCVTZS W1,S0.
+                0xd65f_03c0,
+            ]);
+            let mut o = options();
+            o.arguments = vec![input.to_bits() as u64];
+            let r = checked_call(&mut b, o).unwrap();
+            assert!(r.returned, "{:?}", r.failure);
+            assert_eq!(r.instructions, 3);
+            assert_eq!(r.registers["x1"], expected);
+        }
+
+        let mut b = board(&[0x1ef8_0001, 0xd65f_03c0]); // FCVTZS W1,H0.
+        let r = checked_call(&mut b, options()).unwrap();
+        assert_eq!(r.instructions, 0);
+        assert!(r
+            .failure
+            .unwrap()
+            .contains("Unsupported instruction 0x1ef80001"));
     }
     #[test]
     fn checked_scalar_double_polynomial_forms_are_narrowly_admitted() {
