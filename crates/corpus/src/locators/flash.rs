@@ -447,11 +447,8 @@ fn flash_with_route<L: Lookup>(
     } else {
         let id = jedec_id.ok_or("NOR installed JEDEC identity is not established")?;
         let is_selector = |r: &Routine| r.has("add", "x3, x3, #0x20") && r.has("cmp", "w2, #5");
-        let selector = if firmware_names_flash_read(index, firmware)? {
-            locator.named("flash_select_supported_jedec_id", is_selector)?
-        } else {
-            locator.small_routine(0x60, is_selector, "flash_select_supported_jedec_id")?
-        };
+        let selector =
+            locator.small_routine(0x60, is_selector, "flash_select_supported_jedec_id")?;
         let hits = index
             .select(
                 Some(firmware),
