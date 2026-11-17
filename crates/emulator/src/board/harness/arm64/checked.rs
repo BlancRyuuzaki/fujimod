@@ -876,6 +876,7 @@ impl Guard {
         let scalar_fcvtzs_w_from_d = word & 0xffff_fc00 == 0x1e78_0000; // FCVTZS W,D.
         let scalar_fcvtzu_w_from_s = word & 0xffff_fc00 == 0x1e39_0000; // FCVTZU W,S.
         let scalar_fcmpe_register = word & 0xffa0_fc1f == 0x1e20_2010; // FCMPE S,S and D,D; only bit 22 varies by width.
+        let scalar_fcmp_zero = word & 0xffbf_fc1f == 0x1e20_2008; // FCMP S/D,#0.0; width and Rn vary.
         let scalar_fadd = word & 0xffa0_fc00 == 0x1e20_2800; // FADD S/D; only bit 22 varies by width.
         let scalar_fdiv = word & 0xffa0_fc00 == 0x1e20_1800; // FDIV S/D; only bit 22 varies by width.
         let scalar_fsub = word & 0xffa0_fc00 == 0x1e20_3800; // FSUB S/D; only bit 22 varies by width.
@@ -906,6 +907,7 @@ impl Guard {
             || scalar_fcvtzs_w_from_d
             || scalar_fcvtzu_w_from_s
             || scalar_fcmpe_register
+            || scalar_fcmp_zero
             || scalar_fadd
             || scalar_fdiv
             || scalar_fsub
@@ -1802,6 +1804,39 @@ mod tests {
             .failure
             .unwrap()
             .contains("Unsupported instruction 0x1ee02800"));
+    }
+    #[test]
+    fn scalar_fcmp_zero_drives_ordered_conditions_and_rejects_half_precision() {
+        for (input, branch) in [
+            (4.0f32, 0x5400_004c), // B.GT.
+            (0.0f32, 0x5400_0040), // B.EQ.
+            (-1.0f32, 0x5400_0044), // B.MI.
+        ] {
+            let mut b = board(&[
+                0x1e27_0000, // FMOV S0,W0.
+                0x1e20_2008, // FCMP S0,#0.0.
+                branch, // Branch on the expected condition.
+                0x5280_0000, // MOV W0,#0.
+                0x5280_0020, // MOV W0,#1.
+                0xd65f_03c0,
+            ]);
+            let mut o = options();
+            o.executable = vec![(0x1000, 0x1018)];
+            o.readable[0] = (0x1000, 0x1018);
+            o.arguments = vec![input.to_bits() as u64];
+            let r = checked_call(&mut b, o).unwrap();
+            assert!(r.returned, "{:?}", r.failure);
+            assert_eq!(r.instructions, 5);
+            assert_eq!(r.registers["x0"], 1);
+        }
+
+        let mut b = board(&[0x1ee0_2008, 0xd65f_03c0]); // FCMP H0,#0.0.
+        let r = checked_call(&mut b, options()).unwrap();
+        assert_eq!(r.instructions, 0);
+        assert!(r
+            .failure
+            .unwrap()
+            .contains("Unsupported instruction 0x1ee02008"));
     }
     #[test]
     fn scalar_fcvtzs_x_from_s_is_admitted_without_admitting_d_to_x() {
