@@ -488,3 +488,23 @@ fn an_identity_without_catalog_firmware_is_its_own_connect_error() {
     ));
     assert_ne!(EXIT_UNSUPPORTED_FIRMWARE, 1);
 }
+
+#[test]
+fn missing_mount_map_is_unsupported_before_opening_usb() {
+    let limits = DebugMemoryLimits {
+        read: std::num::NonZeroU32::new(256).unwrap(),
+        write: std::num::NonZeroU32::new(1).unwrap(),
+    };
+    let result = UsbDevice::connect("xh2-530".into(), None, limits, None);
+    match result {
+        Err(error) => {
+            assert_eq!(error.exit_status(), EXIT_UNSUPPORTED_FIRMWARE);
+            assert_eq!(error.to_string(), "No readable memory map for xh2-530");
+        }
+        Ok(_) => panic!("Firmware without a state map must not start a USB worker"),
+    }
+    assert_eq!(
+        ConnectError::from("USB transaction failed").exit_status(),
+        1
+    );
+}

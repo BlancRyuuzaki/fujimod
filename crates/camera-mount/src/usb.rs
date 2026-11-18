@@ -97,7 +97,8 @@ async fn target(device_id: Option<String>) -> std::result::Result<Target, String
     })
 }
 /// `fujimod-mount` exits with this status when the camera's identity has no
-/// catalog firmware. Retrying cannot succeed until the catalog changes.
+/// catalog firmware or the selected firmware lacks a required mount capability.
+/// Retrying cannot succeed until the catalog changes.
 pub const EXIT_UNSUPPORTED_FIRMWARE: i32 = 3;
 
 /// Why [`UsbDevice::connect`] failed.
@@ -108,7 +109,21 @@ pub enum ConnectError {
         product: String,
         internal_version: String,
     },
+    MissingMemoryMap {
+        firmware: String,
+    },
     Failed(String),
+}
+impl ConnectError {
+    /// Missing support must not be treated as a recoverable camera failure.
+    pub fn exit_status(&self) -> i32 {
+        match self {
+            Self::UnsupportedFirmware { .. } | Self::MissingMemoryMap { .. } => {
+                EXIT_UNSUPPORTED_FIRMWARE
+            }
+            Self::Failed(_) => 1,
+        }
+    }
 }
 impl std::fmt::Display for ConnectError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -117,6 +132,9 @@ impl std::fmt::Display for ConnectError {
                 product,
                 internal_version,
             } => write!(f, "No catalog firmware for {product} {internal_version}"),
+            Self::MissingMemoryMap { firmware } => {
+                write!(f, "No readable memory map for {firmware}")
+            }
             Self::Failed(message) => f.write_str(message),
         }
     }
@@ -535,7 +553,9 @@ impl UsbDevice {
         let has_card = capability.is_some();
         let regions: Vec<Region> = selected
             .state
-            .ok_or("Selected firmware has no readable memory map")?
+            .ok_or_else(|| ConnectError::MissingMemoryMap {
+                firmware: firmware.clone(),
+            })?
             .regions
             .into_iter()
             .map(|r| Region {

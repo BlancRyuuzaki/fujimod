@@ -64,18 +64,14 @@ fn options(args: impl Iterator<Item = String>) -> std::result::Result<Options, S
 #[cfg(target_os = "macos")]
 #[tokio::main]
 async fn main() {
-    use fujimod_camera_mount::usb::{ConnectError, EXIT_UNSUPPORTED_FIRMWARE};
+    use fujimod_camera_mount::usb::ConnectError;
     if let Err(error) = run().await {
         eprintln!("fujimod-mount: {error}");
-        let unsupported = matches!(
-            error.downcast_ref::<ConnectError>(),
-            Some(ConnectError::UnsupportedFirmware { .. })
+        std::process::exit(
+            error
+                .downcast_ref::<ConnectError>()
+                .map_or(1, ConnectError::exit_status),
         );
-        std::process::exit(if unsupported {
-            EXIT_UNSUPPORTED_FIRMWARE
-        } else {
-            1
-        });
     }
 }
 
