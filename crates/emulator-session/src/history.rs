@@ -5,7 +5,7 @@ use fujimod_emulator_cpu::ExecutionPolicy;
 use fujimod_emulator_devices::parts::touch_input::ContactInput;
 use fujimod_emulator_devices::capability::StatisticsCadence;
 use fujimod_emulator_exr2_resources::SensorFrame;
-use std::{collections::VecDeque, sync::Arc};
+use std::{collections::VecDeque, rc::Rc};
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Boundary {
@@ -53,6 +53,10 @@ pub enum Input {
     Rotate {
         node: String,
         cycles: i32,
+    },
+    RotateEdges {
+        node: String,
+        edges: i32,
     },
     Touch {
         node: String,
@@ -130,6 +134,7 @@ impl Input {
             | Self::Frames { node, .. }
             | Self::Wake { node }
             | Self::Rotate { node, .. }
+            | Self::RotateEdges { node, .. }
             | Self::CardContacts { node, .. } => node.capacity(),
             Self::Adc { node, samples } => node.capacity() + samples.capacity() * size_of::<u16>(),
             Self::Touch { node, script } => {
@@ -186,6 +191,7 @@ impl Input {
             } => session.gpio(node, *port, *pin, *high),
             Self::Adc { node, samples } => session.set_adc_samples(node, samples),
             Self::Rotate { node, cycles } => session.rotate(node, *cycles),
+            Self::RotateEdges { node, edges } => session.rotate_edges(node, *edges),
             Self::Touch { node, script } => session.touch(node, script),
             Self::Logic { wire, high } => session.logic_input(wire, *high),
             Self::Wake { node } => session.board.inputs_changed(session.node(node)?),
@@ -260,7 +266,7 @@ impl Entry {
 const AUTOMATIC_INPUT_INTERVAL: usize = 16;
 
 struct Mark {
-    saved: Arc<Snapshot>,
+    saved: Rc<Snapshot>,
     cursor: usize,
 }
 pub struct History {
@@ -345,7 +351,7 @@ impl History {
     /// Capture before an external transaction, not from a host read or getter.
     pub fn mark(&mut self, session: &Session) -> Result<(), String> {
         let previous = self.marks.back().map(|m| m.saved.as_ref());
-        let saved = Arc::new(session.checkpoint(previous)?);
+        let saved = Rc::new(session.checkpoint(previous)?);
         self.marks.push_back(Mark {
             saved,
             cursor: self.log.len(),

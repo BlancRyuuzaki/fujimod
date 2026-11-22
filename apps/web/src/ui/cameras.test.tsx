@@ -1,45 +1,96 @@
 import { render } from '@solidjs/web';
 import { flush } from 'solid-js';
 import { afterEach, expect, test } from 'vite-plus/test';
-import {
-  byModel,
-  phases,
-  started,
-  withOverrides,
-  type FirmwareProgress,
-  type TrackId,
-} from './camera-progress';
+import { byModel, phases, started, type FirmwareProgress, type TrackId } from './camera-progress';
 import { CameraTable, type Owner } from './cameras';
 let dispose: (() => void) | undefined;
 afterEach(() => {
   dispose?.();
   document.body.replaceChildren();
 });
-/** A small bring-up graph in the generated documents' shape. */
-const TRACKS: [TrackId, string, [string, string][]][] = [
-  ['static', 'Static analysis', [
-    ['research', 'Update file registered'],
-    ['analysis', 'Facts located'],
-  ]],
-  ['emulator', 'Emulator', [
-    ['rec', 'Boots'],
-    ['menu', 'Menus respond'],
-    ['stock', 'Stock features'],
-    ['emulator-updater', 'Updater'],
-  ]],
-  ['camera', 'Camera', [
-    ['camera-identity', 'Identified'],
-    ['camera-snapshot', 'State dumped'],
-    ['camera-menu', 'Menus driven'],
-    ['camera-restart', 'Restarts itself'],
-  ]],
-  ['fujimod', 'FujiMod', [
-    ['mod-target', 'Mod target'],
-    ['mod-build', 'Built'],
-    ['walkthroughs', 'Walkthroughs'],
-  ]],
-  ['sd', 'SD card and install', [['sd-boot', 'Boots from the card']]],
+/** A small graph-resolved step list in the generated documents' shape. */
+const TRACKS: {
+  id: TrackId;
+  phase: 'research' | 'emulator' | 'camera' | 'mods' | 'sd-card';
+  title: string;
+  steps: [string, string, string][];
+}[] = [
+  {
+    id: 'static',
+    phase: 'research',
+    title: 'Static analysis',
+    steps: [
+      ['research', 'Update file registered', 'research'],
+      ['analysis', 'Facts located', 'analysis'],
+      ['boot-rom', 'Boot ROM', 'research'],
+    ],
+  },
+  {
+    id: 'emulator',
+    phase: 'emulator',
+    title: 'Emulator',
+    steps: [
+      ['rec', 'Boot', 'rec'],
+      ['menu', 'Menus', 'menu'],
+      ['stock/film-simulations', 'Film simulations', 'stock'],
+      ['stock/ibis', 'IBIS', 'stock'],
+      ['stock/sd', 'SD', 'stock'],
+      [
+        'firmware-update-stock-installs-in-emulator',
+        'Updater',
+        'firmware-update-stock-installs-in-emulator',
+      ],
+    ],
+  },
+  {
+    id: 'camera',
+    phase: 'camera',
+    title: 'Camera',
+    steps: [
+      ['camera-identity', 'Identified', 'camera-identity'],
+      ['camera-snapshot', 'State dumped', 'camera-snapshot'],
+      ['camera-menu', 'Menus driven', 'camera-menu'],
+      ['camera-restart', 'Restarts itself', 'camera-restart'],
+    ],
+  },
+  {
+    id: 'fujimod',
+    phase: 'mods',
+    title: 'FujiMod',
+    steps: [
+      ['mod-target', 'Mod target', 'mod-target'],
+      ['mod-build', 'Built', 'mod-build'],
+    ],
+  },
+  {
+    id: 'sd',
+    phase: 'sd-card',
+    title: 'SD card and install',
+    steps: [
+      [
+        'boot-rom-loads-sd-card-on-camera',
+        'Boot ROM loads an SD card',
+        'boot-rom-loads-sd-card-on-camera',
+      ],
+      [
+        'sd-boot-v1-fujimod-boots-on-camera',
+        'FujiMod boots from an SD card',
+        'sd-boot-v1-fujimod-boots-on-camera',
+      ],
+    ],
+  },
 ];
+function step(id: string, label: string, stage: string, result: 'pass' | 'fail' | 'not-run') {
+  return {
+    id,
+    label,
+    stage,
+    result,
+    passed: result === 'pass' ? 1 : 0,
+    total: 1,
+    milestone: true,
+  };
+}
 function progress(
   model: string,
   passed: string[],
@@ -52,14 +103,21 @@ function progress(
     version,
     facts: null,
     boot_rom: null,
-    tracks: TRACKS.map(([id, title, stages]) => ({
-      id,
-      title,
-      stages: stages.map(([stage, label]) => ({
-        id: stage,
-        title: label,
-        result: passed.includes(stage) ? 'pass' : 'not-run',
-      })),
+    tracks: TRACKS.map((track) => ({
+      id: track.id,
+      title: track.title,
+      phase: track.phase,
+      stages: [],
+      steps: [
+        ...track.steps.map(([id, label, stage]) =>
+          step(id, label, stage, passed.includes(id) ? 'pass' : 'not-run'),
+        ),
+        ...(track.id === 'fujimod'
+          ? Object.entries(mods).map(([mod, result]) =>
+              step('walkthroughs/' + mod, mod, 'walkthroughs', result),
+            )
+          : []),
+      ],
     })),
     stock: {},
     mods,
@@ -67,7 +125,12 @@ function progress(
 }
 function result(document: FirmwareProgress, id: string, value: 'stale' | 'fail') {
   for (const entry of document.tracks)
-    for (const stage of entry.stages) if (stage.id === id) stage.result = value;
+    for (const step of entry.steps)
+      if (step.id === id) {
+        step.result = value;
+        step.passed = 0;
+        step.total = 1;
+      }
 }
 function table(
   columns: Parameters<typeof CameraTable>[0]['columns'],
@@ -84,80 +147,83 @@ function table(
   return host;
 }
 
-test('each phase fills by its steps and names its value', () => {
-  const document = progress(
-    'X-E2S',
-    ['research', 'rec', 'camera-identity', 'mod-target', 'mod-build'],
-    {
-      a: 'pass',
-      b: 'fail',
-      c: 'fail',
-      d: 'fail',
-    },
-  );
-  document.facts = { located: 1, total: 2 };
-  document.boot_rom = 'X70';
-  const list = phases(document);
-  expect(list.map((phase) => [phase.id, phase.fraction, phase.value])).toEqual([
-    ['research', (1 + 0.5 + 1) / 3, '2 of 3'],
-    ['emulator', 1 / 3, '1 of 3'],
-    ['camera', 1 / 4, '1 of 4'],
-    ['mods', 1 / 4, '1 of 4'],
-    ['sd-card', 0, 'Not yet'],
+test('each graph track reserves space for all of its tagged milestones', () => {
+  const document = progress('X-E2S', [
+    'research',
+    'rec',
+    'camera-identity',
+    'mod-target',
+    'mod-build',
   ]);
-  expect(list[0]?.steps.map((step) => [step.label, step.fraction, step.detail])).toEqual([
-    ['Update file registered', 1, undefined],
-    ['Facts located', 1 / 2, '1 of 2 facts'],
-    ['Boot ROM', 1, 'X70 dump'],
-  ]);
-});
-
-test('the emulator draws one cell per feature the body has, partial ones by their share', () => {
-  const document = progress('X-T4', ['rec']);
-  document.stock = {
-    'film-simulations': { result: 'partial', passed: 9, total: 11 },
-    ibis: { result: 'pass' },
-    sd: { result: 'stale' },
-  };
-  const emulator = phases(document)[1]!;
-  expect(emulator.cells).toBe(true);
-  expect(emulator.steps.map((step) => [step.label, step.fraction, step.detail])).toEqual([
-    ['Boot', 1, undefined],
-    ['Menus', 0, undefined],
-    ['Film simulations', 9 / 11, '9 of 11'],
-    ['IBIS', 1, undefined],
-    ['SD', 0, undefined],
-    ['Updater', 0, undefined],
-  ]);
-  const host = table([[{ name: 'X-Processor 4', years: '', models: ['X-T4'] }]], [document]);
-  const cells = [...host.querySelectorAll<HTMLElement>('.phase:nth-child(2) .cell')];
-  expect(cells.map((cell) => cell.style.getPropertyValue('--p'))).toEqual([
-    '100%',
-    '0%',
-    `${(9 / 11) * 100}%`,
-    '100%',
-    '0%',
-    '0%',
-  ]);
-  expect(host.querySelector('.phase:nth-child(2) li.partial .step-detail')?.textContent).toBe(
-    '9 of 11',
-  );
-  expect(host.querySelector('.progress-heading')?.textContent).toBe('X-T41.00');
-});
-
-test('stale and failing stages do not count', () => {
-  const document = progress('X-T10', ['rec']);
+  const analysis = document.tracks[0]!.steps.find((step) => step.id === 'analysis')!;
+  const boot = document.tracks[0]!.steps.find((step) => step.id === 'boot-rom')!;
+  Object.assign(analysis, { result: 'partial', passed: 99, total: 100, detail: '99 of 100 facts' });
+  Object.assign(boot, { result: 'pass', milestone: false });
   result(document, 'menu', 'stale');
-  result(document, 'research', 'fail');
-  const [research, emulator] = phases(document);
-  expect([research?.fraction, emulator?.fraction]).toEqual([0, 1 / 3]);
+  result(document, 'sd-boot-v1-fujimod-boots-on-camera', 'fail');
+  const groups = phases(document);
+  expect(groups.map((group) => [group.id, group.passed, group.steps.length])).toEqual([
+    ['research', 1, 2],
+    ['emulator', 1, 6],
+    ['camera', 1, 4],
+    ['mods', 2, 2],
+    ['sd-card', 0, 2],
+  ]);
+  const host = table([[{ name: 'EXR Processor II', years: '', models: ['X-E2S'] }]], [document]);
+  const bar = host.querySelector('[role="progressbar"]');
+  expect(bar?.getAttribute('aria-valuenow')).toBe('5');
+  expect(bar?.getAttribute('aria-valuemax')).toBe('16');
+  const segments = [...host.querySelectorAll<HTMLElement>('.track-group')];
+  expect(segments.map((segment) => segment.style.getPropertyValue('--outcomes'))).toEqual([
+    '2',
+    '6',
+    '4',
+    '2',
+    '2',
+  ]);
+  expect(
+    segments.map((segment) => Number.parseFloat(segment.style.getPropertyValue('--p'))),
+  ).toEqual([50, (1 / 6) * 100, 25, 100, 0]);
+});
+
+test('stale outcomes display their last passing credit without a freshness label', () => {
+  const document = progress('X70', ['rec']);
+  const [first, second] = document.tracks[0]!.steps;
+  Object.assign(first!, { result: 'stale', passed: 1, total: 1 });
+  Object.assign(second!, { result: 'stale', passed: 0, total: 1 });
+  const host = table([[{ name: 'EXR Processor II', years: '', models: ['X70'] }]], [document]);
+  expect(host.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow')).toBe('2');
+  const rows = [...host.querySelectorAll('.tip-group li')].slice(0, 2);
+  expect(rows.map((row) => row.classList.contains('todo'))).toEqual([false, true]);
+  expect(host.querySelector('.tip')?.textContent).not.toContain('Stale');
+});
+
+test('a released badge leaves the engineering count as recorded', () => {
+  const camera = progress('X70', ['rec']);
+  const host = document.createElement('div');
+  document.body.append(host);
+  dispose = render(
+    () => (
+      <CameraTable
+        columns={[[{ name: 'EXR Processor II', years: '', models: ['X70'] }]]}
+        progress={byModel([camera])}
+        owners={[]}
+        released={new Set([camera.firmware_id])}
+      />
+    ),
+    host,
+  );
+  flush();
+  expect(host.querySelector('.progress-heading')?.textContent).toContain('Released');
+  expect(host.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow')).toBe('1');
 });
 
 test('a model is started once any stage, stock feature or mod passes', () => {
   const partial = progress('X30', []);
-  partial.stock = { lens: { result: 'partial', passed: 1, total: 2 } };
+  const film = partial.tracks[1]!.steps.find((step) => step.id === 'stock/film-simulations')!;
+  Object.assign(film, { result: 'partial', passed: 1, total: 2, detail: '1 of 2' });
   expect(started(partial)).toBe(true);
-  partial.stock = { lens: { result: 'fail' } };
+  Object.assign(film, { result: 'fail', passed: 0, total: 1, detail: undefined });
   expect(started(partial)).toBe(false);
   expect(started(progress('X30', []))).toBe(false);
   expect(started(progress('X30', [], { a: 'fail' }))).toBe(false);
@@ -193,7 +259,7 @@ test('started models draw a bar; the others are listed as not started', () => {
     'X70',
   ]);
   expect(host.querySelector('.rest')?.textContent).toBe('Not startedX30 · X20');
-  expect(host.querySelectorAll('.progress-row .phase')).toHaveLength(5);
+  expect(host.querySelectorAll('.progress-row .progress-bar')).toHaveLength(1);
 });
 
 test('one tip is open at a time, whether tapped, hovered or focused', () => {
@@ -202,9 +268,9 @@ test('one tip is open at a time, whether tapped, hovered or focused', () => {
     [progress('X70', ['research']), progress('X30', ['research'])],
   );
   const [a, b] = [...host.querySelectorAll<HTMLElement>('.bar')].map((bar) =>
-    bar.querySelector<HTMLElement>('.phase:nth-child(2)')!,
+    bar.querySelector<HTMLElement>('.progress-bar')!,
   );
-  const open = () => [...host.querySelectorAll('.phase.open')];
+  const open = () => [...host.querySelectorAll('.progress-bar.open')];
   const tap = (element: Element) => {
     element.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerType: 'touch' }));
     element.dispatchEvent(new MouseEvent('click', { bubbles: true }));
@@ -252,10 +318,9 @@ test('the camera popover asks an owner for help until every camera step passes',
     ],
   );
   const help = [...host.querySelectorAll('.bar')].map(
-    (bar) => bar.querySelector('.phase:nth-child(3) .help')?.textContent,
+    (bar) => bar.querySelector('.help')?.textContent,
   );
   expect(help).toEqual(['Have an X-E2? Help test it', 'Help test on your X-E2S', undefined]);
-  expect(host.querySelector('.phase:nth-child(3) .tip-value')?.textContent).toBe('Needs an owner');
 });
 
 test('a started model missing from the generation list appears under Other cameras', () => {
@@ -298,8 +363,7 @@ test('bodies a contributor owns are outlined and the camera popover names the ow
   ]);
   expect(host.querySelector('.rest')?.textContent).toBe('Not startedX100V · X20');
   expect(host.querySelector('.legend .owned')?.textContent).toBe('Owned by a contributor');
-  const [owned, unowned] = [...host.querySelectorAll('.bar .phase:nth-child(3)')];
-  expect(owned?.querySelector('.tip-value')?.textContent).toBe('Not yet');
+  const [owned, unowned] = [...host.querySelectorAll('.bar .progress-bar')];
   expect(
     [...(owned?.querySelectorAll('.owners a') ?? [])].map((link) => [
       link.textContent,
@@ -310,21 +374,5 @@ test('bodies a contributor owns are outlined and the camera popover names the ow
     ['@two', 'https://github.com/two'],
   ]);
   expect(owned?.querySelector('.help')?.textContent).toBe('Have an X70? Help test it');
-  expect(unowned?.querySelector('.tip-value')?.textContent).toBe('Needs an owner');
   expect(unowned?.querySelector('.owners')).toBeNull();
-});
-
-test('a complete override publishes every phase and step as done', () => {
-  const [document] = withOverrides(
-    [progress('X70', ['research'], { a: 'pass', b: 'fail' })],
-    [{ firmware_id: 'x70-100', complete: true }],
-  );
-  const list = phases(document!);
-  expect(list.every((phase) => phase.fraction === 1)).toBe(true);
-  expect(list.every((phase) => phase.steps.every((step) => step.fraction === 1))).toBe(true);
-  expect(list.map((phase) => phase.value)).toEqual(['Done', 'Done', 'Done', '2 of 2', 'Done']);
-  expect(started(document!)).toBe(true);
-  expect(() => withOverrides([], [{ firmware_id: 'x70-100', complete: true }])).toThrow(
-    'unknown firmware',
-  );
 });

@@ -1,6 +1,11 @@
 # Contributions
 
-The browser explicitly uploads contributions to `https://share.fujimod.com`.
+The browser explicitly uploads contributions to its configured sharing origin:
+`https://share.fujimod.com` in production, or the development preview's own
+origin, which proxies the local Worker. The `shareUrl` in a receipt uses
+`SHARING_ORIGIN` from the Worker configuration, and is site-relative when that
+setting is empty.
+
 No GitHub request is made. The existing private `ISSUE_REPORTS` R2 bucket holds
 individual gzip files and contribution metadata. Writes use the shared bucket
 helpers to index each completed object in `REPORTS_INDEX` (D1) as a
@@ -65,7 +70,7 @@ between multipart creation and saving its ID can leave an orphan upload.
 
 ## Local checks
 
-`npm --prefix apps/usb-sharing test` bundles and runs the real Worker with local
+`pnpm --filter fujimod-usb-sharing test` bundles and runs the real Worker with local
 Miniflare Durable Objects and R2, without cloud credentials. Run
-`npm --prefix apps/usb-sharing run check` for Worker/test type checks and a
+`pnpm --filter fujimod-usb-sharing run check` for Worker/test type checks and a
 Wrangler deployment dry run. Browser protocol tests live beside `contribute.ts`.

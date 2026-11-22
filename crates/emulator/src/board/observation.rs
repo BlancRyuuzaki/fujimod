@@ -1,26 +1,48 @@
 //! Explicit, bounded CPU/bus observation. No device consumes these records.
 pub mod calls;
+pub mod ranges;
 use super::{Board, State, factory::MemoryMap, scalar};
 use fujimod_emulator_cpu::{Access, Cpu, Hook, HookId, HookRange, Model, Register, arm};
 use serde_json::{Value, json};
 use std::{
     cell::{Cell, RefCell},
+    collections::BTreeMap,
     ffi::c_void,
     rc::{Rc, Weak},
 };
 type Span = (u64, u64);
+pub const MAX_INSTRUCTION_POINTS: usize = 16_384;
 #[derive(Default)]
 pub struct Records {
     ranges: Vec<Span>,
     limit: usize,
-    rows: Vec<Value>,
+    // Each record is kept as its serialized JSON object: a bound of millions of
+    // records stays near 300 bytes each instead of a multi-kilobyte `Value` map.
+    rows: Vec<Box<str>>,
     violation: Option<String>,
+    // CPU accesses whose program counter lies in one of these spans are not
+    // recorded (a caller that discards its own code's accesses anyway).
+    excluded_pcs: Vec<Span>,
 }
 impl Records {
+    /// Stop recording CPU accesses made by instructions inside `spans`.
+    pub fn exclude_pcs(&mut self, spans: Vec<Span>) -> Result<(), String> {
+        if spans.iter().any(|&(lo, hi)| lo >= hi) {
+            return Err("Memory watch PC exclusion needs non-empty spans".into());
+        }
+        self.excluded_pcs = union(spans);
+        Ok(())
+    }
+    fn pc_excluded(&self, pc: u64) -> bool {
+        let index = self.excluded_pcs.partition_point(|&(_, hi)| hi <= pc);
+        self.excluded_pcs
+            .get(index)
+            .is_some_and(|&(lo, _)| lo <= pc)
+    }
     fn overlaps(&self, address: u64, bytes: u64) -> bool {
-        self.ranges
-            .iter()
-            .any(|&(lo, hi)| address < hi && lo < address.saturating_add(bytes))
+        let end = address.saturating_add(bytes);
+        let index = self.ranges.partition_point(|&(_, hi)| hi <= address);
+        self.ranges.get(index).is_some_and(|&(lo, _)| lo < end)
     }
     fn push(&mut self, row: Value) {
         if self.violation.is_some() {
@@ -32,25 +54,54 @@ impl Records {
                 self.limit
             ));
         } else {
-            self.rows.push(row);
+            self.rows.push(row.to_string().into_boxed_str());
         }
     }
     pub(super) fn transfer(&mut self, source: &str, physical: u64, address: u64, bytes: usize) {
         if self.overlaps(physical, bytes as u64) {
             self.push(
                 json!({"source":source,"physical":physical,"address":address,
-                "size":bytes,"core":null,"pc":null,"instructions":null,"tick":null}),
+                "size":bytes,"core":null,"pc":null,"sp":null,"instructions":null,"tick":null}),
             );
         }
     }
     pub fn state(&self) -> Value {
-        json!({"enabled":true,"ranges":self.ranges,"records":self.rows,"violation":self.violation})
+        serde_json::from_str(&self.state_json(None)).expect("memory watch state is valid JSON")
+    }
+    /// Serialize the state without building `Value`s for the records.
+    /// `violation` is reported when the watch itself recorded none.
+    pub fn state_json(&self, violation: Option<&str>) -> String {
+        let violation = self.violation.as_deref().or(violation);
+        let size = self.rows.iter().map(|row| row.len() + 1).sum::<usize>();
+        let mut out = String::with_capacity(size + 256);
+        out.push_str(r#"{"enabled":true,"ranges":"#);
+        out.push_str(&json!(self.ranges).to_string());
+        out.push_str(r#","records":["#);
+        for (index, row) in self.rows.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push_str(row);
+        }
+        out.push_str(r#"],"violation":"#);
+        out.push_str(&json!(violation).to_string());
+        out.push('}');
+        out
     }
 }
 pub struct MemoryWatch {
     pub records: Rc<RefCell<Records>>,
+    // Native hooks hold raw pointers into each box; boxing keeps them stable as the Vec grows.
+    #[allow(clippy::vec_box)]
     contexts: Vec<Box<MemoryContext>>,
     hooks: Vec<(usize, HookId)>,
+}
+impl MemoryWatch {
+    pub fn is_live(&self) -> bool {
+        self.contexts
+            .iter()
+            .all(|context| context.cpu.upgrade().is_some())
+    }
 }
 struct MemoryContext {
     state: Weak<RefCell<State>>,
@@ -58,6 +109,9 @@ struct MemoryContext {
     records: Rc<RefCell<Records>>,
     maps: Vec<MemoryMap>,
     core: usize,
+    sample_address: Option<u64>,
+    sample_offsets: Vec<u64>,
+    sample_bounds: Option<Span>,
 }
 impl MemoryContext {
     fn record(
@@ -93,6 +147,10 @@ impl MemoryContext {
         };
         let mut records = self.records.borrow_mut();
         if !records.overlaps(physical, size) {
+            return Ok(());
+        }
+        let pc = scalar(&*cpu, Register::Pc)?;
+        if records.pc_excluded(pc) {
             return Ok(());
         }
         // Only an R-profile core can hide physical RAM behind a private TCM
@@ -145,16 +203,58 @@ impl MemoryContext {
             .timeline
             .now()
             .saturating_add(elapsed.min(u64::MAX as u128) as u64);
+        // Optional debugger-supplied per-core RAM sample, taken at the access.
+        // A sample can be unavailable during early boot; observation continues.
+        let mut sample_path = Vec::new();
+        if (source == "cpu-read" || source == "cpu-fetch")
+            && let Some(root) = self.sample_address
+        {
+            let mut sample_address = root;
+            for index in 0..=self.sample_offsets.len() {
+                let mut bytes = [0u8; 4];
+                if cpu.read_memory(sample_address, &mut bytes).is_err() {
+                    break;
+                }
+                let value = if byte_order == "little" {
+                    u32::from_le_bytes(bytes)
+                } else {
+                    u32::from_be_bytes(bytes)
+                };
+                sample_path.push(value);
+                if index == self.sample_offsets.len() {
+                    break;
+                }
+                let Some(next) = u64::from(value).checked_add(self.sample_offsets[index]) else {
+                    break;
+                };
+                let Some((lo, hi)) = self.sample_bounds else {
+                    break;
+                };
+                if next < lo || next.checked_add(4).is_none_or(|end| end > hi) {
+                    break;
+                }
+                sample_address = next;
+            }
+        }
+        let sample = sample_path.first().copied();
         records.push(
-            json!({"source":source,"address":address,"physical":physical,"size":size,
+            json!({"sample":sample,"sample_path":sample_path,"source":source,"address":address,"physical":physical,"size":size,
             "value":value,"before":before,"byte_order":byte_order,
-            "core":self.core,"pc":scalar(&*cpu,Register::Pc)?,
+            "core":self.core,"pc":pc,"sp":stack_pointer(&*cpu)?,
             "instructions":instructions,"tick":tick}),
         );
         Ok(())
     }
     fn fail(&self, error: String) {
         self.records.borrow_mut().violation.get_or_insert(error);
+    }
+}
+/// The executing mode's stack pointer: an A/R-profile core reports its banked
+/// `r13`; other models report the architectural stack pointer.
+fn stack_pointer(cpu: &dyn Cpu) -> Result<u64, String> {
+    match cpu.model() {
+        Model::CortexR5F | Model::CortexA7 => scalar(cpu, Register::Arm32(arm::Register::R(13))),
+        _ => scalar(cpu, Register::Sp),
     }
 }
 unsafe fn access(access: Access, address: u64, size: i32, value: i64, data: *mut c_void) {
@@ -226,6 +326,34 @@ pub(super) fn union(mut ranges: Vec<Span>) -> Vec<Span> {
     }
     out
 }
+
+// Limit backend hook count without widening the ranges recorded by Records.
+// Joining the smallest gaps minimizes callbacks on unwatched addresses.
+fn compact_hooks(ranges: Vec<Span>, maximum: usize) -> Vec<Span> {
+    let ranges = union(ranges);
+    if ranges.len() <= maximum {
+        return ranges;
+    }
+    let mut gaps: Vec<_> = ranges
+        .windows(2)
+        .enumerate()
+        .map(|(index, pair)| (pair[1].0 - pair[0].1, index))
+        .collect();
+    gaps.sort_unstable();
+    let mut join = vec![false; gaps.len()];
+    for &(_, index) in gaps.iter().take(ranges.len() - maximum) {
+        join[index] = true;
+    }
+    let mut result = vec![ranges[0]];
+    for (index, &(lo, hi)) in ranges.iter().enumerate().skip(1) {
+        if join[index - 1] {
+            result.last_mut().unwrap().1 = hi;
+        } else {
+            result.push((lo, hi));
+        }
+    }
+    result
+}
 impl Board {
     pub fn transaction_watch_begin(&self, ranges: Vec<Span>, limit: usize) -> Result<(), String> {
         self.state
@@ -258,7 +386,27 @@ impl Board {
         limit: usize,
         maps: Vec<MemoryMap>,
     ) -> Result<Box<MemoryWatch>, String> {
-        self.memory_watch_begin_with_reads(ranges, limit, maps, true)
+        self.memory_watch_begin_with_samples(ranges, limit, maps, vec![], vec![], None)
+    }
+
+    pub fn memory_watch_begin_with_samples(
+        &self,
+        ranges: Vec<Span>,
+        limit: usize,
+        maps: Vec<MemoryMap>,
+        sample_addresses: Vec<u64>,
+        sample_offsets: Vec<u64>,
+        sample_bounds: Option<Span>,
+    ) -> Result<Box<MemoryWatch>, String> {
+        self.memory_watch_begin_with_reads(
+            ranges,
+            limit,
+            maps,
+            true,
+            sample_addresses,
+            sample_offsets,
+            sample_bounds,
+        )
     }
 
     /// Observe bounded CPU writes to physical memory, without observing reads.
@@ -270,16 +418,28 @@ impl Board {
         limit: usize,
         maps: Vec<MemoryMap>,
     ) -> Result<Box<MemoryWatch>, String> {
-        self.memory_watch_begin_with_reads(ranges, limit, maps, false)
+        self.memory_watch_begin_with_reads(ranges, limit, maps, false, vec![], vec![], None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn memory_watch_begin_with_reads(
         &self,
         ranges: Vec<Span>,
         limit: usize,
         maps: Vec<MemoryMap>,
         observe_reads: bool,
+        sample_addresses: Vec<u64>,
+        sample_offsets: Vec<u64>,
+        sample_bounds: Option<Span>,
     ) -> Result<Box<MemoryWatch>, String> {
+        if (!sample_addresses.is_empty() && sample_addresses.len() != self.cpus.len())
+            || sample_offsets.len() > 4
+            || (!sample_offsets.is_empty()
+                && (sample_addresses.is_empty() || sample_bounds.is_none()))
+            || sample_bounds.is_some_and(|(lo, hi)| lo >= hi || hi > 1 << 32)
+        {
+            return Err("Invalid per-core memory watch sample specification".into());
+        }
         // A memory hook's bounds and the address it reports are physical: the
         // backend checks them after the processor's own MMU/MPU translation
         // (`cputlb.c` dispatches `UC_HOOK_MEM_*` with the translated page), so
@@ -304,7 +464,7 @@ impl Board {
             })
         });
         if ranges.is_empty()
-            || ranges.len() > 256
+            || ranges.len() > 16384
             || limit == 0
             || limit > 1 << 22
             || ranges.iter().any(|&(lo, hi)| lo >= hi || hi > 1 << 32)
@@ -368,11 +528,14 @@ impl Board {
                 records: records.clone(),
                 maps: maps.iter().filter(|m| m.core == core).cloned().collect(),
                 core,
+                sample_address: sample_addresses.get(core).copied(),
+                sample_offsets: sample_offsets.clone(),
+                sample_bounds,
             }));
             let data = (&**watch.contexts.last().unwrap() as *const MemoryContext)
                 .cast_mut()
                 .cast();
-            for (begin, end) in union(spans) {
+            for (begin, end) in compact_hooks(spans, 256) {
                 let mut hooks = vec![Hook::Memory {
                     callback: access,
                     data,
@@ -422,17 +585,122 @@ impl Board {
     }
 }
 
+/// One architectural instruction entry in scheduler order.
+#[derive(serde::Serialize)]
+pub struct PcEntry {
+    pub core: usize,
+    pub pc: u64,
+    pub size: u32,
+}
+
+#[derive(serde::Serialize)]
+pub struct PcEntries {
+    pub entries: Vec<PcEntry>,
+    pub omitted: u64,
+}
+
+/// Bounded storage shared by instruction observers.
+pub struct PcRecorder {
+    limit: usize,
+    records: PcEntries,
+}
+
+impl PcRecorder {
+    pub fn new(limit: usize) -> Result<Self, String> {
+        if limit == 0 || limit > 10_000_000 {
+            return Err("PC trace needs a bound between 1 and 10000000 entries".into());
+        }
+        Ok(Self { limit, records: PcEntries { entries: Vec::new(), omitted: 0 } })
+    }
+
+    pub fn record(&mut self, core: usize, pc: u64, size: u32) {
+        if self.records.entries.len() < self.limit {
+            self.records.entries.push(PcEntry { core, pc, size });
+        } else {
+            self.records.omitted = self.records.omitted.saturating_add(1);
+        }
+    }
+
+    pub fn take(&mut self) -> PcEntries {
+        std::mem::replace(&mut self.records, PcEntries { entries: Vec::new(), omitted: 0 })
+    }
+}
+
+struct TraceHook {
+    cpu: Weak<dyn Cpu>,
+    hook: HookId,
+    context: Box<TraceContext>,
+}
+struct TraceContext {
+    core: usize,
+    records: Rc<RefCell<PcRecorder>>,
+}
+
+/// Collect a bounded prefix of consecutive instruction entries. Hook ownership
+/// is tied to this value. Dropping it releases the instrumentation.
+pub struct PcTrace {
+    records: Rc<RefCell<PcRecorder>>,
+    hooks: Vec<TraceHook>,
+}
+
+unsafe fn trace_pc(pc: u64, size: u32, context: *mut c_void) {
+    let context = unsafe { &*context.cast::<TraceContext>() };
+    context.records.borrow_mut().record(context.core, pc, size);
+}
+
+impl PcTrace {
+    pub fn take(mut self) -> PcEntries {
+        self.detach();
+        self.records.borrow_mut().take()
+    }
+
+    fn detach(&mut self) {
+        for TraceHook { cpu, hook, context } in self.hooks.drain(..) {
+            if cpu.upgrade().is_some_and(|cpu| cpu.remove_hook(hook).is_err()) {
+                // The CPU still owns a callback pointing at this context.
+                Box::leak(context);
+            }
+        }
+    }
+}
+
+impl Drop for PcTrace {
+    fn drop(&mut self) {
+        self.detach();
+    }
+}
+
+impl Board {
+    pub fn trace_pcs(&self, limit: usize) -> Result<PcTrace, String> {
+        if self.execution_policy() != fujimod_emulator_cpu::ExecutionPolicy::Exact {
+            return Err("PC tracing requires exact execution policy".into());
+        }
+        let records = Rc::new(RefCell::new(PcRecorder::new(limit)?));
+        let mut trace = PcTrace { records, hooks: Vec::new() };
+        for (core, cpu) in self.cpus.iter().enumerate() {
+            let mut context = Box::new(TraceContext { core, records: trace.records.clone() });
+            let hook = unsafe { cpu.install_hook(Hook::Instruction {
+                callback: trace_pc,
+                data: (&mut *context as *mut TraceContext).cast(),
+                range: HookRange::All,
+            }) }?;
+            trace.hooks.push(TraceHook { cpu: Rc::downgrade(cpu), hook, context });
+        }
+        Ok(trace)
+    }
+}
+
 /// Repeated entry observations stop before the selected instruction. Resume
 /// executes that instruction once, even when it is itself a loop target.
 pub(super) struct EntryPoints {
-    addresses: Vec<u64>,
+    addresses: RefCell<Vec<u64>>,
     pause: Rc<Cell<bool>>,
     event: RefCell<Option<u64>>,
     skip: Cell<Option<u64>>,
 }
 impl EntryPoints {
     fn hit(&self, pc: u64) -> bool {
-        if self.addresses.binary_search(&pc).is_err() {
+        if self.addresses.borrow().binary_search(&pc).is_err() {
             return false;
         }
         if self.skip.get() == Some(pc) {
@@ -448,7 +716,10 @@ impl EntryPoints {
 pub struct InstructionPoints {
     cpu: Weak<dyn Cpu>,
     entry: Rc<EntryPoints>,
-    hooks: Vec<HookId>,
+    /// Installed hooks by address. A hook stays installed after its address
+    /// leaves the active set, because removing and reinstalling it discards
+    /// the translated code of its page both times.
+    hooks: BTreeMap<u64, HookId>,
 }
 unsafe fn instruction(pc: u64, _: u32, data: *mut c_void) {
     let points = unsafe { &*data.cast::<InstructionPoints>() };
@@ -475,6 +746,9 @@ impl super::State {
         pc: u64,
         cpu: &dyn Cpu,
     ) -> Result<bool, String> {
+        if self.entry_points[core].is_empty() {
+            return Ok(false);
+        }
         self.entry_points[core].retain(|entry| entry.strong_count() != 0);
         for entry in self.entry_points[core].iter().filter_map(Weak::upgrade) {
             if entry.hit(pc) {
@@ -489,47 +763,88 @@ impl Board {
     pub fn instruction_points_begin(
         &self,
         core: usize,
-        mut addresses: Vec<u64>,
+        addresses: Vec<u64>,
     ) -> Result<Box<InstructionPoints>, String> {
-        let cpu = self.cpu(core)?;
-        if addresses.len() > 4096 || addresses.iter().any(|pc| pc & 1 != 0) {
-            return Err("Instruction points require bounded aligned addresses".into());
-        }
-        addresses.sort_unstable();
-        addresses.dedup();
+        self.cpu(core)?;
         let mut points = Box::new(InstructionPoints {
             cpu: Rc::downgrade(&self.cpus[core]),
             entry: Rc::new(EntryPoints {
-                addresses: addresses.clone(),
+                addresses: RefCell::new(vec![]),
                 pause: self.host_pause.clone(),
                 event: RefCell::new(None),
                 skip: Cell::new(None),
             }),
-            hooks: vec![],
+            hooks: BTreeMap::new(),
         });
-        if !cpu.features().instruction_progress {
+        if !self.cpu(core)?.features().instruction_progress {
             // These processors use the shared all-instruction callback. Check
             // there before architectural emulation and instruction accounting.
             self.state.borrow_mut().entry_points[core].push(Rc::downgrade(&points.entry));
-            return Ok(points);
+        }
+        if let Err(error) = self.instruction_points_update(core, &mut points, addresses) {
+            self.instruction_points_end(core, &mut points)?;
+            return Err(error);
+        }
+        Ok(points)
+    }
+    /// Replace the active addresses, installing hooks only for new ones.
+    pub fn instruction_points_update(
+        &self,
+        core: usize,
+        points: &mut InstructionPoints,
+        mut addresses: Vec<u64>,
+    ) -> Result<(), String> {
+        let cpu = self.cpu(core)?;
+        if addresses.len() > MAX_INSTRUCTION_POINTS || addresses.iter().any(|pc| pc & 1 != 0) {
+            return Err("Instruction points require bounded aligned addresses".into());
+        }
+        addresses.sort_unstable();
+        addresses.dedup();
+        // A skip belongs to the stop it resumes from. Once its address leaves
+        // the active set, or the host has moved the core elsewhere, it would
+        // otherwise swallow that address's next hit.
+        if let Some(pc) = points.entry.skip.get()
+            && (addresses.binary_search(&pc).is_err()
+                || self.read_register(core, Register::Pc)? != pc)
+        {
+            points.entry.skip.set(None);
+        }
+        *points.entry.addresses.borrow_mut() = addresses.clone();
+        if !cpu.features().instruction_progress {
+            return Ok(());
+        }
+        let added = addresses
+            .iter()
+            .filter(|pc| !points.hooks.contains_key(pc))
+            .count();
+        if points.hooks.len() + added > MAX_INSTRUCTION_POINTS {
+            let inactive = points
+                .hooks
+                .keys()
+                .filter(|pc| addresses.binary_search(pc).is_err())
+                .copied()
+                .collect::<Vec<_>>();
+            for pc in inactive {
+                if let Some(hook) = points.hooks.remove(&pc) {
+                    cpu.remove_hook(hook)?;
+                }
+            }
         }
         let data = (&*points as *const InstructionPoints).cast_mut().cast();
         for pc in addresses {
-            match unsafe {
+            if points.hooks.contains_key(&pc) {
+                continue;
+            }
+            let hook = unsafe {
                 cpu.install_hook(Hook::Instruction {
                     callback: instruction,
                     data,
                     range: HookRange::Inclusive { begin: pc, end: pc },
                 })
-            } {
-                Ok(id) => points.hooks.push(id),
-                Err(error) => {
-                    self.instruction_points_end(core, &mut points)?;
-                    return Err(error);
-                }
-            }
+            }?;
+            points.hooks.insert(pc, hook);
         }
-        Ok(points)
+        Ok(())
     }
     pub fn instruction_points_end(
         &self,
@@ -542,7 +857,7 @@ impl Board {
                 .upgrade()
                 .is_some_and(|entry| !Rc::ptr_eq(&entry, &points.entry))
         });
-        for hook in points.hooks.drain(..) {
+        for hook in std::mem::take(&mut points.hooks).into_values() {
             self.cpu(core)?.remove_hook(hook)?;
         }
         Ok(())
@@ -551,7 +866,10 @@ impl Board {
 
 pub struct FunctionWatch {
     pub recorder: Rc<RefCell<calls::Recorder>>,
+    // Native hooks hold raw pointers into each box; boxing keeps them stable as the Vec grows.
+    #[allow(clippy::vec_box)]
     contexts: Vec<Box<FunctionContext>>,
+    pub range_counts: Option<Rc<RefCell<ranges::RangeCounts>>>,
     hooks: Vec<(usize, HookId)>,
 }
 struct FunctionContext {
@@ -561,6 +879,8 @@ struct FunctionContext {
     maps: Vec<MemoryMap>,
     core: usize,
     last: Cell<Option<(u64, u64)>>,
+    range_last: Cell<Option<(u64, u64)>>,
+    range_counts: Option<Rc<RefCell<ranges::RangeCounts>>>,
     error: RefCell<Option<String>>,
 }
 impl FunctionContext {
@@ -616,6 +936,36 @@ impl FunctionContext {
         Ok(())
     }
 }
+unsafe fn function_with_ranges(pc: u64, size: u32, data: *mut c_void) {
+    let context = unsafe { &*data.cast::<FunctionContext>() };
+    let result = (|| -> Result<(), String> {
+        let (Some(state), Some(cpu)) = (context.state.upgrade(), context.cpu.upgrade()) else {
+            return Ok(());
+        };
+        let state = state.borrow();
+        let extra = cpu
+            .instruction_progress()
+            .ok_or("function watch requires exact CPU progress")?
+            .saturating_sub(state.accounted[context.core]);
+        let instructions = state
+            .total_instructions()?
+            .checked_add(extra)
+            .ok_or("function watch instruction overflow")?;
+        if context.range_last.replace(Some((pc, instructions))) != Some((pc, instructions)) {
+            context
+                .range_counts
+                .as_ref()
+                .unwrap()
+                .borrow_mut()
+                .observe(context.core, pc);
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        context.error.borrow_mut().get_or_insert(error);
+    }
+    unsafe { function(pc, size, data) };
+}
 unsafe fn function(pc: u64, _: u32, data: *mut c_void) {
     let context = unsafe { &*data.cast::<FunctionContext>() };
     if let Err(error) = context.observe(pc) {
@@ -623,6 +973,12 @@ unsafe fn function(pc: u64, _: u32, data: *mut c_void) {
     }
 }
 impl FunctionWatch {
+    pub fn is_live(&self) -> bool {
+        self.contexts
+            .iter()
+            .all(|context| context.cpu.upgrade().is_some())
+    }
+
     pub fn check(&self) -> Result<(), String> {
         for context in &self.contexts {
             if let Some(error) = &*context.error.borrow() {
@@ -637,10 +993,18 @@ impl Board {
         &self,
         recorder: calls::Recorder,
         maps: Vec<MemoryMap>,
+        ranges: Option<Vec<(u64, u64)>>,
     ) -> Result<Box<FunctionWatch>, String> {
+        let range_counts = ranges
+            .map(|ranges| {
+                ranges::RangeCounts::new(ranges, self.cpus.len())
+                    .map(|counts| Rc::new(RefCell::new(counts)))
+            })
+            .transpose()?;
         let recorder = Rc::new(RefCell::new(recorder));
         let mut watch = Box::new(FunctionWatch {
             recorder: recorder.clone(),
+            range_counts: range_counts.clone(),
             contexts: vec![],
             hooks: vec![],
         });
@@ -656,6 +1020,8 @@ impl Board {
                 maps: maps.iter().filter(|m| m.core == core).cloned().collect(),
                 core,
                 last: Cell::new(None),
+                range_last: Cell::new(None),
+                range_counts: range_counts.clone(),
                 error: RefCell::new(None),
             }));
             let data = (&**watch.contexts.last().unwrap() as *const FunctionContext)
@@ -663,7 +1029,11 @@ impl Board {
                 .cast();
             match unsafe {
                 cpu.install_hook(Hook::Instruction {
-                    callback: function,
+                    callback: if range_counts.is_some() {
+                        function_with_ranges
+                    } else {
+                        function
+                    },
                     data,
                     range: HookRange::All,
                 })

@@ -1,3 +1,4 @@
+use fujimod_catalog_configuration::RunEngine;
 use super::*;
 use crate::board::{factory::*, memory::BusMapping};
 use fujimod_emulator_cpu::{Model, arm};
@@ -57,7 +58,7 @@ pub(super) fn board_mode(mode: bus::Mode) -> Board {
     let processors = (0..2)
         .map(|core| Processor {
             model: Model::CortexR5F,
-            released: true,
+            released: true, parked_until_sgi: false,
             mprofile: None,
             rprofile: Some(fujimod_emulator_cpu_unicorn::rprofile::core::Options {
                 cp14_identity: 0x55aa,
@@ -71,6 +72,7 @@ pub(super) fn board_mode(mode: bus::Mode) -> Board {
                         reset: 0xffff8001,
                     },
                 },
+                ..Default::default()
             }),
             registers: vec![
                 (Register::Pc, 0x1000 + core * 0x100),
@@ -153,7 +155,7 @@ pub(super) fn board_mode(mode: bus::Mode) -> Board {
         .unwrap();
     let mut board = graph
         .build(
-            Options::new(Engine::Unicorn).with_translation_cache_size_bytes(1 << 20),
+            Options::new(RunEngine::Unicorn).with_translation_cache_size_bytes(1 << 20),
             bus,
             None,
         )
@@ -191,15 +193,15 @@ fn both_execution_policies_restore_the_whole_board_and_pending_events() {
         let mut board = board();
         board.set_execution_policy(policy).unwrap();
         board.run_until(13, 17).unwrap();
-        let before = board.fingerprint().unwrap();
+        let before = board.complete_state().unwrap();
         let saved = board.checkpoint(None).unwrap();
-        assert_eq!(before, board.fingerprint().unwrap());
+        assert_eq!(before, board.complete_state().unwrap());
         board.run_until(120, 17).unwrap();
         board.set_execution_policy(ExecutionPolicy::Exact).unwrap();
         board.write_physical(0x3000, &99u32.to_le_bytes()).unwrap();
         board.restore_keyframe(&saved).unwrap();
         assert_eq!(board.execution_policy(), policy);
-        assert_eq!(before, board.fingerprint().unwrap());
+        assert_eq!(before, board.complete_state().unwrap());
         board.run_until(120, 17).unwrap();
         assert!(
             board
@@ -215,16 +217,16 @@ fn both_execution_policies_restore_the_whole_board_and_pending_events() {
 fn replay_restores_pending_dma_deadlines_aliases_private_ram_and_partial_scheduler_slices() {
     let mut board = board();
     board.run_until(13, 17).unwrap();
-    let before = board.fingerprint().unwrap();
+    let before = board.complete_state().unwrap();
     let saved = board.checkpoint(None).unwrap();
-    assert_eq!(before, board.fingerprint().unwrap());
+    assert_eq!(before, board.complete_state().unwrap());
     assert!(
         board
             .inspect_device::<PendingDma, _>(0, |d| Ok(d.due.is_some()))
             .unwrap()
     );
     board.run_until(120, 17).unwrap();
-    let straight = board.fingerprint().unwrap();
+    let straight = board.complete_state().unwrap();
     assert_eq!(
         board
             .inspect_device::<PendingDma, _>(0, |d| Ok(d.completions.clone()))
@@ -245,13 +247,13 @@ fn replay_restores_pending_dma_deadlines_aliases_private_ram_and_partial_schedul
         .unwrap();
     for _ in 0..3 {
         board.restore_keyframe(&saved).unwrap();
-        assert_eq!(before, board.fingerprint().unwrap());
+        assert_eq!(before, board.complete_state().unwrap());
         board.run_until(120, 17).unwrap();
-        assert_eq!(straight, board.fingerprint().unwrap());
+        assert_eq!(straight, board.complete_state().unwrap());
         board.write_physical(0x3000, &99u32.to_le_bytes()).unwrap();
     }
     board.restore_keyframe(&later).unwrap();
-    assert_eq!(straight, board.fingerprint().unwrap());
+    assert_eq!(straight, board.complete_state().unwrap());
     let other = self::board();
     assert!(
         other
@@ -260,6 +262,13 @@ fn replay_restores_pending_dma_deadlines_aliases_private_ram_and_partial_schedul
             .unwrap()
             .contains("different board")
     );
+}
+#[test]
+fn the_first_keyframe_reads_only_written_pages_and_still_holds_every_write() {
+    let mut board = board();
+    board.run_until(13, 17).unwrap();
+    let saved = board.checkpoint(None).unwrap();
+    assert_eq!(saved.memory, board.complete_state().unwrap().memory);
 }
 #[test]
 fn independent_cpu_allocations_refuse_instead_of_omitting_live_ram() {

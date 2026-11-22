@@ -37,6 +37,15 @@
               "name": "imagescaler",
               "kind": "ImageScaler",
               "boot_entries": [
+                "rom",
+                "loader"
+              ],
+              "refs": {}
+            },
+            {
+              "name": "windowanalysis",
+              "kind": "WindowAnalysisControl",
+              "boot_entries": [
                 "loader"
               ],
               "refs": {}
@@ -66,7 +75,17 @@
             {
               "name": "audio",
               "kind": "SerialAudioTransmitSink",
-              "refs": {}
+              "refs": {},
+              "model_choices": {
+                "option": "audio_input_profile",
+                "models": {
+                  "declared-silent-stereo-pcm48000": {
+                    "kind": "SerialAudioReceiveSource",
+                    "refs": {},
+                    "dependencies": []
+                  }
+                }
+              }
             },
             {
               "name": "pulseoutputs",
@@ -168,6 +187,52 @@
               "name": "displayformatter",
               "kind": "DisplayFormatter",
               "refs": {}
+            },
+            {
+              "name": "prefilter",
+              "kind": "PrefilterControl",
+              "refs": {}
+            },
+            {
+              "name": "rawstatistics",
+              "kind": "RawStatisticsControl",
+              "refs": {}
+            },
+            {
+              "name": "stillisp",
+              "kind": "StillProcessor",
+              "refs": {}
+            },
+            {
+              "name": "imagewarp",
+              "kind": "ImageWarpControl",
+              "refs": {}
+            },
+            {
+              "name": "avccodec",
+              "kind": "AvcCodecControl",
+              "refs": {}
+            },
+            {
+              "name": "jpegencoder",
+              "kind": "ApproximateJPEGEncodeControl",
+              "refs": {
+                "stream_source": "imagewarp"
+              }
+            },
+            {
+              "name": "rawreadback",
+              "kind": "MemoryReadback",
+              "refs": {
+                "input_controller": "inputprocessingcontrol",
+                "image_output": "imageworkcontrol",
+                "parameters": "imageparametercontrol"
+              }
+            },
+            {
+              "name": "jpegdecoder",
+              "kind": "JPEGDecodeControl",
+              "refs": {}
             }
           ],
           "construction_order": [
@@ -176,6 +241,7 @@
             "nandcontroller",
             "fujidecompressor",
             "imagescaler",
+            "windowanalysis",
             "imagecombination",
             "loadermemorydma",
             "powerdevices",
@@ -199,7 +265,15 @@
             "graphicsaccelerator",
             "displayscanout",
             "displaytiming",
-            "displayformatter"
+            "displayformatter",
+            "prefilter",
+            "rawstatistics",
+            "stillisp",
+            "imagewarp",
+            "avccodec",
+            "jpegencoder",
+            "rawreadback",
+            "jpegdecoder"
           ],
           "attachment_order": [
             "bootcontrols",
@@ -207,6 +281,7 @@
             "nandcontroller",
             "fujidecompressor",
             "imagescaler",
+            "windowanalysis",
             "imagecombination",
             "loadermemorydma",
             "usbcontrol",
@@ -230,7 +305,15 @@
             "graphicsaccelerator",
             "displayscanout",
             "displaytiming",
-            "displayformatter"
+            "displayformatter",
+            "prefilter",
+            "rawstatistics",
+            "stillisp",
+            "imagewarp",
+            "avccodec",
+            "jpegencoder",
+            "rawreadback",
+            "jpegdecoder"
           ]
         },
         "controllers": {
@@ -377,6 +460,11 @@
             "frame_period_ticks": 400000,
             "stop_delay_ticks": 2,
             "basis": "Declared catalog input."
+          },
+          "window_analysis": {
+            "profile": "declared-y16-window-gradients-and-local-tracking-unmeasured",
+            "ticks_per_window": 1000,
+            "basis": "Declared window-analysis numerical law and clock."
           }
         },
         "pin_interrupts": [
@@ -444,11 +532,16 @@
           ],
           "basis": "Declared catalog input."
         },
-        "limits": [],
+        "limits": [
+          "Still capture uses declared synthetic sensor color/CFA and cadence, identity sparse repair, programmed RAW statistics and the shared approximate ISP/JPEG arithmetic. Physical color, timing and sensor fidelity are unmeasured."
+        ],
         "dram_basis": "Declared catalog input.",
         "attachments": {
           "serial_part": [
             "banked-lens"
+          ],
+          "contact_cams": [
+            "xe2s-acquisition-contacts"
           ]
         },
         "control_bus_order": [
@@ -459,9 +552,157 @@
           "device-4",
           "device-5",
           "device-6",
-          "device-7",
+          "sensor",
           "device-8"
-        ]
+        ],
+        "imaging": {
+          "sensor_capture": {
+            "width": 4992,
+            "height": 3362,
+            "period_ticks": 1200000,
+            "dma_ticks": 1000,
+            "cfa_origin": [
+              0,
+              62
+            ]
+          },
+          "capture_color": {
+            "black": 0,
+            "full_scale": 16380,
+            "reference_white": [
+              568,
+              302,
+              558
+            ],
+            "initial_rgb": [
+              128,
+              128,
+              128
+            ],
+            "sensor_cfa": [
+              1,
+              1,
+              2,
+              1,
+              1,
+              0,
+              1,
+              1,
+              0,
+              1,
+              1,
+              2,
+              0,
+              2,
+              1,
+              2,
+              0,
+              1,
+              1,
+              1,
+              0,
+              1,
+              1,
+              2,
+              1,
+              1,
+              2,
+              1,
+              1,
+              0,
+              2,
+              0,
+              1,
+              0,
+              2,
+              1
+            ],
+            "processing_cfa": [
+              0,
+              2,
+              1,
+              2,
+              0,
+              1,
+              1,
+              1,
+              0,
+              1,
+              1,
+              2,
+              1,
+              1,
+              2,
+              1,
+              1,
+              0,
+              2,
+              0,
+              1,
+              0,
+              2,
+              1,
+              1,
+              1,
+              2,
+              1,
+              1,
+              0,
+              1,
+              1,
+              0,
+              1,
+              1,
+              2
+            ],
+            "sensor_image_area": [
+              0,
+              62,
+              4992,
+              3300
+            ],
+            "basis": "Declared synthetic X-Trans input with fixed inverse-gain RGB normalization. CFA phase and spectral response are unmeasured on this body. Radiometry is the X70's X-Trans CMOS II sensor law (same sensor, same mode-236 drive). No lens is mounted (SHOOT WITHOUT LENS), so there is no projection. The 15 cd/m2 scene reproduces the camera's lens-off AE evaluation (+752..+800). Image-input comparators 0 and 1 release the first and second curtains (camera snapshots); light runs from comparator 0's edge to comparator 1's plus 0.42 ms, which gives nominal + 0.2..0.3 ms at 1/4000 and 1/250 as measured.",
+            "radiometry": {
+              "pixel_clock_hz": 33000000,
+              "saturation_lux_seconds": 1.0,
+              "white_luminance": 15.0,
+              "curtains": {
+                "first_output": 0,
+                "second_output": 1,
+                "light_offset_seconds": 0.00042
+              },
+              "shutter_output": 0,
+              "mode_change_frames": 2,
+              "rolling_references": [
+                {
+                  "mode": 236,
+                  "horizontal": 706,
+                  "vertical": 9348,
+                  "lines": 857
+                },
+                {
+                  "mode": 236,
+                  "horizontal": 734,
+                  "vertical": 1671,
+                  "lines": 1671
+                },
+                {
+                  "mode": 236,
+                  "horizontal": 737,
+                  "vertical": 8955,
+                  "lines": 820
+                },
+                {
+                  "mode": 236,
+                  "horizontal": 750,
+                  "vertical": 1760,
+                  "lines": 1760
+                }
+              ],
+              "ticks_per_second": 12000000
+            }
+          }
+        }
       },
       "xe2s-service-session": {
         "graph": {
@@ -757,6 +998,9 @@
         "attachments": {
           "serial_part": [
             "banked-lens"
+          ],
+          "contact_cams": [
+            "xe2s-acquisition-contacts"
           ]
         },
         "control_bus_order": [
@@ -767,7 +1011,7 @@
           "device-4",
           "device-5",
           "device-6",
-          "device-7",
+          "sensor",
           "device-8"
         ]
       },
@@ -982,6 +1226,9 @@
         "attachments": {
           "serial_part": [
             "banked-lens"
+          ],
+          "contact_cams": [
+            "xe2s-acquisition-contacts"
           ]
         },
         "control_bus_order": [
@@ -992,7 +1239,7 @@
           "device-4",
           "device-5",
           "device-6",
-          "device-7",
+          "sensor",
           "device-8"
         ]
       },
@@ -1224,6 +1471,9 @@
         "attachments": {
           "serial_part": [
             "banked-lens"
+          ],
+          "contact_cams": [
+            "xe2s-acquisition-contacts"
           ]
         },
         "controllers": {
@@ -1555,7 +1805,7 @@
           "device-4",
           "device-5",
           "device-6",
-          "device-7",
+          "sensor",
           "device-8"
         ],
         "card_contacts": {
@@ -1628,7 +1878,16 @@
   },
   "ram_regions": [],
   "nand": null,
-  "sensor": null,
+  "sensor": {
+    "part_id": "x70-image-sensor",
+    "connection_id": "sensor-bus",
+    "control_bus": {
+      "controller_id": "control-bus0",
+      "channel": 0,
+      "address": 28,
+      "polarity_selector": 1
+    }
+  },
   "lens": null,
   "display": null,
   "microcontroller": null,
@@ -1689,13 +1948,6 @@
       "address": 12,
       "polarity_selector": 1,
       "id": "device-6"
-    },
-    {
-      "controller_id": "control-bus0",
-      "channel": 0,
-      "address": 28,
-      "polarity_selector": 1,
-      "id": "device-7"
     },
     {
       "controller_id": "control-bus1",
@@ -1937,11 +2189,31 @@
           "active_level": true
         }
       ]
+    },
+    {
+      "id": "sensor-bus",
+      "kind": "sensor",
+      "signals": [
+        {
+          "kind": "serial",
+          "block_id": "control-bus0",
+          "channel": 0,
+          "address": 28
+        }
+      ]
     }
   ],
   "parts": [
     "sd-card",
-    "banked-lens"
+    "banked-lens",
+    "x70-image-sensor",
+    "xe2s-acquisition-contacts"
   ],
-  "wiring": []
+  "wiring": [
+    {
+      "source_id": "sensor-bus",
+      "target_id": "x70-image-sensor",
+      "signal": "serial_data"
+    }
+  ]
 }

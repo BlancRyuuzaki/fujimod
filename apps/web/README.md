@@ -6,9 +6,9 @@ worker CPU captures, Wasm symbols, instruction rates and repeatable timing.
 This app lives in `apps/web/` of the FujiMod repository. Run the commands
 below from that directory.
 
-Try camera firmware and build SD boot files in your browser. Firmware is
+Try camera firmware and build an SD boot v2 SD card in your browser. Firmware is
 identified by its complete SHA-256 and never uploaded. The web app is developed
-on review branches; the Pages workflow deploys approved main builds only.
+on review branches; `main` is deployed nightly and by hand ([DEPLOYMENT.md](DEPLOYMENT.md)).
 
 ## Rendering and static hosting
 
@@ -19,16 +19,16 @@ remain separate from the Solid components that display their state. The
 [emulator UI package](../../packages/emulator-ui/README.md) owns the reusable
 session and workspace; `src/home/controller.ts` owns homepage policy.
 
-`npm run build` renders `/`, `/dev-tools/` and `/bug/` through start mode's
+`pnpm run build` renders `/`, `/dev-tools/` and `/bug/` through start mode's
 production request handler. Deploy **`dist/client/`**, which contains the full
 page HTML, CSS and browser assets; static hosting needs no running SSR server.
-`dist/server/` is a build-time renderer. `npm run build:local-preview` uses
+`dist/server/` is a build-time renderer. `pnpm run build:local-preview` uses
 `dist-local-preview/{client,server}`. Both build commands fail if a page cannot
 be prerendered. The initial camera catalog enters the build from installed public artifacts.
 The browser refreshes the catalog and loads release metadata after mounting.
 Firmware selection and execution remain browser operations.
 
-`npm run test:prerender` checks the production static files in Chromium and
+`pnpm run test:prerender` checks the production static files in Chromium and
 WebKit, with and without JavaScript. It asserts page content, hydration of the
 existing homepage nodes, Features and Feedback, and the report page's
 absence of development reporting hooks. The web workflow runs this after build.
@@ -45,6 +45,43 @@ generated entries and hashed build assets. `node scripts/test-development.ts`
 checks mobile Chromium and WebKit against a running development server, including
 a retained stale unversioned page response, repeated visits, and working inputs.
 Set `FUJIMOD_WEB_URL` to check another development endpoint.
+
+`node scripts/test-homepage.ts` checks the 0.1.0 preview in desktop
+and mobile Chromium and WebKit. It exercises feature search, detail cards,
+release notes and camera selection, and verifies a browser-built SD card
+download against every declared asset hash. Screenshots go to
+`build/homepage/`; set `FUJIMOD_REVIEW_OUTPUT` to choose another directory.
+
+## Sharing Worker
+
+Production sends the firmware download proxy, error logs, issue reports and
+contribution uploads to `https://share.fujimod.com`. The development preview
+starts [`apps/usb-sharing`](../usb-sharing/README.md) with `wrangler dev` and
+serves those paths under the preview's own origin, so `pnpm run dev` and
+`pnpm run preview` need no sharing hostname. It applies the Worker's local D1
+migrations before starting it. Set `FUJIMOD_SHARING_ORIGIN` to build against
+another sharing server.
+
+## Camera sign-in
+
+A camera has no browser, so it signs in by device code. It asks for a code,
+shows it to its owner, and polls until the owner approves it at `/device/`. The
+camera client id is `x70-camera`:
+
+```
+POST /api/auth/device/code      {client_id, scope}
+  -> {device_code, user_code, verification_uri, verification_uri_complete, expires_in, interval}
+POST /api/auth/device/token     {grant_type, device_code, client_id}
+  -> {access_token, token_type, expires_in, scope}   or authorization_pending
+POST /api/devices/google-token  Authorization: Bearer <access_token>
+  -> {accessToken, expiresAt}
+```
+
+`grant_type` is `urn:ietf:params:oauth:grant-type:device_code`, and bodies may
+be JSON or `application/x-www-form-urlencoded`. Poll no faster than `interval`
+seconds, or the token endpoint answers `slow_down`. The Worker records the
+issued session as a device credential and returns a Google token only to a
+device whose policy grants `google.photos.append`.
 
 ## Dev Tools
 
@@ -74,10 +111,10 @@ IDs; Save exports the captured log. The Rust queue and browser log are bounded,
 and discarded entries are reported. Long rows scroll inside the log on mobile.
 
 ```sh
-npm run build
-npm run test:dev-tools:browser
+pnpm run build
+pnpm run test:dev-tools:browser
 # Or check an existing server:
-FUJIMOD_WEB_URL=https://your-host.ts.net/ npm run test:dev-tools:browser
+FUJIMOD_WEB_URL=https://your-host.ts.net/ pnpm run test:dev-tools:browser
 ```
 
 This checks production Wasm against a simulated WebUSB device in desktop/mobile
@@ -188,12 +225,9 @@ Use the Node version in the repository's `mise.toml` (`mise install`),
 
 ```sh
 rustup target add wasm32-unknown-unknown
-npm --prefix ../.. ci
-npm --prefix ../../packages/emulator-ui ci
-npm --prefix ../../bindings/javascript ci
-npm --prefix ../../bindings/javascript run setup:tooling
-npm ci
-npm run dev -- --port 5190
+pnpm install --frozen-lockfile
+pnpm --filter fujimod run setup:tooling
+pnpm run dev -- --port 5190
 ```
 
 The web commands build the local Rust USB bindings before starting. The tooling
@@ -222,6 +256,14 @@ server only. Keep review files outside the repository; the build rejects
 `public/review/`. `node --test scripts/local-review-files.test.ts` checks the
 mount and production build guard.
 
+`src/development/focal/` holds interactive prototypes of camera screens in
+Focal UI, built with Solid and Tailwind. `focal.css` defines every size and
+color as a Tailwind theme token in camera pixels on the 720x480 LCD, and
+`review.tsx` renders a live screen driven by the arrow keys, Enter and Esc,
+followed by a gallery of fixed states. A review page loads it with
+`<div id="focal-review"></div>` and
+`<script type="module" src="/src/development/focal/review.tsx"></script>`.
+
 `FUJIMOD_MEDIA_ROOT` enables development media from a recording workspace.
 The homepage previews `media/frontier/site` when available, otherwise
 `media/current`, and reloads when the manifest changes. The server exposes
@@ -242,9 +284,9 @@ the viewer remains a DAT drop target. Public builds omit the automatic DAT fetch
 opt-in mount and is never copied into any build artifact.
 
 ```sh
-npm run check
-npm test
-npm run build
+pnpm run check
+pnpm test
+pnpm run build
 FUJIMOD_WEB_URL=https://your-host.ts.net:port node tests/wasm.browser.ts
 FUJIMOD_WEB_URL=https://your-host.ts.net:port node tests/wasm-camera.browser.ts
 node tests/speed.browser.ts --url 'https://your-host.ts.net:port/?scenario=x70-lcd#workspace' \
@@ -267,18 +309,18 @@ The ordinary `?scenario=x70-lcd#workspace` development route loads the configure
 local DAT into live REC with deterministic RTC input and normal Engine calls.
 It executes the real guest; no screen state or peripheral result is synthesized.
 
-Tests stay next to the code they cover. `npm test` runs the emulator UI package
+Tests stay next to the code they cover. `pnpm test` runs the emulator UI package
 tests and then the web app tests. `.test.tsx` tests use jsdom, and `.test.ts`
 tests use Node. Import test APIs from `vite-plus/test`; call Solid 2 `flush()`
-before asserting batched UI changes. Use `npm run format -- path/to/file.tsx`
+before asserting batched UI changes. Use `pnpm run format -- path/to/file.tsx`
 for selected files. The runtime and DOM package are pinned to Solid 2.0.0-rc.15.
 See [the engine contract](src/engine/WASM.md) for transport and history behavior.
 
 ### Local production preview
 
 ```sh
-npm run build:local-preview
-npm run preview -- --mode local-preview --port 5190 --strictPort
+pnpm run build:local-preview
+pnpm run preview -- --mode local-preview --port 5190 --strictPort
 ```
 
 This serves `dist-local-preview/` and enables the configured local DAT. Public
@@ -290,12 +332,13 @@ state starts fresh at each cold boot.
 
 ### Website assets and deployment
 
-The Web checks workflow runs lint, type checks, tests and the public build on
-web changes in pull requests and on main. It does not deploy.
+The Web checks workflow runs lint, type checks, tests and the public build when
+started by hand. It does not deploy.
 
-`npm run deploy -- --runtime DIRECTORY --media DIRECTORY`
+`pnpm run deploy -- --runtime DIRECTORY --media DIRECTORY --sdk-docs DIRECTORY`
 validates locally generated assets, runs checks and tests, builds the website,
-and uploads it directly to Cloudflare. Runtime bundles and feature media remain
+and uploads it directly to Cloudflare. `--carry-from ORIGIN` reuses a deployed
+site's verified assets instead; the nightly Web deploy workflow uses it. Runtime bundles and feature media remain
 in ignored generated directories. GitHub Releases contain mod patches and their
 index; publishing a mod does not deploy the website.
 
@@ -356,8 +399,9 @@ operations. A genuinely new codec would require an interpreter update.
 download page and original release date, patch hash/size, included mods and model-specific boot instructions. Patch filenames are simple
 local filenames. The Worker serves the index and patches from the same origin
 through `/releases/`; they are fetched at runtime and are never website build
-inputs. Each firmware has `downloads: {sd_card, installable}`, both false by
-default; installable requires a verified `fpupdate` patch output. Optional
+inputs. Each firmware has `downloads: {sd_boot_v1, sd_boot_v1_installable}`, both false by
+default; installable requires a verified `fpupdate` patch output and
+`update_filename`, the body's update DAT name. Optional
 `notes: {name}` identifies Markdown fetched as text for display.
 See [the release contract](RELEASE-DOWNLOADS.md).
 
@@ -391,3 +435,20 @@ and logs. The ZIP’s `report.json` is saved alongside it for direct inspection.
 Dev Tools includes binary USB traces. Unavailable snapshots are recorded
 explicitly. Inspection snapshots preserve the captured boundary and are not resume
 points. Release builds keep the browser download and GitHub issue workflow.
+
+### Software bill of materials
+
+The web build writes `client/sbom.json` under its output directory. This
+CycloneDX 1.6 document includes the locked production dependency graph, packages
+that contribute files to the web bundle, the WebUSB Wasm dependencies, and the
+provenance supplied with any staged runtime assets. The `fujimod:product`
+property identifies each product that ships a component. The license expression
+is in `licenses`; full notices for multi-license expressions are in
+`evidence.licenses`.
+
+Keep vendored source metadata in `upstream.json` beside the build target that
+uses it. Each record identifies the source revision and its local license
+files. A source with a verified Git submodule can inherit the pin and URL from
+the gitlink and `.gitmodules`. Runtime staging includes `sbom-components.json`
+in the hashed site asset manifest so carry-forward deployments preserve the
+licenses for the exact runtime being reused.

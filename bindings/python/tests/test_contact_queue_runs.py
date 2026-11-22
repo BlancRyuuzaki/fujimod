@@ -1,19 +1,18 @@
 """Every whole-board run frontend advances queued physical contacts."""
-import hashlib
 import json
 import struct
 
 import pytest
 from fujimod.emulator import Asset, Definition, Image, make_board
 
-from test_emulator import _execution_graph
+from .test_emulator import _execution_graph
 
 
 def contact_board(quantum):
     # Acknowledge press, then release, through guest stores to the same byte.
     program = struct.pack("<5I", 0xe3a00001, 0xe5c10000, 0xe2800001,
                           0xe5c10000, 0xeafffffe)
-    asset = Asset("program", len(program), hashlib.sha256(program).hexdigest())
+    asset = Asset("program", len(program))
     graph = _execution_graph()
     graph["processors"][0]["registers"].append(["Pstate", 0xd3])
     graph["dma_mappings"] = [dict(address=0x10000, physical=0x10000, size=0x4000, permissions=3)]

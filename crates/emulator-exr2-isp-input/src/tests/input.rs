@@ -54,10 +54,18 @@ fn raw_readback_keeps_neutral_light_across_sensor_window_origins() {
         h.now = 7;
         assert!(outputs.lock().unwrap().transfers[0].write(&mut h.cx()).unwrap());
         let pixels = h.ram[0x9000..0x9000 + 72].to_vec();
-        assert!(pixels.chunks_exact(4).all(|p| p[0] > 0 && p[0] < 255
-            && p[0] == p[1] && p[2..] == [128, 128]));
-        if let Some(expected) = &reference { assert_eq!(&pixels, expected); }
-        else { reference = Some(pixels); }
+        assert!(
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| p[0] > 0 && p[0] < 255 && p[0] == p[1] && p[2..] == [128, 128])
+        );
+        if let Some(expected) = &reference {
+            assert_eq!(&pixels, expected);
+        } else {
+            reference = Some(pixels);
+        }
     }
 }
 fn input_options() -> fujimod_emulator_imaging::exr2_isp::options::input::Options {
@@ -88,6 +96,7 @@ fn input_wiring() -> input::Wiring {
         parameters: None,
         memory_outputs: None,
         edges: Default::default(),
+        comparator_outputs: Default::default(),
         start_tick: 0,
     }
 }
@@ -266,7 +275,7 @@ fn physical_sensor_latch_and_both_input_sources_share_one_edge() {
     use fujimod_emulator_imaging::scene::{Frame, FramePixels, SensorFrames};
     use std::sync::{Arc, Mutex};
     let frames = Arc::new(Mutex::new(SensorFrames::new(
-        Frame::new(2, 1, FramePixels::Raw16(vec![100, 200].into())).unwrap(),
+        Frame::new(2, 1, FramePixels::Raw16(vec![100, 200])).unwrap(),
     )));
     let mut w = input_wiring();
     w.frame_period = Some(Arc::new(Mutex::new(10)));
@@ -344,6 +353,7 @@ fn sensor_frames_after_a_drive_mode_change_raise_no_edge() {
                         rolling_references: vec![],
                         mode_change_frames: 2,
                         preview_field: None,
+                        curtains: None,
                     },
                     wire.clone(),
                     iris.clone(),
@@ -724,11 +734,31 @@ fn worker_raw_readout_retains_latched_frames_padding_deadline_ack_and_restore() 
     fujimod_emulator_devices::work::configure(0).unwrap();
 }
 #[test]
+fn raw_channel_can_be_enabled_before_its_input_window_is_programmed() {
+    let (mut d, mut h, _) = raw_window_input(false);
+    write(&mut d, &mut h, 0xfff10014, 0);
+    write(&mut d, &mut h, 0xfff10018, 0);
+    advance(&mut d, &mut h, 10);
+    assert!(h.irqs.is_empty());
+    assert!(h.ram[0x8000..0x8008].iter().all(|&byte| byte == 0xa5));
+    assert!(d.save()[0]["dma"]["deadline"].is_null());
+
+    write(&mut d, &mut h, 0xfff10014, 0x10003);
+    write(&mut d, &mut h, 0xfff10018, 0x10001);
+    advance(&mut d, &mut h, 20);
+    advance(&mut d, &mut h, 25);
+    assert_eq!(
+        &h.ram[0x8000..0x8008],
+        &[0x10, 1, 0x20, 1, 0x30, 1, 0x40, 1]
+    );
+}
+
+#[test]
 fn raw_dma_refuses_out_of_raster_windows_and_unmodeled_transport_selections() {
     for (offset, value, reason) in [
         (0x24, 3, "bounded input window"), // Odd active width cannot form packed pairs.
         (0x14, 0x80003, "bounded input window"),
-        (0x14, 1, "bounded input window"),
+        (0x14, 5 << 16 | 3, "bounded input window"), // Window [5, 9) exceeds the 8-column sensor.
         (0x18, 0x40000, "bounded input window"),
         (0x18, 4, "bounded input window"),
         (0x354, 0x10200000, "transport"),
@@ -835,9 +865,11 @@ fn packed_raw_readback_matches_u16_with_independent_row_padding() {
                 let b = a + 70;
                 let at = 0x8000 + y * pitch + packing.row_bytes(x);
                 match packing {
+                    // Packed12 stores U12 samples that still color restores
+                    // to the U14 domain of U16 RAW.
                     Packing::U16 => {
-                        h.ram[at..at + 2].copy_from_slice(&a.to_le_bytes());
-                        h.ram[at + 2..at + 4].copy_from_slice(&b.to_le_bytes());
+                        h.ram[at..at + 2].copy_from_slice(&(a << 2).to_le_bytes());
+                        h.ram[at + 2..at + 4].copy_from_slice(&(b << 2).to_le_bytes());
                     }
                     Packing::Packed12 => h.ram[at..at + 3].copy_from_slice(&[
                         a as u8,
@@ -978,8 +1010,8 @@ fn raw_readback_waits_for_both_outputs_then_eof() {
     h.now = 7;
     {
         let mut out = outputs.lock().unwrap();
-        for i in 0..2 {
-            assert!(out.transfers[i].write(&mut h.cx()).unwrap());
+        for (i, transfer) in out.transfers.iter_mut().enumerate().take(2) {
+            assert!(transfer.write(&mut h.cx()).unwrap());
             Irq {
                 core: 0,
                 line: 44 + i as u32,
@@ -1459,9 +1491,18 @@ fn raw_readback_retains_captured_color_phase_after_sensor_capture_is_disabled() 
             (0x3ac, 0xc003), (0x3b8, 0xfb000000), (0x390, 1),
         ] { write(&mut device, &mut h, 0xfff10000 + offset, value); }
         h.now = 7;
-        assert!(outputs.lock().unwrap().transfers[0].write(&mut h.cx()).unwrap());
-        assert!(h.ram[0x9000..0x9048].chunks_exact(4)
-            .all(|p| p[0] == p[1] && p[2..] == [128, 128]));
+        assert!(
+            outputs.lock().unwrap().transfers[0]
+                .write(&mut h.cx())
+                .unwrap()
+        );
+        assert!(
+            h.ram[0x9000..0x9048]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| p[0] == p[1] && p[2..] == [128, 128])
+        );
     }
 }
 
@@ -1501,4 +1542,118 @@ fn record_phase_has_an_independent_register_gated_frame_edge() {
     write(&mut d, &mut h, 0xfff10048, 0);
     advance(&mut d, &mut h, 60);
     assert!(h.irqs.is_empty());
+}
+#[test]
+fn started_comparators_fire_once_at_their_frame_point_and_release_the_curtains() {
+    // X-E2S camera: comparators 0 and 1 read 0x80010003 while a still
+    // waits for its curtains and 0x3 afterwards; stock refuses to reprogram a
+    // started comparator, so a comparator that never fired kept every later
+    // still's curtain points out. Light runs from comparator 0's edge to
+    // comparator 1's plus the declared offset.
+    use fujimod_emulator_imaging::exposure::{Calibration, Exposure};
+    use fujimod_emulator_imaging::scene::{Frame, FramePixels, SensorFrames};
+    use std::sync::{Arc, Mutex};
+    let frames = Arc::new(Mutex::new(SensorFrames::new(
+        Frame::new(2, 1, FramePixels::Rgb24(vec![128; 6].into())).unwrap(),
+    )));
+    let wire = Arc::new(Mutex::new(Exposure::default()));
+    let iris = Arc::new(Mutex::new(8.));
+    let mut sensor = fujimod_emulator_parts_sensor::sensor::Sensor::new(
+        fujimod_emulator_parts_sensor::sensor::Options {
+            width: 2,
+            height: 1,
+            image_area: [0, 0, 2, 1],
+            cfa: cfa(),
+            black: 0,
+            full_scale: 4095,
+            reference_white: [256; 3],
+        },
+        frames,
+    )
+    .unwrap();
+    let mut controls = fujimod_emulator_parts_sensor::xtrans16::Sensor::new(
+        fujimod_emulator_parts_sensor::xtrans16::Options {
+            pixel_clock_hz: 33_000_000,
+            shutter: None,
+            rolling_references: vec![],
+            mode_change_frames: 0,
+            preview_field: None,
+            curtains: Some(fujimod_emulator_parts_sensor::xtrans16::Curtains {
+                first_output: 0,
+                second_output: 1,
+                light_offset_seconds: 0.00042,
+            }),
+        },
+        wire.clone(),
+        iris.clone(),
+    )
+    .unwrap();
+    controls
+        .attach_frame_clock(Arc::new(Mutex::new(0)), 12_000_000)
+        .unwrap();
+    sensor
+        .attach_controls(
+            Box::new(controls),
+            Calibration {
+                full_scale: 4095,
+                reference_white: [256; 3],
+                saturation_lux_seconds: 1.,
+                color_sample_weights: [2, 5, 2],
+            },
+            wire.clone(),
+            iris,
+        )
+        .unwrap();
+    sensor.command(&[0x81, 1, 4, 0, 0, 0, 0, 0]).unwrap();
+    let mut w = input_wiring();
+    w.frame_period = Some(Arc::new(Mutex::new(10)));
+    w.sensor = Some(sensor);
+    let first = fujimod_emulator_devices::signals::Level::new(true);
+    w.comparator_outputs[0] = Some(first.clone());
+    let mut o = input_options();
+    o.sensor_period_ticks = Some(100);
+    o.clock = Some(fujimod_emulator_imaging::exr2_isp::options::input::Clock {
+        mode: fujimod_emulator_imaging::exr2_isp::options::input::ClockMode::InputEnable,
+        source: fujimod_emulator_imaging::exr2_isp::options::input::ClockSource::Sensor {},
+        secondary: false,
+        companion_secondary: false,
+    });
+    let mut d = ImageInput::new(o, w).unwrap();
+    let mut h = TestHost::new();
+    for (o, v) in [(0x48, 1), (0x38c, 0x10201)] {
+        write(&mut d, &mut h, 0xfff10000 + o, v);
+    }
+    advance(&mut d, &mut h, 5);
+    write(&mut d, &mut h, 0xfff1038c, 0x10203);
+    // Points: clock 33 (12 ticks) and clock 66 (24 ticks) into the next frame.
+    for (o, v) in [
+        (0xc8, 0x0021_0000),
+        (0xdc, 0x0042_0000),
+        (0xc4, 0x8001_0003),
+        (0xd8, 0x8001_0003),
+    ] {
+        write(&mut d, &mut h, 0xfff10000 + o, v);
+    }
+    // Its output wire falls when started and rises when it fires.
+    assert!(!first.high());
+    advance(&mut d, &mut h, 10);
+    advance(&mut d, &mut h, 15);
+    assert_eq!(read(&mut d, &mut h, 0xfff100c4), 0x8001_0003);
+    assert!(!first.high());
+    assert_eq!(wire.lock().unwrap().seconds, 0.);
+    advance(&mut d, &mut h, 23);
+    assert_eq!(read(&mut d, &mut h, 0xfff100c4), 0x8000_0003);
+    assert!(first.high());
+    assert_eq!(read(&mut d, &mut h, 0xfff100d8), 0x8001_0003);
+    advance(&mut d, &mut h, 35);
+    assert_eq!(read(&mut d, &mut h, 0xfff100d8), 0x8000_0003);
+    let light = wire.lock().unwrap().seconds;
+    assert!(
+        (light - (12. / 12_000_000. + 0.00042)).abs() < 1e-9,
+        "{light}"
+    );
+    // A comparator fires once: later frames leave it and the exposure alone.
+    advance(&mut d, &mut h, 60);
+    assert_eq!(read(&mut d, &mut h, 0xfff100c4), 0x8000_0003);
+    assert_eq!(wire.lock().unwrap().seconds, light);
 }

@@ -16,6 +16,7 @@ use std::{
     task::{Context, Poll, Wake},
 };
 
+use fujimod_perf::{DeviceWorkCounter, add_work, work_timer};
 use wgpu::util::DeviceExt;
 
 const TILE_SIDE: u32 = 8;
@@ -84,8 +85,15 @@ pub struct PendingSurfaceReadbacks {
 
 struct PendingSurfaceReadback {
     surface: Arc<GpuSurface>,
-    _result: wgpu::Buffer,
-    download: wgpu::Buffer,
+    slot: usize,
+}
+
+struct SurfaceReadbackBuffers {
+    pixel_result: Arc<wgpu::Buffer>,
+    mask_result: Arc<wgpu::Buffer>,
+    download: Arc<wgpu::Buffer>,
+    pixel_bytes: usize,
+    busy: bool,
 }
 
 pub struct GpuSurface {
@@ -96,6 +104,21 @@ pub struct GpuSurface {
     pixel_count: usize,
     byte_len: usize,
     guest_shadow: Mutex<Vec<u8>>,
+    readback_buffers: Mutex<Vec<Option<SurfaceReadbackBuffers>>>,
+}
+
+impl Drop for PendingSurfaceReadback {
+    fn drop(&mut self) {
+        if let Ok(mut slots) = self.surface.readback_buffers.lock() {
+            if self.slot == 0 {
+                if let Some(Some(slot)) = slots.get_mut(self.slot) {
+                    slot.busy = false;
+                }
+            } else if let Some(slot) = slots.get_mut(self.slot) {
+                *slot = None;
+            }
+        }
+    }
 }
 
 impl GpuSurface {
@@ -364,12 +387,7 @@ impl GpuContext {
             .get(&key)
             .cloned()
             .ok_or("host GPU surface is not resident")?;
-        let readback = self.gpu.readback(Arc::clone(&surface))?;
-        *surface
-            .guest_shadow
-            .lock()
-            .map_err(|_| "host GPU surface shadow lock poisoned")? = readback.bytes.clone();
-        Ok(readback)
+        self.gpu.readback(surface)
     }
 
     /// Convert a resident surface back to guest bytes without blocking WebGPU.
@@ -384,16 +402,12 @@ impl GpuContext {
         let mut encoder = self.gpu.device.create_command_encoder(&Default::default());
         let pending = self.gpu.encode_readback(&mut encoder, surface)?;
         self.gpu.queue.submit([encoder.finish()]);
-        let (surface, readback) = self
+        let (_, readback) = self
             .gpu
             .finish_readbacks_async(vec![pending])
             .await?
             .pop()
             .ok_or("host GPU readback returned no result")?;
-        *surface
-            .guest_shadow
-            .lock()
-            .map_err(|_| "host GPU surface shadow lock poisoned")? = readback.bytes.clone();
         Ok(readback)
     }
 
@@ -425,7 +439,10 @@ impl GpuContext {
         pending: PendingSurfaceReadbacks,
     ) -> Result<Vec<(SurfaceKey, SurfaceReadback)>, String> {
         let readbacks = self.gpu.finish_readbacks(pending.surfaces)?;
-        self.update_readback_shadows(readbacks)
+        Ok(readbacks
+            .into_iter()
+            .map(|(surface, readback)| (surface.key, readback))
+            .collect())
     }
 
     /// Finish a submitted batch without blocking the browser event loop.
@@ -434,22 +451,10 @@ impl GpuContext {
         pending: PendingSurfaceReadbacks,
     ) -> Result<Vec<(SurfaceKey, SurfaceReadback)>, String> {
         let readbacks = self.gpu.finish_readbacks_async(pending.surfaces).await?;
-        self.update_readback_shadows(readbacks)
-    }
-
-    fn update_readback_shadows(
-        &self,
-        readbacks: Vec<(Arc<GpuSurface>, SurfaceReadback)>,
-    ) -> Result<Vec<(SurfaceKey, SurfaceReadback)>, String> {
-        let mut results = Vec::with_capacity(readbacks.len());
-        for (surface, readback) in readbacks {
-            *surface
-                .guest_shadow
-                .lock()
-                .map_err(|_| "host GPU surface shadow lock poisoned")? = readback.bytes.clone();
-            results.push((surface.key, readback));
-        }
-        Ok(results)
+        Ok(readbacks
+            .into_iter()
+            .map(|(surface, readback)| (surface.key, readback))
+            .collect())
     }
 
     pub fn device(&self) -> &wgpu::Device {
@@ -803,22 +808,71 @@ impl Gpu {
         encoder: &mut wgpu::CommandEncoder,
         surface: Arc<GpuSurface>,
     ) -> Result<PendingSurfaceReadback, String> {
-        let result_size = surface
+        let pixel_bytes = surface
             .pixel_count
-            .checked_mul(8)
-            .ok_or("host GPU surface readback size overflow")? as u64;
-        let result = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("host GPU surface result"),
-            size: result_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-        let download = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("host GPU surface readback staging"),
-            size: result_size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+            .checked_mul(4)
+            .ok_or("host GPU surface readback size overflow")?;
+        let tiles_x = surface.key.extent.width.div_ceil(TILE_SIDE) as usize;
+        let tiles_y = surface.key.extent.height.div_ceil(TILE_SIDE) as usize;
+        let mask_bytes = tiles_x
+            .checked_mul(tiles_y)
+            .and_then(|tiles| tiles.checked_mul(8 * 4))
+            .ok_or("host GPU surface mask readback size overflow")?;
+        let download_size = pixel_bytes
+            .checked_add(mask_bytes)
+            .ok_or("host GPU surface readback size overflow")?;
+        let mut slots = surface
+            .readback_buffers
+            .lock()
+            .map_err(|_| "host GPU surface readback buffer lock poisoned")?;
+        let slot_index = if slots
+            .first()
+            .is_none_or(|slot| slot.as_ref().is_none_or(|slot| !slot.busy))
+        {
+            0
+        } else if let Some(slot) = slots.iter().skip(1).position(Option::is_none) {
+            slot + 1
+        } else {
+            slots.push(None);
+            slots.len() - 1
+        };
+        if slots.get(slot_index).is_none_or(Option::is_none) {
+            let buffers = SurfaceReadbackBuffers {
+                pixel_result: Arc::new(self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("host GPU surface pixel readback"),
+                    size: pixel_bytes as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                })),
+                mask_result: Arc::new(self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("host GPU surface mask readback"),
+                    size: mask_bytes as u64,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                })),
+                download: Arc::new(self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("host GPU surface readback staging"),
+                    size: download_size as u64,
+                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })),
+                pixel_bytes,
+                busy: false,
+            };
+            if slot_index == slots.len() {
+                slots.push(Some(buffers));
+            } else {
+                slots[slot_index] = Some(buffers);
+            }
+        }
+        let slot = slots[slot_index]
+            .as_mut()
+            .ok_or("host GPU surface readback slot disappeared")?;
+        slot.busy = true;
+        let pixel_result = Arc::clone(&slot.pixel_result);
+        let mask_result = Arc::clone(&slot.mask_result);
+        let download = Arc::clone(&slot.download);
+        drop(slots);
         let params = self.params(&surface, 0);
         let readback_bindings = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("host GPU surface readback bindings"),
@@ -846,7 +900,11 @@ impl Gpu {
                 },
                 wgpu::BindGroupEntry {
                     binding: 11,
-                    resource: result.as_entire_binding(),
+                    resource: pixel_result.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: mask_result.as_entire_binding(),
                 },
             ],
         });
@@ -857,11 +915,17 @@ impl Gpu {
             surface.key.extent,
             "host GPU surface readback",
         );
-        encoder.copy_buffer_to_buffer(&result, 0, &download, 0, result_size);
+        encoder.copy_buffer_to_buffer(&pixel_result, 0, &download, 0, pixel_bytes as u64);
+        encoder.copy_buffer_to_buffer(
+            &mask_result,
+            0,
+            &download,
+            pixel_bytes as u64,
+            mask_bytes as u64,
+        );
         Ok(PendingSurfaceReadback {
             surface,
-            _result: result,
-            download,
+            slot: slot_index,
         })
     }
 
@@ -873,17 +937,28 @@ impl Gpu {
         let receivers = pending
             .iter()
             .map(|readback| {
-                let (sender, receiver) = std::sync::mpsc::channel();
-                readback
+                let download = readback
+                    .surface
+                    .readback_buffers
+                    .lock()
+                    .map_err(|_| "host GPU surface readback buffer lock poisoned")?
+                    .get(readback.slot)
+                    .and_then(Option::as_ref)
+                    .ok_or("host GPU surface readback slot disappeared")?
                     .download
+                    .clone();
+                let (sender, receiver) = std::sync::mpsc::channel();
+                download
                     .slice(..)
                     .map_async(wgpu::MapMode::Read, move |status| {
                         let _ = sender.send(status);
                     });
-                receiver
+                Ok(receiver)
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, String>>()?;
         if !pending.is_empty() {
+            add_work(DeviceWorkCounter::GpuReadbackBatches, 1);
+            let _wait = work_timer(DeviceWorkCounter::GpuReadbackWaitNs);
             self.device
                 .poll(wgpu::PollType::wait_indefinitely())
                 .map_err(|error| format!("host GPU polling: {error}"))?;
@@ -908,9 +983,24 @@ impl Gpu {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            for readback in &pending {
-                wait_for_mapping(&readback.download).await?;
+            if !pending.is_empty() {
+                add_work(DeviceWorkCounter::GpuReadbackBatches, 1);
             }
+            let _wait = work_timer(DeviceWorkCounter::GpuReadbackWaitNs);
+            for readback in &pending {
+                let download = readback
+                    .surface
+                    .readback_buffers
+                    .lock()
+                    .map_err(|_| "host GPU surface readback buffer lock poisoned")?
+                    .get(readback.slot)
+                    .and_then(Option::as_ref)
+                    .ok_or("host GPU surface readback slot disappeared")?
+                    .download
+                    .clone();
+                wait_for_mapping(&download).await?;
+            }
+            drop(_wait);
             self.decode_readbacks(pending)
         }
     }
@@ -921,20 +1011,63 @@ impl Gpu {
     ) -> Result<Vec<(Arc<GpuSurface>, SurfaceReadback)>, String> {
         let mut readbacks = Vec::with_capacity(pending.len());
         for pending in pending {
-            let mapped = pending
-                .download
+            let key = pending.surface.key;
+            let (download, pixel_bytes) = {
+                let slots = pending
+                    .surface
+                    .readback_buffers
+                    .lock()
+                    .map_err(|_| "host GPU surface readback buffer lock poisoned")?;
+                let slot = slots
+                    .get(pending.slot)
+                    .and_then(Option::as_ref)
+                    .ok_or("host GPU surface readback slot disappeared")?;
+                (Arc::clone(&slot.download), slot.pixel_bytes)
+            };
+            let mapped = download
                 .slice(..)
                 .get_mapped_range()
                 .map_err(|error| error.to_string())?;
-            let readback = match pending.surface.key.format.bytes_per_pixel() {
-                2 => decode_pixels::<2>(&mapped, pending.surface.key.guest_address),
-                3 => decode_pixels::<3>(&mapped, pending.surface.key.guest_address),
-                4 => decode_pixels::<4>(&mapped, pending.surface.key.guest_address),
+            let mut shadow = pending
+                .surface
+                .guest_shadow
+                .lock()
+                .map_err(|_| "host GPU surface shadow lock poisoned")?;
+            let written_ranges = match key.format.bytes_per_pixel() {
+                2 => decode_pixels::<2>(
+                    key,
+                    &mapped[..pixel_bytes],
+                    &mapped[pixel_bytes..],
+                    &mut shadow,
+                ),
+                3 => decode_pixels::<3>(
+                    key,
+                    &mapped[..pixel_bytes],
+                    &mapped[pixel_bytes..],
+                    &mut shadow,
+                ),
+                4 => decode_pixels::<4>(
+                    key,
+                    &mapped[..pixel_bytes],
+                    &mapped[pixel_bytes..],
+                    &mut shadow,
+                ),
                 _ => unreachable!("checked surface format"),
             };
+            let readback = SurfaceReadback {
+                bytes: shadow.clone(),
+                written_ranges,
+            };
+            drop(shadow);
+            add_work(DeviceWorkCounter::GpuReadbackSurfaces, 1);
+            add_work(
+                DeviceWorkCounter::GpuReadbackPixels,
+                u64::from(key.extent.width) * u64::from(key.extent.height),
+            );
+            add_work(DeviceWorkCounter::GpuReadbackBytes, mapped.len() as u64);
             drop(mapped);
-            pending.download.unmap();
-            readbacks.push((pending.surface, readback));
+            download.unmap();
+            readbacks.push((Arc::clone(&pending.surface), readback));
         }
         Ok(readbacks)
     }
@@ -956,7 +1089,7 @@ impl Gpu {
             surface.key.extent.height,
             surface.key.extent.width,
             surface.key.extent.height,
-            surface.key.extent.width / TILE_SIDE,
+            surface.key.extent.width.div_ceil(TILE_SIDE),
             surface.key.format.bytes_per_pixel(),
             write_count,
             u32::from(surface.key.layout == SurfaceLayout::Morton8x8),
@@ -994,44 +1127,151 @@ impl Gpu {
     }
 }
 
-// Readbacks are already in guest pixel order. Coalesce masks as they arrive
-// rather than expanding a second byte-sized bitmap and scanning it again.
-fn decode_pixels<const BYTES: usize>(mapped: &[u8], address: u64) -> SurfaceReadback {
-    let mut bytes = vec![0; mapped.len() / 8 * BYTES];
+// Pixel words are in guest order; packed masks are grouped by image tiles.
+fn decode_pixels<const BYTES: usize>(
+    key: SurfaceKey,
+    pixels: &[u8],
+    masks: &[u8],
+    bytes: &mut Vec<u8>,
+) -> Vec<(u64, usize)> {
+    let width = key.extent.width as usize;
+    let height = key.extent.height as usize;
+    let pixel_count = width * height;
+    bytes.resize(pixel_count * BYTES, 0);
     let mut written_ranges = Vec::new();
     let mut open = None;
     let full = (1u32 << BYTES) - 1;
-    for (index, (record, pixel)) in mapped
-        .chunks_exact(8)
-        .zip(bytes.chunks_exact_mut(BYTES))
-        .enumerate()
-    {
-        pixel.copy_from_slice(&record[..BYTES]);
-        let mask = u32::from_le_bytes(record[4..8].try_into().unwrap()) & full;
-        let offset = index * BYTES;
-        if mask == full {
-            open.get_or_insert(offset);
-        } else if mask == 0 {
-            if let Some(start) = open.take() {
-                written_ranges.push((address + start as u64, offset - start));
+    match key.layout {
+        SurfaceLayout::Linear => {
+            let tiles_per_row = width.div_ceil(TILE_SIDE as usize);
+            for y in 0..height {
+                let tile_row = (y / TILE_SIDE as usize) * tiles_per_row;
+                let mask_group = y % TILE_SIDE as usize;
+                let mut x = 0;
+                while x < width {
+                    let tile_column = x / TILE_SIDE as usize;
+                    let run = (width - x).min(TILE_SIDE as usize - x % TILE_SIDE as usize);
+                    let pixel_start = y * width + x;
+                    let mask_index = (tile_row + tile_column) * TILE_SIDE as usize + mask_group;
+                    let mask_offset = mask_index * 4;
+                    let packed_masks =
+                        u32::from_le_bytes(masks[mask_offset..mask_offset + 4].try_into().unwrap());
+                    decode_pixel_run::<BYTES>(pixels, bytes, pixel_start, run);
+                    decode_write_mask_run::<BYTES>(
+                        key.guest_address,
+                        pixel_start,
+                        run,
+                        packed_masks,
+                        full,
+                        &mut open,
+                        &mut written_ranges,
+                    );
+                    x += run;
+                }
             }
-        } else {
-            for lane in 0..BYTES {
-                let at = offset + lane;
-                if mask & (1 << lane) != 0 {
-                    open.get_or_insert(at);
-                } else if let Some(start) = open.take() {
-                    written_ranges.push((address + start as u64, at - start));
+        }
+        SurfaceLayout::Morton8x8 => {
+            let tiles_per_row = width.div_ceil(TILE_SIDE as usize);
+            let tile_rows = height.div_ceil(TILE_SIDE as usize);
+            for tile in 0..tiles_per_row * tile_rows {
+                for row in 0..TILE_SIDE as usize {
+                    let pixel_start = tile * 64 + row * TILE_SIDE as usize;
+                    let mask_index = tile * TILE_SIDE as usize + row;
+                    let mask_offset = mask_index * 4;
+                    let packed_masks =
+                        u32::from_le_bytes(masks[mask_offset..mask_offset + 4].try_into().unwrap());
+                    decode_pixel_run::<BYTES>(pixels, bytes, pixel_start, TILE_SIDE as usize);
+                    decode_write_mask_run::<BYTES>(
+                        key.guest_address,
+                        pixel_start,
+                        TILE_SIDE as usize,
+                        packed_masks,
+                        full,
+                        &mut open,
+                        &mut written_ranges,
+                    );
                 }
             }
         }
     }
     if let Some(start) = open {
-        written_ranges.push((address + start as u64, bytes.len() - start));
+        written_ranges.push((key.guest_address + start as u64, bytes.len() - start));
     }
-    SurfaceReadback {
-        bytes,
-        written_ranges,
+    written_ranges
+}
+
+fn decode_pixel_run<const BYTES: usize>(
+    pixels: &[u8],
+    bytes: &mut [u8],
+    pixel_start: usize,
+    pixel_count: usize,
+) {
+    let pixel_end = pixel_start + pixel_count;
+    let source = &pixels[pixel_start * 4..pixel_end * 4];
+    let output = &mut bytes[pixel_start * BYTES..pixel_end * BYTES];
+    if BYTES == 4 {
+        output.copy_from_slice(source);
+    } else {
+        for (pixel_word, pixel) in source
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(output.as_chunks_mut::<BYTES>().0)
+        {
+            pixel.copy_from_slice(&pixel_word[..BYTES]);
+        }
+    }
+}
+
+fn decode_write_mask_run<const BYTES: usize>(
+    guest_address: u64,
+    pixel_start: usize,
+    pixel_count: usize,
+    packed_masks: u32,
+    full: u32,
+    open: &mut Option<usize>,
+    written_ranges: &mut Vec<(u64, usize)>,
+) {
+    let start = pixel_start * BYTES;
+    let active_nibbles = if pixel_count == 8 {
+        u32::MAX
+    } else {
+        (1u32 << (pixel_count * 4)) - 1
+    };
+    let full_nibbles = full * 0x1111_1111;
+    let masks = packed_masks & active_nibbles;
+    if masks == 0 {
+        if let Some(range_start) = open.take() {
+            written_ranges.push((guest_address + range_start as u64, start - range_start));
+        }
+        return;
+    }
+    if masks == (full_nibbles & active_nibbles) {
+        open.get_or_insert(start);
+        return;
+    }
+    for pixel in 0..pixel_count {
+        let mask = (packed_masks >> (pixel * 4)) & full;
+        let pixel_offset = (pixel_start + pixel) * BYTES;
+        if mask == full {
+            open.get_or_insert(pixel_offset);
+        } else if mask == 0 {
+            if let Some(range_start) = open.take() {
+                written_ranges.push((
+                    guest_address + range_start as u64,
+                    pixel_offset - range_start,
+                ));
+            }
+        } else {
+            for lane in 0..BYTES {
+                let at = pixel_offset + lane;
+                if mask & (1 << lane) != 0 {
+                    open.get_or_insert(at);
+                } else if let Some(range_start) = open.take() {
+                    written_ranges.push((guest_address + range_start as u64, at - range_start));
+                }
+            }
+        }
     }
 }
 
@@ -1071,6 +1311,7 @@ fn create_surface(key: SurfaceKey, pixel_count: usize, byte_len: usize, gpu: &Gp
         pixel_count,
         byte_len,
         guest_shadow: Mutex::new(Vec::new()),
+        readback_buffers: Mutex::new(Vec::new()),
     }
 }
 
@@ -1080,7 +1321,7 @@ fn validate_key(key: SurfaceKey, gpu: &Gpu) -> Result<(usize, usize), String> {
         return Err("host GPU surface extent must be nonzero".into());
     }
     if key.layout == SurfaceLayout::Morton8x8
-        && (extent.width % TILE_SIDE != 0 || extent.height % TILE_SIDE != 0)
+        && (!extent.width.is_multiple_of(TILE_SIDE) || !extent.height.is_multiple_of(TILE_SIDE))
     {
         return Err("host GPU Morton surface extent must be a multiple of 8 pixels".into());
     }
@@ -1098,7 +1339,7 @@ fn validate_key(key: SurfaceKey, gpu: &Gpu) -> Result<(usize, usize), String> {
     key.guest_address
         .checked_add(byte_len as u64)
         .ok_or("host GPU surface guest address overflow")?;
-    let storage_limit = gpu.device.limits().max_storage_buffer_binding_size as u64;
+    let storage_limit = gpu.device.limits().max_storage_buffer_binding_size;
     if byte_len as u64 > storage_limit
         || (pixel_count as u64) * 8 > storage_limit
         || (pixel_count as u64) * 4 > storage_limit
@@ -1210,31 +1451,170 @@ mod tests {
         height: 8,
     };
 
+    fn decode_pixels_reference<const BYTES: usize>(
+        key: SurfaceKey,
+        pixels: &[u8],
+        masks: &[u8],
+    ) -> SurfaceReadback {
+        let pixel_count = key.extent.width as usize * key.extent.height as usize;
+        let mut bytes = vec![0; pixel_count * BYTES];
+        let mut written_ranges = Vec::new();
+        let mut open = None;
+        let full = (1u32 << BYTES) - 1;
+        let tiles_per_row = key.extent.width.div_ceil(TILE_SIDE) as usize;
+        for (index, (pixel_word, pixel)) in pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(bytes.as_chunks_mut::<BYTES>().0)
+            .enumerate()
+        {
+            let pixel_word = u32::from_le_bytes(*pixel_word);
+            pixel.copy_from_slice(&pixel_word.to_le_bytes()[..BYTES]);
+            let (mask_word, lane) = match key.layout {
+                SurfaceLayout::Linear => {
+                    let width = key.extent.width as usize;
+                    let x = index % width;
+                    let y = index / width;
+                    let tile = (y / TILE_SIDE as usize) * tiles_per_row + x / TILE_SIDE as usize;
+                    let group = y % TILE_SIDE as usize;
+                    let lane = x % TILE_SIDE as usize;
+                    (tile * TILE_SIDE as usize + group, lane)
+                }
+                SurfaceLayout::Morton8x8 => {
+                    let tile = index / 64;
+                    let in_tile = index % 64;
+                    (tile * 8 + in_tile / 8, in_tile % 8)
+                }
+            };
+            let byte_offset = mask_word * 4;
+            let packed_masks =
+                u32::from_le_bytes(masks[byte_offset..byte_offset + 4].try_into().unwrap());
+            let mask = (packed_masks >> (lane * 4)) & full;
+            let offset = index * BYTES;
+            if mask == full {
+                open.get_or_insert(offset);
+            } else if mask == 0 {
+                if let Some(start) = open.take() {
+                    written_ranges.push((key.guest_address + start as u64, offset - start));
+                }
+            } else {
+                for lane in 0..BYTES {
+                    let at = offset + lane;
+                    if mask & (1 << lane) != 0 {
+                        open.get_or_insert(at);
+                    } else if let Some(start) = open.take() {
+                        written_ranges.push((key.guest_address + start as u64, at - start));
+                    }
+                }
+            }
+        }
+        if let Some(start) = open {
+            written_ranges.push((key.guest_address + start as u64, bytes.len() - start));
+        }
+        SurfaceReadback {
+            bytes,
+            written_ranges,
+        }
+    }
+
     #[test]
-    fn packed_readback_masks_match_byte_bitmap_for_all_pixel_sizes() {
-        fn check<const B: usize>() {
-            let mut mapped = Vec::new();
+    fn pixel_decode_matches_reference_and_reuses_output_for_masked_and_unmasked_surfaces() {
+        fn check<const BYTES: usize>(
+            layout: SurfaceLayout,
+            extent: SurfaceExtent,
+            mask_pattern: usize,
+        ) {
+            let key = SurfaceKey {
+                guest_address: 0x1234,
+                format: SurfaceFormat::Rgba8,
+                extent,
+                layout,
+            };
+            let tiles_per_row = key.extent.width.div_ceil(TILE_SIDE) as usize;
+            let tiles_per_column = key.extent.height.div_ceil(TILE_SIDE) as usize;
+            let mut pixels = Vec::new();
+            let mut packed_masks = vec![0u32; tiles_per_row * tiles_per_column * 8];
             let mut expected_bytes = Vec::new();
             let mut flags = Vec::new();
-            for index in 0..1024u32 {
-                let pixel = index.wrapping_mul(0x1234567).to_le_bytes();
-                let mask = match index % 64 {
-                    0..=15 => 0,
-                    16..=31 => 15,
-                    _ => index & 15,
+            for index in 0..key.extent.width as usize * key.extent.height as usize {
+                let pixel = (index as u32).wrapping_mul(0x1234567).to_le_bytes();
+                let mask = match mask_pattern {
+                    0 => 0,
+                    1 => 15,
+                    _ => match index % 64 {
+                        0..=15 => 0,
+                        16..=31 => 15,
+                        _ => index as u32 & 15,
+                    },
                 };
-                mapped.extend_from_slice(&pixel);
-                mapped.extend_from_slice(&mask.to_le_bytes());
-                expected_bytes.extend_from_slice(&pixel[..B]);
-                flags.extend((0..B).map(|lane| mask & (1 << lane) != 0));
+                pixels.extend_from_slice(&pixel);
+                expected_bytes.extend_from_slice(&pixel[..BYTES]);
+                flags.extend((0..BYTES).map(|lane| mask & (1 << lane) != 0));
+                let (tile, group, lane) = match layout {
+                    SurfaceLayout::Linear => {
+                        let width = key.extent.width as usize;
+                        let x = index % width;
+                        let y = index / width;
+                        let tile = (y / 8) * tiles_per_row + x / 8;
+                        (tile, y % 8, x % 8)
+                    }
+                    SurfaceLayout::Morton8x8 => {
+                        let in_tile = index % 64;
+                        let tile = index / 64;
+                        (tile, in_tile / 8, in_tile % 8)
+                    }
+                };
+                packed_masks[tile * 8 + group] |= (mask & 15) << (lane * 4);
             }
-            let actual = decode_pixels::<B>(&mapped, 0x1234);
-            assert_eq!(actual.bytes, expected_bytes);
-            assert_eq!(actual.written_ranges, byte_ranges(0x1234, &flags));
+            let masks: Vec<u8> = packed_masks
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect();
+            let expected = decode_pixels_reference::<BYTES>(key, &pixels, &masks);
+            let mut output = Vec::new();
+            let written_ranges = decode_pixels::<BYTES>(key, &pixels, &masks, &mut output);
+            let first_output = output.clone();
+            let allocation = output.as_ptr();
+            let reused_ranges = decode_pixels::<BYTES>(key, &pixels, &masks, &mut output);
+            assert_eq!(output.as_ptr(), allocation);
+            assert_eq!(output, expected_bytes);
+            assert_eq!(output, expected.bytes);
+            assert_eq!(first_output, expected.bytes);
+            assert_eq!(reused_ranges, written_ranges);
+            assert_eq!(written_ranges, expected.written_ranges);
+            assert_eq!(written_ranges, byte_ranges(key.guest_address, &flags));
         }
-        check::<2>();
-        check::<3>();
-        check::<4>();
+        for (layout, extents) in [
+            (
+                SurfaceLayout::Linear,
+                vec![
+                    SurfaceExtent {
+                        width: 13,
+                        height: 10,
+                    },
+                    SurfaceExtent {
+                        width: 16,
+                        height: 64,
+                    },
+                ],
+            ),
+            (
+                SurfaceLayout::Morton8x8,
+                vec![SurfaceExtent {
+                    width: 16,
+                    height: 64,
+                }],
+            ),
+        ] {
+            for extent in extents {
+                for mask_pattern in 0..3 {
+                    check::<2>(layout, extent, mask_pattern);
+                    check::<3>(layout, extent, mask_pattern);
+                    check::<4>(layout, extent, mask_pattern);
+                }
+            }
+        }
     }
 
     fn context_or_skip() -> Option<&'static GpuContext> {
@@ -1452,6 +1832,17 @@ mod tests {
         let resident = context.get_or_create_target(key, Some(&changed)).unwrap();
         assert!(Arc::ptr_eq(&first, &resident));
         assert_eq!(context.readback(key).unwrap().bytes, changed);
+        assert_eq!(context.readback(key).unwrap().bytes, changed);
+        assert_eq!(
+            first
+                .readback_buffers
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|slot| slot.is_some())
+                .count(),
+            1
+        );
     }
 
     #[test]

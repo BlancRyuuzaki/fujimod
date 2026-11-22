@@ -1,9 +1,10 @@
 import type { CardEntry } from 'fujimod/emulator';
 import type { JSX } from '@solidjs/web';
-import { Show, createSignal } from 'solid-js';
+import { createSignal } from 'solid-js';
 import type { SessionState } from './session/state';
 import type { SessionController } from './session/controller';
 import type { DevicePanel } from './ui/layout';
+import { PowerOff } from './viewer/PowerOff';
 import { ViewerOverlays } from './viewer/Overlays';
 import { LoadingAssets } from './LoadingAssets';
 import { Controls } from './ui/controls';
@@ -63,6 +64,10 @@ export function EmulatorWorkspace(props: {
           height="480"
         />
         <ViewerOverlays viewer={props.runtime?.viewer} />
+        <PowerOff
+          visible={props.state.poweredOn === false && !props.state.loading && !props.state.fault}
+          turnOn={() => void props.runtime?.turnOn()}
+        />
         <div class="ghost" aria-hidden="true" />
         {props.toolbar}
         {props.children}

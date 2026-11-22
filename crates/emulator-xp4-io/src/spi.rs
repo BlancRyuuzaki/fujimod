@@ -1,11 +1,14 @@
 //! XP4 synchronous serial FIFO. The input pin is explicit; this does not
 //! implement a companion protocol.
-use fujimod_emulator_devices::{Cx, Device, Record, Value as Field};
+use fujimod_emulator_devices::{Cx, Device, Record, Value as Field, checkpoint::Checkpoint};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 
 pub trait Input: Send {
     fn exchange(&mut self, bits: u32, tx: u16, tick: u64) -> Result<u16, String>;
+    fn checkpoint(&self) -> Result<Checkpoint, String>;
+    fn validate_checkpoint(&self, data: &Checkpoint) -> Result<(), String>;
+    fn restore_checkpoint(&mut self, data: &Checkpoint) -> Result<(), String>;
     fn save(&self) -> Value;
     fn restore(&mut self, value: &Value) -> Result<(), String>;
 }
@@ -13,6 +16,18 @@ pub struct FixedPin(pub bool);
 impl Input for FixedPin {
     fn exchange(&mut self, bits: u32, _: u16, _: u64) -> Result<u16, String> {
         Ok(if self.0 { u16::MAX >> (16 - bits) } else { 0 })
+    }
+    fn checkpoint(&self) -> Result<Checkpoint, String> {
+        Checkpoint::encode("xp4-spi-fixed-pin", &self.0)
+    }
+    fn validate_checkpoint(&self, data: &Checkpoint) -> Result<(), String> {
+        if data.decode::<bool>("xp4-spi-fixed-pin")? != self.0 {
+            return Err("XP4 SPI fixed pin differs".into());
+        }
+        Ok(())
+    }
+    fn restore_checkpoint(&mut self, data: &Checkpoint) -> Result<(), String> {
+        self.validate_checkpoint(data)
     }
     fn save(&self) -> Value {
         json!({"kind":"fixed-pin", "miso":self.0})
@@ -162,6 +177,159 @@ impl Spi {
         Ok(0)
     }
 }
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpiState<T> {
+    base: u64,
+    input: T,
+    control: u32,
+    enable: u32,
+    divider: u32,
+    causes: u32,
+    tx: VecDeque<u16>,
+    rx: VecDeque<u16>,
+    pending: Option<(u64, u64, u16, u32)>,
+    generation: u64,
+}
+
+impl Spi {
+    fn capture<T>(&self, input: T) -> SpiState<T> {
+        SpiState {
+            base: self.base, input, control: self.control, enable: self.enable, divider: self.divider,
+            causes: self.causes, tx: self.tx.clone(), rx: self.rx.clone(), pending: self.pending,
+            generation: self.generation,
+        }
+    }
+
+    fn validate<T>(&self, state: &SpiState<T>) -> Result<(), String> {
+        if state.base != self.base
+            || state.control & !0xffcf != 0
+            || state.enable & !0xb != 0
+            || state.tx.len() > 8
+            || state.rx.len() > 8
+            || state.causes & !1 != 0
+            || state.pending.is_some_and(|(_, token, _, bits)| {
+                token != state.generation
+                    || state.enable & 2 == 0
+                    || state.divider == 0
+                    || bits != (state.control & 15) + 1
+            })
+        {
+            return Err("Invalid XP4 SPI checkpoint or base".into());
+        }
+        Ok(())
+    }
+
+    fn apply<T>(&mut self, state: SpiState<T>) -> Result<(), String> {
+        self.control = state.control;
+        self.enable = state.enable;
+        self.divider = state.divider;
+        self.causes = state.causes;
+        self.tx = state.tx;
+        self.rx = state.rx;
+        self.pending = state.pending;
+        self.generation = state.generation;
+        Ok(())
+    }
+}
+
+impl Device for Spi {
+    fn name(&self) -> &'static str {
+        match self.base {
+            0xfff32000 => "xp4-spi0",
+            0xfff33000 => "xp4-spi1",
+            0xfff34000 => "xp4-spi2",
+            0xfff35000 => "xp4-spi3",
+            0xfff36000 => "xp4-spi4",
+            0xfff37000 => "xp4-spi5",
+            0xfff38000 => "xp4-spi6",
+            _ => "xp4-spi",
+        }
+    }
+    fn read(&mut self, cx: &mut Cx<'_>, address: u64, size: u8) -> u64 {
+        match self.access(cx, address, size, false, 0) {
+            Ok(v) => v,
+            Err(e) => {
+                cx.fail(e);
+                0
+            }
+        }
+    }
+    fn write(&mut self, cx: &mut Cx<'_>, address: u64, size: u8, value: u64) {
+        if let Err(e) = self.access(cx, address, size, true, value as u32) {
+            cx.fail(e);
+        }
+    }
+    fn next_deadline(&self, _now: u64) -> Option<u64> {
+        self.pending.map(|p| p.0)
+    }
+    fn event(&mut self, cx: &mut Cx<'_>, token: u64) {
+        let Some((at, generation, tx, bits)) = self.pending else {
+            return;
+        };
+        if generation != token || cx.now() < at {
+            return;
+        }
+        self.pending = None;
+        if self.rx.len() == 8 {
+            cx.fail("XP4 SPI receive FIFO overflow");
+            return;
+        }
+        let mask = u16::MAX >> (16 - bits);
+        let rx = if self.enable & 1 != 0 {
+            tx & mask
+        } else {
+            match self.input.exchange(bits, tx & mask, at) {
+                Ok(value) => value & mask,
+                Err(error) => {
+                    cx.fail(error);
+                    return;
+                }
+            }
+        };
+        self.rx.push_back(rx);
+        self.causes |= 1;
+        cx.record(Record::new(
+            "XP4 SPI word complete",
+            [
+                ("base", Field::int(self.base)),
+                ("tx", Field::int(tx & mask)),
+                ("rx", Field::int(rx)),
+                ("bits", Field::int(bits)),
+                ("tick", Field::int(at)),
+            ],
+        ));
+        self.start_at(cx, at);
+    }
+    fn save(&self) -> Value {
+        json!({"base":self.base,"input":self.input.save(),"control":self.control,"enable":self.enable,
+            "divider":self.divider,"causes":self.causes,"tx":self.tx,"rx":self.rx,"pending":self.pending,
+            "generation":self.generation})
+    }
+    fn checkpoint(&self) -> Result<Checkpoint, String> {
+        Ok(Checkpoint::encode(self.name(), &self.capture(()))?.with_children(vec![self.input.checkpoint()?]))
+    }
+    fn validate_checkpoint(&self, data: &Checkpoint) -> Result<(), String> {
+        let state: SpiState<()> = data.decode(self.name())?;
+        self.validate(&state)?;
+        let [input] = data.children() else {
+            return Err("XP4 SPI checkpoint requires one input".into());
+        };
+        self.input.validate_checkpoint(input)
+    }
+    fn restore_checkpoint(&mut self, data: &Checkpoint) -> Result<(), String> {
+        self.validate_checkpoint(data)?;
+        let state: SpiState<()> = data.decode(self.name())?;
+        self.input.restore_checkpoint(&data.children()[0])?;
+        self.apply(state)
+    }
+    fn restore(&mut self, value: &Value) -> Result<(), String> {
+        let state: SpiState<Value> = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+        self.validate(&state)?;
+        self.input.restore(&state.input)?;
+        self.apply(state)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -267,121 +435,5 @@ mod tests {
             outcomes.push((m.save(), h.records));
         }
         assert_eq!(outcomes[0], outcomes[1]);
-    }
-}
-impl Device for Spi {
-    fn name(&self) -> &'static str {
-        match self.base {
-            0xfff32000 => "xp4-spi0",
-            0xfff33000 => "xp4-spi1",
-            0xfff34000 => "xp4-spi2",
-            0xfff35000 => "xp4-spi3",
-            0xfff36000 => "xp4-spi4",
-            0xfff37000 => "xp4-spi5",
-            0xfff38000 => "xp4-spi6",
-            _ => "xp4-spi",
-        }
-    }
-    fn read(&mut self, cx: &mut Cx<'_>, address: u64, size: u8) -> u64 {
-        match self.access(cx, address, size, false, 0) {
-            Ok(v) => v,
-            Err(e) => {
-                cx.fail(e);
-                0
-            }
-        }
-    }
-    fn write(&mut self, cx: &mut Cx<'_>, address: u64, size: u8, value: u64) {
-        if let Err(e) = self.access(cx, address, size, true, value as u32) {
-            cx.fail(e);
-        }
-    }
-    fn next_deadline(&self, _now: u64) -> Option<u64> {
-        self.pending.map(|p| p.0)
-    }
-    fn event(&mut self, cx: &mut Cx<'_>, token: u64) {
-        let Some((at, generation, tx, bits)) = self.pending else {
-            return;
-        };
-        if generation != token || cx.now() < at {
-            return;
-        }
-        self.pending = None;
-        if self.rx.len() == 8 {
-            cx.fail("XP4 SPI receive FIFO overflow");
-            return;
-        }
-        let mask = u16::MAX >> (16 - bits);
-        let rx = if self.enable & 1 != 0 {
-            tx & mask
-        } else {
-            match self.input.exchange(bits, tx & mask, at) {
-                Ok(value) => value & mask,
-                Err(error) => {
-                    cx.fail(error);
-                    return;
-                }
-            }
-        };
-        self.rx.push_back(rx);
-        self.causes |= 1;
-        cx.record(Record::new(
-            "XP4 SPI word complete",
-            [
-                ("base", Field::int(self.base)),
-                ("tx", Field::int(tx & mask)),
-                ("rx", Field::int(rx)),
-                ("bits", Field::int(bits)),
-                ("tick", Field::int(at)),
-            ],
-        ));
-        self.start_at(cx, at);
-    }
-    fn save(&self) -> Value {
-        json!({"base":self.base,"input":self.input.save(),"control":self.control,"enable":self.enable,
-            "divider":self.divider,"causes":self.causes,"tx":self.tx,"rx":self.rx,"pending":self.pending,
-            "generation":self.generation})
-    }
-    fn restore(&mut self, value: &Value) -> Result<(), String> {
-        #[derive(serde::Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct State {
-            base: u64,
-            input: Value,
-            control: u32,
-            enable: u32,
-            divider: u32,
-            causes: u32,
-            tx: VecDeque<u16>,
-            rx: VecDeque<u16>,
-            pending: Option<(u64, u64, u16, u32)>,
-            generation: u64,
-        }
-        let state: State = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
-        if state.base != self.base
-            || state.control & !0xffcf != 0
-            || state.enable & !0xb != 0
-            || state.tx.len() > 8
-            || state.rx.len() > 8
-            || state.causes & !1 != 0
-            || state.pending.is_some_and(|(_, token, _, bits)| {
-                token != state.generation
-                    || state.enable & 2 == 0
-                    || state.divider == 0
-                    || bits != (state.control & 15) + 1
-            })
-        {
-            return Err("Invalid XP4 SPI checkpoint or base".into());
-        }
-        self.input.restore(&state.input)?;
-        self.control = state.control;
-        self.enable = state.enable;
-        self.divider = state.divider;
-        self.causes = state.causes;
-        self.tx = state.tx;
-        self.rx = state.rx;
-        self.pending = state.pending;
-        self.generation = state.generation;
-        Ok(())
     }
 }

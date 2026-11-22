@@ -1,4 +1,5 @@
 //! Caller-described XP5 graphs shared by language bindings.
+use fujimod_catalog_configuration::RunEngine;
 use crate::{board, boot, session::Inputs};
 use fujimod_emulator::board::{InterruptMap, InterruptRegisters, aprofile, bus::Mode, factory};
 use fujimod_emulator_cpu::{Model, arm64};
@@ -12,12 +13,24 @@ use fujimod_emulator_parts_controls::{
 };
 use fujimod_emulator_xp5_display::display;
 use fujimod_emulator_xp5_io::mailbox;
-use fujimod_emulator_xp5_storage::flash_storage;
+use fujimod_emulator_xp5_storage::{flash_storage, nand_storage};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
 };
+
+/// The flash-storage window's `medium` option selects the backing device
+/// enum; serial-NAND (X-E5) is die-backed and takes no seeds.
+pub fn storage_medium(windows: &[DeviceWindow]) -> String {
+    windows
+        .iter()
+        .find(|w| w.kind == "flash-storage")
+        .and_then(|w| w.options.get("medium"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or("nor")
+        .to_owned()
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -170,7 +183,7 @@ impl Definition {
         self,
         graph: factory::Graph,
         assets: &BTreeMap<String, Vec<u8>>,
-        engine: factory::Engine,
+        engine: RunEngine,
         mode: Mode,
         definition: serde_json::Value,
     ) -> Result<(fujimod_emulator_session::Session, Inputs), String> {
@@ -203,12 +216,19 @@ impl Definition {
             (None, Some(options)) => Some(ControlsOptions::LadderKeys(options)),
             (None, None) => None,
         };
+        let medium = storage_medium(&windows);
         let storage = storage
             .map(|name| {
                 let bytes = assets
                     .get(&name)
                     .ok_or_else(|| format!("Missing XP5 storage asset {name}"))?;
-                flash_storage::Storage::new(bytes.clone()).map(|s| Arc::new(Mutex::new(s)))
+                match medium.as_str() {
+                    "nor" => flash_storage::Storage::new(bytes.clone())
+                        .map(|s| flash_storage::Medium::Nor(Arc::new(Mutex::new(s)))),
+                    "serial-nand" => nand_storage::NandStorage::new(bytes.clone())
+                        .map(|s| flash_storage::Medium::Nand(Arc::new(Mutex::new(s)))),
+                    other => Err(format!("unknown flash storage medium {other}")),
+                }
             })
             .transpose()?;
         let resources = board::Resources {
@@ -233,6 +253,7 @@ impl Definition {
                 .into_iter()
                 .map(Display::config)
                 .collect::<Result<_, _>>()?,
+            pwm: Default::default(),
         };
         boot::open(boot::OpenOptions {
             definition,
@@ -291,7 +312,7 @@ mod tests {
             .open(
                 graph(),
                 &BTreeMap::new(),
-                factory::Engine::Unicorn,
+                RunEngine::Unicorn,
                 Mode::Strict,
                 value,
             )
@@ -323,7 +344,7 @@ mod tests {
 
     fn open(value: serde_json::Value) -> Result<(fujimod_emulator_session::Session, Inputs), String> {
         let definition: Definition = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
-        definition.open(graph(), &BTreeMap::new(), factory::Engine::Unicorn, Mode::Strict, value)
+        definition.open(graph(), &BTreeMap::new(), RunEngine::Unicorn, Mode::Strict, value)
     }
 
     // Synthetic ladder fixture: the band and sample are test inputs.
@@ -373,7 +394,7 @@ mod tests {
                 .open(
                     graph(),
                     &BTreeMap::new(),
-                    factory::Engine::Unicorn,
+                    RunEngine::Unicorn,
                     Mode::Strict,
                     value
                 )
@@ -390,7 +411,7 @@ mod tests {
                 .open(
                     graph(),
                     &BTreeMap::new(),
-                    factory::Engine::Unicorn,
+                    RunEngine::Unicorn,
                     Mode::Strict,
                     value
                 )

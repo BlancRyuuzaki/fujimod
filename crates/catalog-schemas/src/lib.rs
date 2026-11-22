@@ -77,9 +77,45 @@ pub fn generated_documents() -> BTreeMap<&'static str, Value> {
         schema::<fujimod_catalog_bulk::FirmwareBulk>(fujimod_catalog_bulk::BULK_SCHEMA_URI),
     );
     documents.insert(
+        "execution.generated.schema.json",
+        schema::<fujimod_catalog_execution::FirmwareExecution>(
+            fujimod_catalog_execution::EXECUTION_SCHEMA_URI,
+        ),
+    );
+    documents.insert(
         "restart.generated.schema.json",
         schema::<fujimod_catalog_restart::FirmwareRestart>(
             fujimod_catalog_restart::RESTART_SCHEMA_URI,
+        ),
+    );
+    documents.insert(
+        "memory-reservations.generated.schema.json",
+        schema::<fujimod_catalog_memory_reservations::FirmwareMemoryReservations>(
+            fujimod_catalog_memory_reservations::MEMORY_RESERVATIONS_SCHEMA_URI,
+        ),
+    );
+    documents.insert(
+        "sd-boot-v2-autostart.generated.schema.json",
+        schema::<fujimod_catalog::nand_boot::FirmwareNandBoot>(
+            fujimod_catalog::nand_boot::NAND_BOOT_SCHEMA_URI,
+        ),
+    );
+    documents.insert(
+        "boot-patch.generated.schema.json",
+        schema::<fujimod_catalog::boot_patch::FirmwareBootPatch>(
+            fujimod_catalog::boot_patch::BOOT_PATCH_SCHEMA_URI,
+        ),
+    );
+    documents.insert(
+        "boot-rom.generated.schema.json",
+        schema::<fujimod_catalog::boot_rom::BootRom>(
+            fujimod_catalog::boot_rom::BOOT_ROM_SCHEMA_URI,
+        ),
+    );
+    documents.insert(
+        "exr2-boot-identity.generated.schema.json",
+        schema::<fujimod_catalog::boot_identity::Exr2BootIdentity>(
+            fujimod_catalog::boot_identity::EXR2_BOOT_IDENTITY_SCHEMA_URI,
         ),
     );
     documents.insert(
@@ -224,10 +260,10 @@ fn schema<T: JsonSchema>(id: &str) -> Value {
         .as_object_mut()
         .expect("schemars root schema is a JSON object");
     object.insert("$id".into(), Value::String(id.into()));
-    if let Some(Value::Object(properties)) = object.get_mut("properties") {
-        if properties.contains_key("$schema") {
-            properties.insert("$schema".into(), schema_uri_property(id));
-        }
+    if let Some(Value::Object(properties)) = object.get_mut("properties")
+        && properties.contains_key("$schema")
+    {
+        properties.insert("$schema".into(), schema_uri_property(id));
     }
     document
 }

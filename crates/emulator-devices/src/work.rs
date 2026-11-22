@@ -29,6 +29,7 @@ impl Pool {
                     .name(format!("device-{index}"))
                     .stack_size(4 * 1024 * 1024)
                     .spawn(move || {
+                        fujimod_perf::worker_thread();
                         loop {
                             let task = receiver.lock().unwrap().recv();
                             match task {
@@ -97,9 +98,12 @@ impl<T: Send + Sync + 'static> Job<T> {
             };
         };
         let (complete, receiver) = mpsc::channel();
+        let context = fujimod_perf::capture_context();
         sender
             .send(Box::new(move || {
-                let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(compute))
+                let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    fujimod_perf::run_on_worker(context, compute)
+                }))
                     .map_err(|_| "device computation panicked".to_owned());
                 // Cancellation/rollback can discard the receiver. The calculation
                 // owns its inputs and its discarded output cannot reach guest RAM.
@@ -391,7 +395,7 @@ mod tests {
                     out[local_y * 1024] = 7;
                 }
             });
-            for row in bytes.chunks_exact(1024) {
+            for row in bytes.as_chunks::<1024>().0 {
                 assert_eq!(row[0], 7);
                 assert!(row[1..].iter().all(|&v| v == 0));
             }

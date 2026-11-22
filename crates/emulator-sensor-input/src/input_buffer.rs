@@ -1,6 +1,7 @@
 //! Input-buffer write-select enables, frame causes and statistics DMA.
 //! Processor wiring supplies the CSR layout, supported outputs and frame clock.
 use super::statistics::{Planes, Statistics};
+use fujimod_emulator_devices::checkpoint::Checkpoint;
 use fujimod_emulator_devices::{Cx, Device};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -19,6 +20,9 @@ pub struct Output {
     pub columns: usize,
     pub rows: usize,
     pub planes: Planes,
+    /// Registers holding the x and y words of a focus statistics window
+    /// ([`crate::statistics::FocusWindow`]); `None` measures the full-frame grid.
+    pub window: Option<(u64, u64)>,
 }
 #[derive(Clone)]
 pub struct Wiring {
@@ -55,8 +59,29 @@ pub struct InputBuffer {
     state: Arc<Mutex<State>>,
     wiring: Wiring,
     statistics: Option<Statistics>,
+    /// Bring-up option: aligned words outside the wired register map read back their last
+    /// write (kept in `State::regs`, so they are part of the checkpoint).
+    retain_window: bool,
+    /// The sensor whose frames a free-running clock (`Wiring::period_ticks`) follows.
+    frame_clock: Option<crate::sensor::Sensor>,
 }
 impl InputBuffer {
+    /// Let every aligned word of the 4 KiB window beyond the wired register map read back its
+    /// last write (0 before any write) instead of stopping as unmodeled.
+    pub fn with_retained_window(mut self) -> Self {
+        self.retain_window = true;
+        self
+    }
+    /// Let the free-running frame clock follow the sensor's frame length
+    /// ([`crate::sensor::Sensor::frame_ticks`]): each frame of statistics ends one sensor
+    /// frame after the previous one, in a decoded readout as in the stand-in period.
+    pub fn with_frame_clock(mut self, sensor: crate::sensor::Sensor) -> Self {
+        self.frame_clock = Some(sensor);
+        self
+    }
+    fn retains(&self, o: u64, n: u8) -> bool {
+        self.retain_window && n == 4 && o & 3 == 0 && o < 0x1000 && o > self.wiring.write_limit
+    }
     pub fn set_statistics(&mut self, statistics: Statistics) {
         self.statistics = Some(statistics);
     }
@@ -78,6 +103,8 @@ impl InputBuffer {
             state: Arc::default(),
             wiring,
             statistics,
+            retain_window: false,
+            frame_clock: None,
         })
     }
     fn irq(&self, s: &State, cx: &mut Cx<'_>) {
@@ -104,7 +131,16 @@ impl InputBuffer {
                     self.statistics
                         .as_ref()
                         .ok_or("input-buffer output has no statistics source")?
-                        .complete(cx, address, output.columns, output.rows, output.planes)?;
+                        .complete(
+                            cx,
+                            address,
+                            output.columns,
+                            output.rows,
+                            output.planes,
+                            output.window.and_then(|(x, y)| {
+                                crate::statistics::FocusWindow::from_words(s.r(x), s.r(y))
+                            }),
+                        )?;
                 }
             }
         }
@@ -116,6 +152,10 @@ impl InputBuffer {
     }
     fn schedule(&self, s: &mut State, cx: &mut Cx<'_>, anchor: u64) {
         if let Some(period) = self.wiring.period_ticks {
+            let period = self
+                .frame_clock
+                .as_ref()
+                .map_or(period, |sensor| sensor.frame_ticks(period));
             let Some(at) = anchor.checked_add(period) else {
                 cx.fail("input-buffer deadline overflow");
                 return;
@@ -132,6 +172,9 @@ impl Device for InputBuffer {
     fn read(&mut self, cx: &mut Cx<'_>, address: u64, n: u8) -> u64 {
         self.advance(cx);
         let o = address.wrapping_sub(self.wiring.base);
+        if self.retains(o, n) && o > self.wiring.max_offset {
+            return u64::from(self.state.lock().unwrap().r(o));
+        }
         if n != 4 || o & 3 != 0 || o > self.wiring.max_offset {
             cx.unmodeled();
             return 0;
@@ -153,6 +196,10 @@ impl Device for InputBuffer {
     fn write(&mut self, cx: &mut Cx<'_>, address: u64, n: u8, value: u64) {
         self.advance(cx);
         let o = address.wrapping_sub(self.wiring.base);
+        if self.retains(o, n) && o != self.wiring.ready {
+            self.state.lock().unwrap().regs.insert(o, value as u32);
+            return;
+        }
         if n != 4 || o & 3 != 0 || o > self.wiring.max_offset {
             cx.unmodeled();
             return;
@@ -241,6 +288,21 @@ impl Device for InputBuffer {
         let s = self.state.lock().unwrap();
         s.deadline.into_iter().chain(s.reset_deadline).min()
     }
+    fn checkpoint(&self) -> Result<Checkpoint, String> {
+        Checkpoint::encode(self.name(), &*self.state.lock().unwrap())
+    }
+    fn validate_checkpoint(&self, saved: &Checkpoint) -> Result<(), String> {
+        let state: State = saved.decode(self.name())?;
+        if state.deadline.is_some() && (!state.armed || self.wiring.period_ticks.is_none()) {
+            return Err("input-buffer clock/deadline disagree".into());
+        }
+        Ok(())
+    }
+    fn restore_checkpoint(&mut self, saved: &Checkpoint) -> Result<(), String> {
+        self.validate_checkpoint(saved)?;
+        *self.state.lock().unwrap() = saved.decode(self.name())?;
+        Ok(())
+    }
     fn save(&self) -> Value {
         serde_json::json!({"state":*self.state.lock().unwrap()})
     }
@@ -284,6 +346,7 @@ mod tests {
                         columns: 16,
                         rows: 16,
                         planes: Planes::Rgb,
+                        window: None,
                     }],
                     reset_ticks: 8,
                     period_ticks: None,
@@ -291,8 +354,10 @@ mod tests {
                 Some(statistics.clone()),
             )
             .unwrap();
-            let mut host = RecordingHost::default();
-            host.now = 10;
+            let mut host = RecordingHost {
+                now: 10,
+                ..Default::default()
+            };
             input.write(&mut Cx::new(&mut host, cpu, pc, 0), 0x200000, 4, 0);
             assert_eq!(input.next_deadline(10), Some(18));
             let saved = input.save();

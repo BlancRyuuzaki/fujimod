@@ -1,6 +1,6 @@
 //! Immutable page versions with conservative engine/DMA dirty tracking.
 //! Keyframes never alias mutable guest backing. Only flagged pages are read
-//! after an initial capture; equal or zero candidates retain shared pages.
+//! after an initial capture; equal or uniform candidates retain shared pages.
 use crate::BackingObserver;
 mod checkpoint;
 use std::{
@@ -12,10 +12,21 @@ use std::{
 
 pub const PAGE_BYTES: usize = 4096;
 type Page = [u8; PAGE_BYTES];
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Image {
     len: usize,
     pages: Arc<[Arc<Page>]>,
+}
+impl PartialEq for Image {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len
+            && self.pages.len() == other.pages.len()
+            && self
+                .pages
+                .iter()
+                .zip(other.pages.iter())
+                .all(|(left, right)| Arc::ptr_eq(left, right) || left == right)
+    }
 }
 /// Stable bitmap allocation retained until every observing processor is gone.
 /// Native processor threads and the owner may flag pages concurrently.
@@ -24,9 +35,33 @@ pub struct Tracker {
     dirty: Box<[AtomicU64]>,
     base: RefCell<Option<Image>>,
 }
-fn zero() -> &'static Arc<Page> {
-    static ZERO: OnceLock<Arc<Page>> = OnceLock::new();
-    ZERO.get_or_init(|| Arc::new([0; PAGE_BYTES]))
+/// The shared page holding `byte` in every cell. Untouched RAM keeps its
+/// power-on fill, so most pages of a fresh machine are one of these.
+fn uniform(byte: u8) -> &'static Arc<Page> {
+    static PAGES: [OnceLock<Arc<Page>>; 256] = [const { OnceLock::new() }; 256];
+    PAGES[byte as usize].get_or_init(|| Arc::new([byte; PAGE_BYTES]))
+}
+/// The byte every cell of `bytes` holds, if they are all equal.
+fn uniform_byte(bytes: &[u8]) -> Option<u8> {
+    let (&first, rest) = bytes.split_first()?;
+    rest.iter().all(|&byte| byte == first).then_some(first)
+}
+/// A retained copy of one page: the previous version when unchanged, a
+/// shared uniform page, or a new copy.
+fn retain(old: Option<&Arc<Page>>, bytes: &[u8]) -> Arc<Page> {
+    if let Some(old) = old.filter(|p| p[..bytes.len()] == *bytes) {
+        return old.clone();
+    }
+    if let Some(byte) = uniform_byte(bytes) {
+        return uniform(byte).clone();
+    }
+    let mut page = [0; PAGE_BYTES];
+    page[..bytes.len()].copy_from_slice(bytes);
+    fujimod_perf::add_bytes(
+        fujimod_perf::ByteCounter::CheckpointPagesCopied,
+        bytes.len() as u64,
+    );
+    Arc::new(page)
 }
 impl Image {
     pub fn len(&self) -> usize {
@@ -44,6 +79,12 @@ impl Image {
             .zip(other.pages.iter())
             .filter(|(a, b)| Arc::ptr_eq(a, b))
             .count()
+    }
+    /// One page's retained bytes, trimmed to the image's final partial page.
+    pub fn page(&self, index: usize) -> Option<&[u8]> {
+        let page = self.pages.get(index)?;
+        let offset = index.checked_mul(PAGE_BYTES)?;
+        Some(&page[..(self.len.saturating_sub(offset)).min(PAGE_BYTES)])
     }
 }
 impl Tracker {
@@ -78,6 +119,19 @@ impl Tracker {
     fn dirty(&self, page: usize) -> bool {
         self.dirty[page / 64].load(Ordering::Relaxed) & (1 << (page % 64)) != 0
     }
+    /// Take a backing that holds `byte` in every cell as the first keyframe,
+    /// so the next capture reads only flagged pages. Untouched pages stay
+    /// unread: on Apple systems even reading a fresh page makes it resident.
+    /// Every write since the backing was filled must have been flagged.
+    pub fn assume_uniform(&self, byte: u8) {
+        let page = uniform(byte);
+        self.set_base(&Image {
+            len: self.len,
+            pages: (0..self.len.div_ceil(PAGE_BYTES))
+                .map(|_| page.clone())
+                .collect(),
+        });
+    }
     fn set_base(&self, image: &Image) {
         for flag in self.dirty.iter() {
             flag.store(0, Ordering::Relaxed);
@@ -92,7 +146,6 @@ impl Tracker {
     pub unsafe fn capture(&self, pointer: *const u8) -> Image {
         let previous = self.base.borrow();
         let mut pages = Vec::with_capacity(self.len.div_ceil(PAGE_BYTES));
-        let zero_page = zero();
         for offset in (0..self.len).step_by(PAGE_BYTES) {
             let index = offset / PAGE_BYTES;
             let size = PAGE_BYTES.min(self.len - offset);
@@ -102,16 +155,30 @@ impl Tracker {
                 continue;
             }
             let bytes = unsafe { std::slice::from_raw_parts(pointer.add(offset), size) };
-            let page = if let Some(old) = old.filter(|p| p[..size] == *bytes) {
-                old.clone()
-            } else if bytes == &zero_page[..size] {
-                zero_page.clone()
-            } else {
-                let mut page = [0; PAGE_BYTES];
-                page[..size].copy_from_slice(bytes);
-                Arc::new(page)
-            };
-            pages.push(page);
+            pages.push(retain(old, bytes));
+        }
+        let image = Image {
+            len: self.len,
+            pages: pages.into(),
+        };
+        drop(previous);
+        self.set_base(&image);
+        image
+    }
+
+    /// Read every page, reusing an equal previous page or a shared uniform
+    /// page. Host writes that bypass dirty tracking are still observed.
+    /// # Safety
+    /// Every page is readable at `pointer`; all CPUs are stopped.
+    pub unsafe fn capture_all(&self, pointer: *const u8) -> Image {
+        let previous = self.base.borrow();
+        let mut pages = Vec::with_capacity(self.len.div_ceil(PAGE_BYTES));
+        for offset in (0..self.len).step_by(PAGE_BYTES) {
+            let index = offset / PAGE_BYTES;
+            let size = PAGE_BYTES.min(self.len - offset);
+            let old = previous.as_ref().and_then(|p| p.pages.get(index));
+            let bytes = unsafe { std::slice::from_raw_parts(pointer.add(offset), size) };
+            pages.push(retain(old, bytes));
         }
         let image = Image {
             len: self.len,
@@ -146,6 +213,10 @@ impl Tracker {
                 continue;
             }
             unsafe { std::ptr::copy_nonoverlapping(page.as_ptr(), pointer.add(offset), size) };
+            fujimod_perf::add_bytes(
+                fujimod_perf::ByteCounter::CheckpointPagesCopied,
+                size as u64,
+            );
             if let Some((start, bytes)) = changed.last_mut()
                 && *start + *bytes == offset
             {
@@ -162,6 +233,21 @@ impl Tracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_uniform_backing_reads_only_flagged_pages_at_its_first_capture() {
+        let mut ram = vec![0xff; PAGE_BYTES * 2 + 7];
+        let tracker = Tracker::new(ram.len());
+        tracker.assume_uniform(0xff);
+        ram[1] = 1;
+        ram[PAGE_BYTES * 2 + 6] = 2;
+        tracker.mark(PAGE_BYTES * 2 + 6, 1).unwrap();
+        let image = unsafe { tracker.capture(ram.as_ptr()) };
+        // The unflagged first page was never read.
+        assert!(Arc::ptr_eq(&image.pages[0], uniform(0xff)));
+        assert!(Arc::ptr_eq(&image.pages[1], uniform(0xff)));
+        assert_eq!(image.page(2).unwrap()[6], 2);
+        assert_eq!(image.page(2).unwrap().len(), 7);
+    }
     #[test]
     fn dirty_versions_share_pages_restore_branches_and_track_partial_pages() {
         let mut ram = vec![0; PAGE_BYTES * 3 + 7];

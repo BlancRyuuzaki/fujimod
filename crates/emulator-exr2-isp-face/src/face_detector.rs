@@ -2,20 +2,35 @@
 //!
 //! Configuration values follow the declared register fields. Per-channel
 //! DMA accepts the inactive clear/poll/setup sequence with zeroed
-//! initial status as an explicit unmeasured assumption. Detections, DMA
-//! payloads, completion and IRQs remain unmodeled.
+//! initial status as an explicit unmeasured assumption. Detections and DMA
+//! payloads remain unmodeled.
 //! An ordered central reset and guest-owned local stops can cancel an armed
 //! request without creating a result. Local idle status remains the declared
-//! retained zero; reset does not manufacture DMA progress.
+//! retained zero; reset does not manufacture DMA progress. A stopped request
+//! may be followed directly by the next one, as in a burst.
+//! Declared empty results complete an armed request after the unmeasured
+//! result latency: IRQ 47, the ISR acknowledgment at +8F4, the guest's local
+//! stops and a zero detection count at +600. No detections are produced.
 //! RetainedWords instead exposes all aligned words in the 4 KiB bank, initially
 //! zero and freely reconfigurable, without interpreting requests or DMA fields.
+use fujimod_emulator_devices::exr2::irq_routes::IrqRoutes;
 use fujimod_emulator_devices::{Cx, Device};
-use fujimod_emulator_imaging::exr2_isp::options::face_detector::{Mode, Options};
+use fujimod_emulator_imaging::exr2_isp::options::face_detector::{Mode, Options, Results};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
 pub const BASE: u64 = 0xfff14000;
+/// Physical completion line; the stock ISR acknowledges it at +8F4.
+const IRQ: u32 = 47;
+const ACKNOWLEDGE: u16 = 0x8f4;
+const RESULT_COUNT: u16 = 0x600;
+/// Declared, unmeasured result latency: 4,000,000 ticks (333 ms at 12 MHz).
+/// X-E2S still capture changes path when a result precedes its capture wait,
+/// about 290 ms after the request in emulation; that earlier path stalls on
+/// other unmodeled work. This latency follows the stock path taken when the
+/// request is canceled by the firmware's own timeout.
+const RESULT_LATENCY: u64 = 4_000_000;
 
 const FIXED_WORDS: &[(u16, u32)] = &[(0x08, 0x01000000), (0x564, 0xffff), (0x57c, 0)];
 
@@ -41,6 +56,8 @@ struct State {
     registers: BTreeMap<u16, u32>,
     request: Option<RequestState>,
     dma: [DmaChannel; 4],
+    /// Declared result deadline of the armed request.
+    due: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -78,6 +95,7 @@ struct DmaAccess {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct DmaChannel {
     phase: DmaPhase,
+    initial_phase: DmaPhase,
     initial_registers: BTreeMap<u8, u32>,
     registers: BTreeMap<u8, u32>,
     accepted_registers: BTreeMap<u8, u32>,
@@ -96,6 +114,9 @@ enum RequestPhase {
     InterruptSelection,
     CentralStart,
     AwaitingResult,
+    ResultRaised,
+    ResultStopping,
+    ResultCount,
     Resetting,
     Stopping,
     Stopped,
@@ -122,23 +143,32 @@ struct RequestState {
     initial_registers: BTreeMap<u16, u32>,
     initial_dma: [DmaChannel; 4],
     accesses: Vec<RequestAccess>,
+    /// Number of guest accesses before the declared result IRQ.
+    raised_after: Option<usize>,
 }
 
-/// Passive face detector. Neither mode creates detection results.
+/// Face detector. Only declared empty results complete a request.
 pub struct FaceDetector {
     mode: Mode,
+    results: Option<Results>,
+    routes: Option<IrqRoutes>,
     state: State,
 }
 
 impl FaceDetector {
-    pub fn new(options: Options) -> Self {
-        Self {
+    pub fn new(options: Options, routes: Option<IrqRoutes>) -> Result<Self, String> {
+        if options.results.is_some() && (options.mode != Mode::Configuration || routes.is_none()) {
+            return Err("declared face results require configuration mode and IRQ routes".into());
+        }
+        Ok(Self {
             mode: options.mode,
+            results: options.results,
+            routes,
             state: State {
                 mode: options.mode,
                 ..State::default()
             },
-        }
+        })
     }
 
     fn offset(&self, address: u64, size: u8) -> Option<u16> {
@@ -150,6 +180,7 @@ impl FaceDetector {
             && offset & 3 == 0
             && (self.mode == Mode::RetainedWords
                 || offset == 0x14
+                || self.results.is_some() && matches!(offset, ACKNOWLEDGE | RESULT_COUNT)
                 || Self::is_config_offset(offset)
                 || Self::is_request_offset(offset)
                 || Self::dma_location(offset).is_some())
@@ -257,12 +288,14 @@ impl FaceDetector {
         if !Self::valid_idle_dma_registers(&state.initial_registers) {
             return false;
         }
-        let mut replay = DmaChannel {
-            initial_registers: state.initial_registers.clone(),
-            registers: state.initial_registers.clone(),
-            accepted_registers: state.initial_registers.clone(),
-            ..DmaChannel::default()
-        };
+        if !matches!(
+            state.initial_phase,
+            DmaPhase::Initial | DmaPhase::Configured
+        ) {
+            return false;
+        }
+        let mut replay =
+            Self::retired_channel(state.initial_registers.clone(), state.initial_phase);
         for access in &state.accesses {
             if !Self::apply_dma_access(&mut replay, access.operation, access.offset, access.value) {
                 return false;
@@ -271,6 +304,17 @@ impl FaceDetector {
         replay.phase == state.phase
             && replay.registers == state.accepted_registers
             && state.registers == state.accepted_registers
+    }
+
+    fn retired_channel(registers: BTreeMap<u8, u32>, phase: DmaPhase) -> DmaChannel {
+        DmaChannel {
+            phase,
+            initial_phase: phase,
+            initial_registers: registers.clone(),
+            accepted_registers: registers.clone(),
+            registers,
+            accesses: Vec::new(),
+        }
     }
 
     fn read_dma(&mut self, cx: &mut Cx<'_>, channel: usize, offset: u8) -> u64 {
@@ -302,9 +346,9 @@ impl FaceDetector {
             || ADDRESS_WORDS.contains(&offset)
             || MODE_WORDS.iter().any(|(known, _)| *known == offset)
             || matches!(offset, 0x10 | 0x40 | 0x44 | 0x570)
-            || (0x84..0x144).contains(&offset) && (offset - 0x84) % 12 == 0
-            || (0x88..0x148).contains(&offset) && (offset - 0x88) % 12 == 0
-            || (0x80..0x140).contains(&offset) && (offset - 0x80) % 12 == 0
+            || (0x84..0x144).contains(&offset) && (offset - 0x84).is_multiple_of(12)
+            || (0x88..0x148).contains(&offset) && (offset - 0x88).is_multiple_of(12)
+            || (0x80..0x140).contains(&offset) && (offset - 0x80).is_multiple_of(12)
             || Self::in_range(offset, 0x280, 0x3e8)
             || Self::in_range(offset, 0x470, 0x4c0)
             || Self::in_range(offset, 0x4c0, 0x4d8)
@@ -590,6 +634,20 @@ impl FaceDetector {
                 registers.insert(offset, value);
                 request.phase = RequestPhase::AwaitingResult;
             }
+            RequestPhase::ResultRaised => {
+                if operation != DmaOperation::Write || offset != ACKNOWLEDGE || value != 1 {
+                    return false;
+                }
+                request.phase = RequestPhase::ResultStopping;
+                request.step = 0;
+                request.channel_index = 0;
+            }
+            RequestPhase::ResultCount => {
+                if operation != DmaOperation::Read || offset != RESULT_COUNT || value != 0 {
+                    return false;
+                }
+                request.phase = RequestPhase::Stopped;
+            }
             RequestPhase::AwaitingResult | RequestPhase::Stopped => {
                 if operation != DmaOperation::Write || offset != 0 || value != 0 {
                     return false;
@@ -614,7 +672,11 @@ impl FaceDetector {
                 request.step = 0;
                 request.channel_index = 0;
             }
-            RequestPhase::Stopping | RequestPhase::ClosingChannels => {
+            // The completion collector stops channels with the same local
+            // sequence as a cancellation, without the central reset.
+            RequestPhase::Stopping
+            | RequestPhase::ClosingChannels
+            | RequestPhase::ResultStopping => {
                 const ORDER: [usize; 4] = [1, 3, 0, 2];
                 let Some(&channel) = ORDER.get(usize::from(request.channel_index)) else {
                     return false;
@@ -654,10 +716,10 @@ impl FaceDetector {
                     request.channel_index += 1;
                     if request.channel_index == 4 {
                         request.channel_index = 0;
-                        request.phase = if closing {
-                            RequestPhase::Closed
-                        } else {
-                            RequestPhase::Stopped
+                        request.phase = match request.phase {
+                            RequestPhase::ClosingChannels => RequestPhase::Closed,
+                            RequestPhase::ResultStopping => RequestPhase::ResultCount,
+                            _ => RequestPhase::Stopped,
                         };
                     }
                 }
@@ -677,13 +739,8 @@ impl FaceDetector {
                     // Keep the real idle register values, including DMA setup;
                     // only the bounded transaction observers begin again.
                     for channel in dma.iter_mut() {
-                        let registers = channel.registers.clone();
-                        *channel = DmaChannel {
-                            initial_registers: registers.clone(),
-                            accepted_registers: registers.clone(),
-                            registers,
-                            ..DmaChannel::default()
-                        };
+                        *channel =
+                            Self::retired_channel(channel.registers.clone(), DmaPhase::Initial);
                     }
                     request.step = 1;
                     registers.insert(offset, value);
@@ -758,7 +815,15 @@ impl FaceDetector {
         replay.accesses.clear();
         let mut replay_registers = request.initial_registers.clone();
         let mut replay_dma = request.initial_dma.clone();
+        let raise = |replay: &mut RequestState| {
+            if request.raised_after == Some(replay.accesses.len())
+                && replay.phase == RequestPhase::AwaitingResult
+            {
+                replay.phase = RequestPhase::ResultRaised;
+            }
+        };
         for access in &request.accesses {
+            raise(&mut replay);
             if !Self::apply_request_access(
                 &mut replay,
                 &mut replay_registers,
@@ -770,7 +835,11 @@ impl FaceDetector {
                 return false;
             }
         }
-        replay.phase == request.phase
+        raise(&mut replay);
+        request
+            .raised_after
+            .is_none_or(|count| count <= request.accesses.len())
+            && replay.phase == request.phase
             && replay.step == request.step
             && replay.channel_index == request.channel_index
             && replay.optional_mask_words == request.optional_mask_words
@@ -799,8 +868,8 @@ impl FaceDetector {
                         .all(|shift| (value >> shift) & 7 <= 4)
             }
             0x570 => value <= 0xff,
-            0x84..=0x13c if (offset - 0x84) % 12 == 0 => value & !0x03ffffff == 0,
-            0x88..=0x140 if (offset - 0x88) % 12 == 0 => {
+            0x84..=0x13c if (offset - 0x84).is_multiple_of(12) => value & !0x03ffffff == 0,
+            0x88..=0x140 if (offset - 0x88).is_multiple_of(12) => {
                 value & 3 == 0 && (0x40000000..0x60000000).contains(&value)
             }
             _ => Self::is_config_offset(offset),
@@ -869,12 +938,27 @@ impl FaceDetector {
         u64::from(value)
     }
 
+    // An armed request is due once; any other phase has no deadline.
+    fn schedule_result(&mut self, cx: &Cx<'_>) {
+        let awaiting = self.state.request.as_ref().is_some_and(|request| {
+            request.phase == RequestPhase::AwaitingResult && request.raised_after.is_none()
+        });
+        self.state.due = match (self.results, awaiting) {
+            (Some(Results::Empty), true) => self
+                .state
+                .due
+                .or_else(|| cx.now().checked_add(RESULT_LATENCY)),
+            _ => None,
+        };
+    }
+
     fn valid_state(&self, state: &State) -> bool {
         if state.mode != self.mode {
             return false;
         }
         if self.mode == Mode::RetainedWords {
             return state.request.is_none()
+                && state.due.is_none()
                 && state
                     .dma
                     .iter()
@@ -889,18 +973,34 @@ impl FaceDetector {
                 || (Self::is_config_offset(*offset) && Self::valid_config(*offset, *value))
                 || (Self::is_request_offset(*offset) && state.request.is_some())
         });
+        // A declared deadline belongs to exactly one armed, unraised request.
+        let awaiting = state.request.as_ref().is_some_and(|request| {
+            request.phase == RequestPhase::AwaitingResult && request.raised_after.is_none()
+        });
+        let results_valid = if self.results.is_some() {
+            state.due.is_some() == awaiting
+        } else {
+            state.due.is_none()
+                && state
+                    .request
+                    .as_ref()
+                    .is_none_or(|request| request.raised_after.is_none())
+        };
         registers_valid
+            && results_valid
             && if let Some(request) = &state.request {
                 Self::valid_request(request, &state.registers, &state.dma)
             } else {
-                state.dma.iter().all(Self::valid_dma_channel)
+                state.dma.iter().all(|channel| {
+                    channel.initial_phase == DmaPhase::Initial && Self::valid_dma_channel(channel)
+                })
             }
     }
 }
 
 impl Default for FaceDetector {
     fn default() -> Self {
-        Self::new(Options::default())
+        Self::new(Options::default(), None).expect("default face detector options")
     }
 }
 
@@ -960,28 +1060,47 @@ impl Device for FaceDetector {
                 cx.fail("face detector request must fit its 12-bit input");
                 return;
             }
-            if self
-                .state
-                .request
-                .as_ref()
-                .is_some_and(|request| request.phase != RequestPhase::Closed || request.step != 1)
-            {
-                cx.fail("face detector request is already retained without a modeled result");
-                return;
+            let mut dma = self.state.dma.clone();
+            match self.state.request.as_ref() {
+                None => {}
+                Some(request) if request.phase == RequestPhase::Closed && request.step == 1 => {}
+                // A burst follows the ordered reset and local stops with the
+                // next request directly. The stopped channels keep their
+                // programmed idle words, so they stay configured without the
+                // close and reconfiguration a single request performs.
+                Some(request) if request.phase == RequestPhase::Stopped => {
+                    if dma
+                        .iter()
+                        .any(|channel| !Self::valid_idle_dma_registers(&channel.registers))
+                    {
+                        cx.fail(
+                            "face detector request requires stopped DMA channels with idle words",
+                        );
+                        return;
+                    }
+                    for channel in dma.iter_mut() {
+                        *channel =
+                            Self::retired_channel(channel.registers.clone(), DmaPhase::Configured);
+                    }
+                }
+                Some(_) => {
+                    cx.fail("face detector request is already retained without a modeled result");
+                    return;
+                }
             }
-            if !Self::configured_for_request(&self.state.registers, &self.state.dma) {
+            if !Self::configured_for_request(&self.state.registers, &dma) {
                 cx.fail("face detector request requires complete configuration and four inactive DMA channels");
                 return;
             }
             let mut request = RequestState {
                 initial_registers: self.state.registers.clone(),
-                initial_dma: self.state.dma.clone(),
+                initial_dma: dma.clone(),
                 ..RequestState::default()
             };
             if !Self::apply_request_access(
                 &mut request,
                 &mut self.state.registers,
-                &mut self.state.dma,
+                &mut dma,
                 DmaOperation::Write,
                 offset,
                 value,
@@ -989,11 +1108,14 @@ impl Device for FaceDetector {
                 cx.fail("face detector request is outside the supported input domain");
                 return;
             }
+            self.state.dma = dma;
             self.state.request = Some(request);
+            self.schedule_result(cx);
             return;
         }
         if self.state.request.is_some() {
             self.request_access(cx, DmaOperation::Write, offset, Some(value));
+            self.schedule_result(cx);
             return;
         }
         if let Some((channel, local)) = Self::dma_location(offset) {
@@ -1008,6 +1130,28 @@ impl Device for FaceDetector {
             return;
         }
         self.state.registers.insert(offset, value);
+    }
+
+    fn next_deadline(&self, _now: u64) -> Option<u64> {
+        self.state.due
+    }
+
+    fn advance(&mut self, cx: &mut Cx<'_>) {
+        if self.state.due.is_none_or(|due| cx.now() < due) {
+            return;
+        }
+        let Some(routes) = &self.routes else {
+            cx.fail("declared face results require IRQ routes");
+            return;
+        };
+        if let Err(error) = routes.latch(IRQ).and_then(|irq| irq.raise(cx)) {
+            cx.fail(error);
+            return;
+        }
+        let request = self.state.request.as_mut().expect("due face request");
+        request.raised_after = Some(request.accesses.len());
+        request.phase = RequestPhase::ResultRaised;
+        self.state.due = None;
     }
 
     fn save(&self) -> Value {
@@ -1132,7 +1276,7 @@ mod tests {
 
     #[test]
     fn retains_bounded_configuration_without_exposing_unmodeled_reads() {
-        let mut model = FaceDetector::new(Options::default());
+        let mut model = FaceDetector::default();
         assert_eq!(write(&mut model, 0x08, 0x01000000), None);
         assert_eq!(write(&mut model, 0x20, 0x014721d8), None);
         assert_eq!(write(&mut model, 0x84, 0x03ffffff), None);
@@ -1146,7 +1290,7 @@ mod tests {
 
     #[test]
     fn table_and_scratch_addresses_are_data_instead_of_firmware_signatures() {
-        let mut model = FaceDetector::new(Options::default());
+        let mut model = FaceDetector::default();
         for &offset in ADDRESS_WORDS {
             for address in [0, 0x01234560, 0x41000000, 0x4f000004] {
                 assert_eq!(write(&mut model, u64::from(offset), address), None);
@@ -1156,14 +1300,14 @@ mod tests {
         }
         assert!(model.state.request.is_none());
         let saved = model.save();
-        let mut restored = FaceDetector::new(Options::default());
+        let mut restored = FaceDetector::default();
         restored.restore(&saved).unwrap();
         assert_eq!(restored.save(), saved);
     }
 
     #[test]
     fn inactive_dma_channel_clear_and_poll_observes_declared_register_behavior() {
-        let mut model = FaceDetector::new(Options::default());
+        let mut model = FaceDetector::default();
         assert_eq!(read(&mut model, 0x884), None);
         assert_eq!(write(&mut model, 0x884, 0), None);
         assert_eq!(read(&mut model, 0x890), None);
@@ -1171,7 +1315,7 @@ mod tests {
         assert_eq!(model.state.dma[1].phase, DmaPhase::ClearCommand);
 
         let saved = model.save();
-        let mut restored = FaceDetector::new(Options::default());
+        let mut restored = FaceDetector::default();
         restored.restore(&saved).unwrap();
         assert!(read(&mut restored, 0x884).is_some());
 
@@ -1292,7 +1436,10 @@ mod tests {
     }
 
     fn armed_with_mask(mask: u64) -> FaceDetector {
-        let mut model = FaceDetector::new(Options::default());
+        arm(FaceDetector::default(), mask)
+    }
+
+    fn arm(mut model: FaceDetector, mask: u64) -> FaceDetector {
         initialize(&mut model, 0);
         assert_eq!(write(&mut model, 0x14, 0x0fff), None);
         assert_eq!(
@@ -1361,7 +1508,7 @@ mod tests {
         );
         assert_eq!(model.next_deadline(0), None);
         assert!(read(&mut model, 4).is_some());
-        let mut restored = FaceDetector::new(Options::default());
+        let mut restored = FaceDetector::default();
         restored.restore(&model.save()).unwrap();
         assert_eq!(
             restored.state.request.as_ref().unwrap().phase,
@@ -1538,6 +1685,199 @@ mod tests {
             assert!(restored.restore(&false_idle).is_err());
             assert_eq!(restored.save(), saved);
         }
+    }
+
+    fn replay(model: &mut FaceDetector, accesses: &[RequestAccess]) {
+        for access in accesses {
+            let offset = u64::from(access.offset);
+            if access.operation == DmaOperation::Write {
+                assert_eq!(write(model, offset, access.value.into()), None);
+            } else {
+                assert_eq!(read(model, offset), None);
+            }
+        }
+    }
+
+    #[test]
+    fn burst_requests_follow_stopped_requests_without_closing() {
+        let mut model = armed();
+        let submission = model.state.request.as_ref().unwrap().accesses.clone();
+        for _ in 0..3 {
+            let stops = stop_accesses(false);
+            for (index, (operation, offset, value)) in stops.iter().copied().enumerate() {
+                // A request cannot start before every local channel stops.
+                if index + 1 < stops.len() {
+                    let saved = model.save();
+                    assert!(write(&mut model, 0x14, 0x0fff).is_some());
+                    assert_eq!(model.save(), saved);
+                }
+                if operation == DmaOperation::Write {
+                    assert_eq!(write(&mut model, offset, value), None);
+                } else {
+                    assert_eq!(read(&mut model, offset), None);
+                }
+            }
+            assert_eq!(
+                model.state.request.as_ref().unwrap().phase,
+                RequestPhase::Stopped
+            );
+            let stopped = model.state.dma.clone();
+            assert!(write(&mut model, 0x14, 0x1000).is_some());
+            replay(&mut model, &submission);
+            let request = model.state.request.as_ref().unwrap();
+            assert_eq!(request.phase, RequestPhase::AwaitingResult);
+            assert_eq!(request.accesses, submission);
+            for (channel, previous) in request.initial_dma.iter().zip(&stopped) {
+                assert_eq!(channel.initial_phase, DmaPhase::Configured);
+                assert_eq!(channel.initial_registers, previous.registers);
+                assert!(channel.accesses.is_empty());
+            }
+            assert_eq!(model.next_deadline(0), None);
+            let saved = model.save();
+            let mut restored = FaceDetector::default();
+            restored.restore(&saved).unwrap();
+            assert_eq!(restored.save(), saved);
+            let mut busy = saved.clone();
+            busy["request"]["initial_dma"][0]["initial_registers"]["4"] = Value::from(1);
+            assert!(FaceDetector::default().restore(&busy).is_err());
+        }
+        // The burst still ends with the single-request close.
+        for close in [false, true] {
+            for (operation, offset, value) in stop_accesses(close) {
+                if operation == DmaOperation::Write {
+                    assert_eq!(write(&mut model, offset, value), None);
+                } else {
+                    assert_eq!(read(&mut model, offset), None);
+                }
+            }
+        }
+        assert_eq!(write(&mut model, 0x10, 0), None);
+        // Without a stopped request, a channel cannot claim configuration it
+        // never performed.
+        let mut idle = FaceDetector::default();
+        initialize(&mut idle, 0);
+        let mut forged = idle.save();
+        let channel = &mut forged["dma"][0];
+        channel["initial_registers"] = channel["registers"].clone();
+        channel["accesses"] = Value::Array(Vec::new());
+        channel["initial_phase"] = Value::from("configured");
+        assert!(FaceDetector::default().restore(&forged).is_err());
+    }
+
+    struct Timed {
+        now: u64,
+        raised: Vec<(usize, u32)>,
+    }
+
+    impl Host for Timed {
+        fn now(&self) -> u64 {
+            self.now
+        }
+        fn schedule(&mut self, _: usize, _: u64, _: u64) {
+            unreachable!()
+        }
+        fn set_irq(&mut self, _: u32, _: bool) {
+            unreachable!()
+        }
+        fn raise_irq(&mut self, cpu: usize, line: u32) -> Result<(), String> {
+            self.raised.push((cpu, line));
+            Ok(())
+        }
+        fn ram_read(&self, _: u64, _: &mut [u8]) -> Result<(), String> {
+            unreachable!()
+        }
+        fn ram_write(&mut self, _: u64, _: &[u8]) -> Result<(), String> {
+            unreachable!()
+        }
+        fn record(&mut self, _: Record) {}
+    }
+
+    fn advance(model: &mut FaceDetector, now: u64) -> (Option<String>, Vec<(usize, u32)>) {
+        let mut host = Timed {
+            now,
+            raised: Vec::new(),
+        };
+        let mut cx = Cx::new(&mut host, usize::MAX, 0, 4);
+        model.advance(&mut cx);
+        let refusal = cx.take_refusal();
+        (refusal, host.raised)
+    }
+
+    fn with_empty_results() -> FaceDetector {
+        let routes = IrqRoutes::default();
+        routes.set(IRQ, Some(1)).unwrap();
+        let options = Options {
+            mode: Mode::Configuration,
+            results: Some(Results::Empty),
+        };
+        FaceDetector::new(options, Some(routes)).unwrap()
+    }
+
+    fn assert_restores(model: &FaceDetector) {
+        let mut restored = with_empty_results();
+        restored.restore(&model.save()).unwrap();
+        assert_eq!(restored.save(), model.save());
+    }
+
+    #[test]
+    fn declared_empty_results_complete_burst_requests_through_irq_ack_stops_and_count() {
+        // X70/X-E2S stock face completion: ISR 145DC54 acknowledges +8F4,
+        // the collector stops channels 1,3,0,2 and reads the +600 count.
+        let mut model = arm(with_empty_results(), 0x000b000b);
+        let submission = model.state.request.as_ref().unwrap().accesses.clone();
+        for _ in 0..3 {
+            let due = model.next_deadline(0).unwrap();
+            assert_eq!(due, RESULT_LATENCY);
+            assert_eq!(advance(&mut model, due - 1), (None, vec![]));
+            assert!(write(&mut model, 0x8f4, 1).is_some());
+            assert!(read(&mut model, 0x600).is_some());
+            assert_eq!(advance(&mut model, due), (None, vec![(1, IRQ)]));
+            assert_eq!(model.next_deadline(0), None);
+            assert_restores(&model);
+            assert!(read(&mut model, 0x600).is_some());
+            assert!(write(&mut model, 0x8f4, 2).is_some());
+            assert_eq!(write(&mut model, 0x8f4, 1), None);
+            for (operation, offset, value) in stop_accesses(false).into_iter().skip(2) {
+                assert!(read(&mut model, 0x600).is_some());
+                if operation == DmaOperation::Write {
+                    assert_eq!(write(&mut model, offset, value), None);
+                } else {
+                    assert_eq!(read(&mut model, offset), None);
+                }
+                assert_restores(&model);
+            }
+            let mut host = Clock;
+            let mut cx = Cx::new(&mut host, 0, 0, 4);
+            assert_eq!(model.read(&mut cx, BASE + 0x600, 4), 0);
+            assert_eq!(cx.take_refusal(), None);
+            assert_eq!(
+                model.state.request.as_ref().unwrap().phase,
+                RequestPhase::Stopped
+            );
+            assert_restores(&model);
+            let mut moved = model.save();
+            let raised = moved["request"]["raised_after"].as_u64().unwrap();
+            moved["request"]["raised_after"] = Value::from(raised + 1);
+            assert!(with_empty_results().restore(&moved).is_err());
+            assert!(FaceDetector::default().restore(&model.save()).is_err());
+            replay(&mut model, &submission);
+            assert_eq!(
+                model.state.request.as_ref().unwrap().phase,
+                RequestPhase::AwaitingResult
+            );
+        }
+        // A cancellation withdraws the pending result.
+        assert_eq!(write(&mut model, 0, 0), None);
+        assert_eq!(model.next_deadline(0), None);
+        assert_restores(&model);
+        let mut unanswered = arm(with_empty_results(), 0x000b000b).save();
+        unanswered["due"] = Value::Null;
+        assert!(with_empty_results().restore(&unanswered).is_err());
+        let options = Options {
+            mode: Mode::Configuration,
+            results: Some(Results::Empty),
+        };
+        assert!(FaceDetector::new(options, None).is_err());
     }
 
     #[test]

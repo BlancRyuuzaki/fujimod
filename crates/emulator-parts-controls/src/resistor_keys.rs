@@ -1,6 +1,7 @@
 //! External resistor-key inputs with body-declared samples and pin wiring.
 //! No firmware memory or execution state is available at this boundary.
 //! The input is an explicit 12-bit resistor-ladder sample.
+use fujimod_emulator_devices::checkpoint::Checkpoint;
 use fujimod_emulator_devices::parts::controls::Controls;
 use fujimod_emulator_devices::parts::pins::{DriveInput, Pin};
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,20 @@ pub enum Key {
     StickLeft,
     StickRight,
     StickPush,
+    /// Playback button (scanner debug name K_PLAY).
+    Play,
+    /// AE-L (exposure lock) button.
+    AeLock,
+    /// AF-ON button.
+    AfOn,
+    /// Focus-stick diagonal tilts.
+    StickUpLeft,
+    StickUpRight,
+    StickDownLeft,
+    StickDownRight,
+    /// Rear and front command-dial pushes.
+    RearPush,
+    FrontPush,
 }
 impl Key {
     pub fn parse(s: &str) -> Result<Self, String> {
@@ -65,6 +80,15 @@ impl Key {
             "STICK_LEFT" => Ok(Self::StickLeft),
             "STICK_RIGHT" => Ok(Self::StickRight),
             "STICK_PUSH" => Ok(Self::StickPush),
+            "PLAY" | "K_PLAY" | "PLAYBACK" => Ok(Self::Play),
+            "AEL" | "AE-L" | "AE_L" | "AE_LOCK" => Ok(Self::AeLock),
+            "AFON" | "AF-ON" | "AF_ON" => Ok(Self::AfOn),
+            "STICK_UL" | "STICK_UP_LEFT" => Ok(Self::StickUpLeft),
+            "STICK_UR" | "STICK_UP_RIGHT" => Ok(Self::StickUpRight),
+            "STICK_DL" | "STICK_DOWN_LEFT" => Ok(Self::StickDownLeft),
+            "STICK_DR" | "STICK_DOWN_RIGHT" => Ok(Self::StickDownRight),
+            "REAR_PUSH" | "CMD_PUSH" => Ok(Self::RearPush),
+            "FRONT_PUSH" | "CMD2_PUSH" => Ok(Self::FrontPush),
             _ => Err(format!("unknown physical key {s:?}")),
         }
     }
@@ -326,6 +350,13 @@ impl ResistorKeys {
     pub fn used(&self) -> bool {
         self.state.lock().unwrap().used
     }
+
+    fn validate_state(state: &InputState) -> Result<(), String> {
+        if state.rear_phase > 3 || state.front_phase > 3 {
+            return Err("physical controls checkpoint has an invalid dial phase".into());
+        }
+        Ok(())
+    }
 }
 impl Controls for ResistorKeys {
     fn next_deadline(&self) -> Option<u64> {
@@ -449,6 +480,18 @@ impl Controls for ResistorKeys {
     fn restore(&self, v: &Value) -> Result<(), String> {
         let state = serde_json::from_value(v.clone())
             .map_err(|e| format!("physical controls checkpoint: {e}"))?;
+        *self.state.lock().unwrap() = state;
+        Ok(())
+    }
+    fn checkpoint(&self) -> Result<Checkpoint, String> {
+        Checkpoint::encode("physical-controls", &*self.state.lock().unwrap())
+    }
+    fn validate_checkpoint(&self, saved: &Checkpoint) -> Result<(), String> {
+        Self::validate_state(&saved.decode("physical-controls")?)
+    }
+    fn restore_checkpoint(&self, saved: &Checkpoint) -> Result<(), String> {
+        let state: InputState = saved.decode("physical-controls")?;
+        Self::validate_state(&state)?;
         *self.state.lock().unwrap() = state;
         Ok(())
     }

@@ -2,7 +2,7 @@
 //! its declared white luminance supplies absolute cd/m². Sensor signal is
 //! irradiance * integration time * analog gain, clipped at the ADC full well.
 use fujimod_emulator_devices::parts::optics::ApertureHandle;
-use fujimod_emulator_imaging::exposure::{Calibration, Exposure, ExposureHandle};
+use fujimod_emulator_imaging::exposure::{Calibration, Exposure, ExposureHandle, NormalizedRgb};
 use fujimod_emulator_imaging::scene::noise::SensorNoise;
 use fujimod_emulator_imaging::scene::{
     Frame, FramePixels, SensorFramesHandle, frames::SensorExposure,
@@ -15,6 +15,16 @@ pub(super) fn adc(signal: f64, noise: NoiseResponse, x: usize, y: usize, color: 
     match noise {
         Some((profile, gain)) => profile.quantize(signal, gain, x, y, color),
         None => signal.round_ties_even().clamp(0., 16383.) as u16,
+    }
+}
+
+#[inline]
+fn srgb_linear(byte: u8) -> f64 {
+    let s = f64::from(byte) / 255.;
+    if s <= 0.04045 {
+        s / 12.92
+    } else {
+        libm::pow((s + 0.055) / 1.055, 2.4)
     }
 }
 
@@ -78,6 +88,19 @@ impl SampleOffsets {
         let at = row + column + channel * 2;
         u16::from_le_bytes([self.pixels[at], self.pixels[at + 1]])
     }
+    /// # Safety
+    /// `row`, `column`, and `channel` must name one of the prepared samples.
+    #[inline(always)]
+    pub unsafe fn channel_unchecked(&self, row: usize, column: usize, channel: usize) -> u16 {
+        let at = row + column + channel * 2;
+        // SAFETY: upheld by the caller.
+        u16::from_le_bytes(unsafe {
+            [
+                *self.pixels.get_unchecked(at),
+                *self.pixels.get_unchecked(at + 1),
+            ]
+        })
+    }
 }
 /// Immutable values at one physical exposure edge, shared by the preview and
 /// its pre-ISP metering windows. Subsequent host or register updates cannot
@@ -89,6 +112,10 @@ pub struct ExposedFrame {
     pub aperture_squared: f64,
     pub color_sample_weights: [u8; 3],
     response: [[u16; 256]; 3],
+    /// Pre-quantized sRGB input in ADC units. Charge-noise sampling consumes
+    /// the unrounded signal, so this replaces per-pixel color conversion while
+    /// retaining the exact expression order used before noise.
+    signal: [[f64; 256]; 3],
     pub(super) response_scale: [f64; 3],
     pub focus_shift_mm: Option<f64>,
     pub view: Option<fujimod_emulator_imaging::scene::view::View>,
@@ -170,21 +197,6 @@ impl ExposedFrame {
             * exposure.seconds
             * exposure.analog_gain
             / calibration.saturation_lux_seconds;
-        let response = std::array::from_fn(|c| {
-            std::array::from_fn(|v| {
-                let s = v as f64 / 255.;
-                let linear = if s <= 0.04045 {
-                    s / 12.92
-                } else {
-                    libm::pow((s + 0.055) / 1.055, 2.4)
-                };
-                libm::rint(
-                    linear * scale * calibration.full_scale as f64 * 256.
-                        / calibration.reference_white[c] as f64,
-                )
-                .clamp(0., 16383.) as u16
-            })
-        });
         // Mosaic radiance has no photometric white or reference white: its
         // counts are the RAF normalization scaled by the physical exposure.
         // The largest site sets the scale, matching the optical scene's
@@ -195,15 +207,64 @@ impl ExposedFrame {
                 scale * calibration.full_scale as f64 * 256. / calibration.reference_white[c] as f64
             }),
         };
+        Self::with_response(
+            frame,
+            exposure,
+            aperture_squared,
+            calibration.color_sample_weights,
+            response_scale,
+        )
+    }
+
+    /// Form RGB ADC samples directly from the declared response. The unit
+    /// exposure is internal to the readout and is never published as metering.
+    pub(crate) fn from_normalized_rgb(
+        frame: Arc<Frame>,
+        calibration: NormalizedRgb,
+    ) -> Result<Self, String> {
+        if !matches!(frame.pixels, FramePixels::Rgb24(_)) || frame.noise.is_some() {
+            return Err("normalized preview requires noiseless sRGB input".into());
+        }
+        let response = calibration
+            .reference_white
+            .map(|white| f64::from(calibration.full_scale) * 256. / f64::from(white));
+        Self::with_response(
+            frame,
+            Exposure {
+                seconds: 1.,
+                analog_gain: 1.,
+            },
+            1.,
+            calibration.color_sample_weights,
+            response,
+        )
+    }
+
+    fn with_response(
+        frame: Arc<Frame>,
+        exposure: Exposure,
+        aperture_squared: f64,
+        color_sample_weights: [u8; 3],
+        response_scale: [f64; 3],
+    ) -> Result<Self, String> {
         if response_scale.iter().any(|v| !v.is_finite() || *v < 0.) {
             return Err("physical radiance exceeds finite sensor response".into());
         }
+        let response = std::array::from_fn(|c| {
+            std::array::from_fn(|v| {
+                libm::rint(srgb_linear(v as u8) * response_scale[c]).clamp(0., 16383.) as u16
+            })
+        });
+        let signal = std::array::from_fn(|c| {
+            std::array::from_fn(|v| srgb_linear(v as u8) * response_scale[c])
+        });
         Ok(Self {
             frame,
             exposure,
             aperture_squared,
-            color_sample_weights: calibration.color_sample_weights,
+            color_sample_weights,
             response,
+            signal,
             response_scale,
             focus_shift_mm: None,
             view: None,
@@ -283,7 +344,9 @@ impl ExposedFrame {
                 || dimensions.iter().any(|&n| n > 8192)
                 || pixels.len() != dimensions[0] * dimensions[1] * 6
                 || pixels
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .any(|word| u16::from_le_bytes([word[0], word[1]]) > 16383)
             {
                 return Err("invalid exposed-frame filtered pixel checkpoint".into());
@@ -298,6 +361,9 @@ impl ExposedFrame {
             aperture_squared,
             color_sample_weights,
             response: std::array::from_fn(|c| std::array::from_fn(|i| response[c * 256 + i])),
+            signal: std::array::from_fn(|c| {
+                std::array::from_fn(|i| srgb_linear(i as u8) * response_scale[c])
+            }),
             response_scale,
             focus_shift_mm,
             view,
@@ -354,13 +420,13 @@ impl ExposedFrame {
             FramePixels::Rgb24(p) => {
                 if let Some(noise) = self.noise_response() {
                     std::array::from_fn(|c| {
-                        let s = f64::from(p[(sy * f.width + sx) * 3 + c]) / 255.;
-                        let linear = if s <= 0.04045 {
-                            s / 12.92
-                        } else {
-                            libm::pow((s + 0.055) / 1.055, 2.4)
-                        };
-                        adc(linear * self.response_scale[c], Some(noise), sx, sy, c)
+                        adc(
+                            self.signal[c][p[(sy * f.width + sx) * 3 + c] as usize],
+                            Some(noise),
+                            sx,
+                            sy,
+                            c,
+                        )
                     })
                 } else {
                     std::array::from_fn(|c| {
@@ -453,9 +519,9 @@ impl ExposedFrame {
         serde_json::json!({"frame":self.frame.fingerprint(),"exposure":self.exposure,
             "aperture_squared":self.aperture_squared,"color_sample_weights":self.color_sample_weights,
             "focus_shift_mm":self.focus_shift_mm,"view":self.view,"response_scale":self.response_scale,
-            "filtered":self.filtered.as_ref().map(|pixels|fujimod_emulator_devices::fingerprint::bytes(&pixels.materialize())),
+            "filtered":self.filtered.as_ref().map(|pixels|fujimod_emulator_devices::state::bytes(&pixels.materialize())),
             "sample_dimensions":self.sample_dimensions(),
-            "response":fujimod_emulator_devices::fingerprint::words16(&response)})
+            "response":fujimod_emulator_devices::state::words16(&response)})
     }
 }
 

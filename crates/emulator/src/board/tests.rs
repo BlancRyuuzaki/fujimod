@@ -1,3 +1,4 @@
+use fujimod_catalog_configuration::RunEngine;
 use super::*;
 use fujimod_emulator_devices::{Cx, Device};
 use fujimod_emulator_cpu::Model;
@@ -8,18 +9,27 @@ struct Probe {
     due: Option<u64>,
     calls: Vec<(u64, u64)>,
     value: u64,
+    publication: Option<u64>,
+    publication_saves: usize,
 }
 struct Timer(Arc<Mutex<Probe>>);
 impl Device for Timer {
+    fn publication_generation(&self) -> Option<u64> {
+        self.0.lock().unwrap().publication
+    }
     fn name(&self) -> &'static str {
         "test-timer"
     }
     fn read(&mut self, cx: &mut Cx<'_>, address: u64, _: u8) -> u64 {
-        self.0.lock().unwrap().calls.push((cx.now(), address));
-        self.0.lock().unwrap().value
+        let mut p = self.0.lock().unwrap();
+        p.calls.push((cx.now(), address));
+        if let Some(generation) = &mut p.publication { *generation += 1; }
+        p.value
     }
     fn write(&mut self, cx: &mut Cx<'_>, _: u64, _: u8, value: u64) {
         let mut p = self.0.lock().unwrap();
+        if (p.value != value || p.due != Some(cx.now() + 5))
+            && let Some(generation) = &mut p.publication { *generation += 1; }
         p.value = value;
         p.due = Some(cx.now() + 5);
     }
@@ -32,10 +42,12 @@ impl Device for Timer {
             p.due = None;
             p.value += 1;
             p.calls.push((cx.now(), 0));
+            if let Some(generation) = &mut p.publication { *generation += 1; }
         }
     }
     fn save(&self) -> Value {
-        let p = self.0.lock().unwrap();
+        let mut p = self.0.lock().unwrap();
+        p.publication_saves += 1;
         json!({"due":p.due,"calls":p.calls,"value":p.value})
     }
 }
@@ -191,7 +203,7 @@ fn strict_unknown_refuses_and_discovery_retains_evidence() {
 #[test]
 fn factory_owns_alias_backing_and_maps_peripherals_to_physical_bus_addresses() {
     use factory::*;
-    let options = || Options::new(Engine::Unicorn).with_translation_cache_size_bytes(1024 * 1024);
+    let options = || Options::new(RunEngine::Unicorn).with_translation_cache_size_bytes(1024 * 1024);
     let graph = || Graph {
         decoders: vec![],
         processors: vec![Processor {
@@ -199,7 +211,7 @@ fn factory_owns_alias_backing_and_maps_peripherals_to_physical_bus_addresses() {
             mprofile: None,
             model: Model::CortexR5F,
             registers: vec![(Register::Pc, 0x10000)],
-            released: true,
+            released: true, parked_until_sgi: false,
         }],
         dma_mappings: vec![crate::board::memory::BusMapping::ram(0x10000, 0x4000)],
         ram: vec![Ram {
@@ -378,7 +390,7 @@ fn pausing_inside_a_quantum_preserves_multicore_interleaving() {
                     mprofile: None,
                     model: Model::CortexR5F,
                     registers: vec![(Register::Pc, 0x10000)],
-                    released: true,
+                    released: true, parked_until_sgi: false,
                 })
                 .collect(),
             dma_mappings: vec![crate::board::memory::BusMapping::ram(0x10000, 0x4000)],
@@ -400,7 +412,7 @@ fn pausing_inside_a_quantum_preserves_multicore_interleaving() {
         };
         let mut built = graph
             .build(
-                Options::new(Engine::Unicorn).with_translation_cache_size_bytes(1024 * 1024),
+                Options::new(RunEngine::Unicorn).with_translation_cache_size_bytes(1024 * 1024),
                 Bus::new(bus::Mode::Strict),
                 None,
             )
@@ -447,7 +459,7 @@ fn mprofile_systick_wakes_wfi_and_executes_a_real_exception_handler() {
             processors: vec![Processor {
                 model: Model::CortexM4,
                 registers: vec![],
-                released: true,
+                released: true, parked_until_sgi: false,
                 rprofile: None,
                 mprofile: Some(super::mprofile::Config {
                     clock_hz: 1_000_000_000,
@@ -472,7 +484,7 @@ fn mprofile_systick_wakes_wfi_and_executes_a_real_exception_handler() {
         };
         let mut board = graph
             .build(
-                Options::new(Engine::Unicorn).with_translation_cache_size_bytes(1024 * 1024),
+                Options::new(RunEngine::Unicorn).with_translation_cache_size_bytes(1024 * 1024),
                 Bus::new(bus::Mode::Strict),
                 None,
             )
@@ -614,7 +626,7 @@ fn per_core_irq_board_with_backend(counted: bool) -> (Board, Arc<Mutex<Vec<u64>>
                 model: Model::CortexR5F,
                 rprofile: Some(Default::default()),
                 mprofile: None,
-                released: true,
+                released: true, parked_until_sgi: false,
                 registers: vec![
                     (Register::Pc, 0x1000 + core * 0x1000),
                     (Register::Pstate, 0x53),
@@ -699,7 +711,7 @@ fn per_core_irq_board_with_backend(counted: bool) -> (Board, Arc<Mutex<Vec<u64>>
     } else {
         graph
             .build(
-                factory::Options::new(factory::Engine::Unicorn)
+                factory::Options::new(RunEngine::Unicorn)
                     .with_translation_cache_size_bytes(1024 * 1024),
                 bus,
                 None,
@@ -1047,4 +1059,28 @@ fn serialized_interactive_cores_share_execution_before_the_host_deadline() {
     let counts = board.instruction_counts();
     assert!(counts.iter().all(|&count| count >= 64), "{counts:?}");
     assert_eq!(board.state()["timeline"]["now"], 200);
+}
+
+#[test]
+fn generation_publications_stop_at_the_same_instruction_without_serializing() {
+    for generation in [None, Some(0)] {
+        let (mut board, probe) = build_rprofile(bus::Mode::Strict, true);
+        probe.lock().unwrap().publication = generation;
+        board.run_for_instructions(2, 100).unwrap();
+        probe.lock().unwrap().publication_saves = 0;
+        board.continuation_begin(vec![], [0].into(), vec![]).unwrap();
+        board.run_until(20, 100).unwrap();
+        assert!(board.continuation_end().unwrap());
+        assert_eq!(board.instruction_counts(), vec![3]);
+        assert_eq!(probe.lock().unwrap().publication_saves == 0, generation.is_some());
+        board.write_memory(0, 0x10010, &0xe320f003u32.to_le_bytes()).unwrap();
+        board.write_register(0, Register::Pc, 0x10010).unwrap();
+        probe.lock().unwrap().publication_saves = 0;
+        board.continuation_begin(vec![], [0].into(), vec![]).unwrap();
+        board.run_until(20, 100).unwrap();
+        assert!(board.continuation_end().unwrap());
+        assert_eq!(board.instruction_counts(), vec![4]);
+        assert_eq!(probe.lock().unwrap().publication_saves == 0, generation.is_some());
+        assert_eq!(board.state()["timeline"]["now"], 7);
+    }
 }

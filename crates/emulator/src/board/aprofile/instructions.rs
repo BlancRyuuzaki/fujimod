@@ -7,8 +7,103 @@ fn system(encoding: u16) -> Register {
     Register::Arm64System(arm::SystemRegister::from_encoding(encoding))
 }
 
+impl State {
+    /// Deliver this processor's Security state (PSTATE.EL and SCR_EL3.NS) to
+    /// an interrupt controller whose CPU interfaces depend on it.
+    pub(in crate::board) fn deliver_processor_security(
+        &mut self,
+        cpu: &dyn Cpu,
+        core: usize,
+    ) -> Result<(), String> {
+        let Some(interrupts) = self.interrupts.as_mut() else {
+            return Ok(());
+        };
+        if core >= interrupts.cores || !interrupts.gic.tracks_processor_security() {
+            return Ok(());
+        }
+        let pstate = scalar(cpu, Register::Pstate)?;
+        if pstate & 0x10 != 0 {
+            return Err("AArch32 Security state delivery to the GIC is not implemented".into());
+        }
+        let security = ProcessorSecurity {
+            el3: (pstate >> 2) & 3 == 3,
+            non_secure: scalar(cpu, system(0xf088))? & 1 != 0,
+        };
+        interrupts.gic.set_processor_security(core, security)
+    }
+    pub(in crate::board) fn aarch64_before(
+        &mut self,
+        cpu: &dyn Cpu,
+        core: usize,
+        pc: u64,
+    ) -> Result<bool, String> {
+        if self.aprofile[core].is_none() || cpu.features().architectural_exits {
+            return Ok(false);
+        }
+        if fujimod_emulator_cpu::arm64::enter_interrupt(cpu, self.pins[core].0, self.pins[core].1)?
+        {
+            cpu.stop()?;
+            return Ok(true);
+        }
+        let mut bytes = [0; 4];
+        cpu.read_virtual(pc, Access::Fetch, &mut bytes)?;
+        let word = u32::from_le_bytes(bytes);
+        self.aarch64_instruction(cpu, core, pc, word)
+    }
+    pub(in crate::board) fn aarch64_instruction(
+        &mut self,
+        cpu: &dyn Cpu,
+        core: usize,
+        pc: u64,
+        word: u32,
+    ) -> Result<bool, String> {
+        let pstate = scalar(cpu, Register::Pstate)?;
+        if word & 0xffd00000 == 0xd5100000 {
+            let encoding = ((word >> 5) & 0xffff) as u16;
+            let r = arm::SystemRegister::from_encoding(encoding);
+            let framework = fujimod_emulator_cpu::arm64::framework_instruction(word);
+            if framework {
+                if matches!(encoding, 0xf665 | 0xf667) && pstate & 12 != 12 {
+                    return Err("ICC_SRE_EL3 and ICC_IGRPEN1_EL3 require EL3".into());
+                }
+                if encoding == 0xe64d && pstate & 12 < 8 {
+                    return Err("ICC_SRE_EL2 requires EL2 or EL3".into());
+                }
+                if pstate & 12 == 0 {
+                    return Err("AArch64 EL0 framework register access is unsupported".into());
+                }
+                let read = word & (1 << 21) != 0;
+                let rt = (word & 31) as u64;
+                let syndrome = (0x18 << 26)
+                    | (u64::from(r.op0) << 20)
+                    | (u64::from(r.op1) << 14)
+                    | (u64::from(r.crn) << 10)
+                    | (u64::from(r.crm) << 1)
+                    | (u64::from(r.op2) << 17)
+                    | (rt << 5)
+                    | u64::from(read);
+                self.system_register(cpu, core, syndrome)?;
+                cpu.stop()?;
+            }
+            return Ok(false);
+        }
+        let hint = match word {
+            0xd503205f => Hint::WaitForEvent,
+            0xd503207f => Hint::WaitForInterrupt,
+            0xd503209f => Hint::SendEvent,
+            0xd50320bf => Hint::SendEventLocal,
+            _ => return Ok(false),
+        };
+        set(cpu, Register::Pc, pc.wrapping_add(4))?;
+        self.hint(core, hint);
+        cpu.stop()?;
+        Ok(false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use fujimod_catalog_configuration::RunEngine;
     use super::*;
     use crate::board::{
         Board, InterruptMap, InterruptRegisters, aprofile,
@@ -28,7 +123,7 @@ mod tests {
             processors: vec![factory::Processor {
                 model: Model::ArmV8A,
                 registers: vec![(Register::Pc, 0x1000), (Register::Pstate, 0x3cd)],
-                released: true,
+                released: true, parked_until_sgi: false,
                 mprofile: None,
                 rprofile: None,
             }],
@@ -59,7 +154,7 @@ mod tests {
         };
         let mut board = graph
             .build(
-                factory::Options::new(factory::Engine::Unicorn),
+                factory::Options::new(RunEngine::Unicorn),
                 Bus::new(Mode::Strict),
                 Some(interrupts),
             )
@@ -229,7 +324,7 @@ mod tests {
                 processors: (0..4)
                     .map(|core| factory::Processor {
                         model: Model::ArmV8A,
-                        released: true,
+                        released: true, parked_until_sgi: false,
                         registers: vec![
                             (
                                 Register::Pc,
@@ -262,7 +357,7 @@ mod tests {
             if companion {
                 graph.processors.push(factory::Processor {
                     model: Model::CortexM4,
-                    released: false,
+                    released: false, parked_until_sgi: false,
                     registers: vec![],
                     mprofile: Some(crate::board::mprofile::Config {
                         clock_hz: 600_000_000,
@@ -288,7 +383,7 @@ mod tests {
             }
             let mut board = graph
                 .build(
-                    factory::Options::new(factory::Engine::Unicorn),
+                    factory::Options::new(RunEngine::Unicorn),
                     Bus::new(Mode::Strict),
                     Some(InterruptMap {
                         gic: Box::new(
@@ -392,99 +487,5 @@ mod tests {
         assert_eq!(scalar(cpu, system(0xc200)).unwrap(), 5);
         assert_eq!(scalar(cpu, Register::Pstate).unwrap(), 0x3c5);
         assert_eq!(state.instructions, [0]);
-    }
-}
-
-impl State {
-    /// Deliver this processor's Security state (PSTATE.EL and SCR_EL3.NS) to
-    /// an interrupt controller whose CPU interfaces depend on it.
-    pub(in crate::board) fn deliver_processor_security(
-        &mut self,
-        cpu: &dyn Cpu,
-        core: usize,
-    ) -> Result<(), String> {
-        let Some(interrupts) = self.interrupts.as_mut() else {
-            return Ok(());
-        };
-        if core >= interrupts.cores || !interrupts.gic.tracks_processor_security() {
-            return Ok(());
-        }
-        let pstate = scalar(cpu, Register::Pstate)?;
-        if pstate & 0x10 != 0 {
-            return Err("AArch32 Security state delivery to the GIC is not implemented".into());
-        }
-        let security = ProcessorSecurity {
-            el3: (pstate >> 2) & 3 == 3,
-            non_secure: scalar(cpu, system(0xf088))? & 1 != 0,
-        };
-        interrupts.gic.set_processor_security(core, security)
-    }
-    pub(in crate::board) fn aarch64_before(
-        &mut self,
-        cpu: &dyn Cpu,
-        core: usize,
-        pc: u64,
-    ) -> Result<bool, String> {
-        if self.aprofile[core].is_none() || cpu.features().architectural_exits {
-            return Ok(false);
-        }
-        if fujimod_emulator_cpu::arm64::enter_interrupt(cpu, self.pins[core].0, self.pins[core].1)?
-        {
-            cpu.stop()?;
-            return Ok(true);
-        }
-        let mut bytes = [0; 4];
-        cpu.read_virtual(pc, Access::Fetch, &mut bytes)?;
-        let word = u32::from_le_bytes(bytes);
-        self.aarch64_instruction(cpu, core, pc, word)
-    }
-    pub(in crate::board) fn aarch64_instruction(
-        &mut self,
-        cpu: &dyn Cpu,
-        core: usize,
-        pc: u64,
-        word: u32,
-    ) -> Result<bool, String> {
-        let pstate = scalar(cpu, Register::Pstate)?;
-        if word & 0xffd00000 == 0xd5100000 {
-            let encoding = ((word >> 5) & 0xffff) as u16;
-            let r = arm::SystemRegister::from_encoding(encoding);
-            let framework = fujimod_emulator_cpu::arm64::framework_instruction(word);
-            if framework {
-                if matches!(encoding, 0xf665 | 0xf667) && pstate & 12 != 12 {
-                    return Err("ICC EL3 register requires EL3".into());
-                }
-                if encoding == 0xe64d && pstate & 12 < 8 {
-                    return Err("ICC_SRE_EL2 requires EL2 or EL3".into());
-                }
-                if pstate & 12 == 0 {
-                    return Err("AArch64 EL0 framework register access is unsupported".into());
-                }
-                let read = word & (1 << 21) != 0;
-                let rt = (word & 31) as u64;
-                let syndrome = (0x18 << 26)
-                    | (u64::from(r.op0) << 20)
-                    | (u64::from(r.op1) << 14)
-                    | (u64::from(r.crn) << 10)
-                    | (u64::from(r.crm) << 1)
-                    | (u64::from(r.op2) << 17)
-                    | (rt << 5)
-                    | u64::from(read);
-                self.system_register(cpu, core, syndrome)?;
-                cpu.stop()?;
-            }
-            return Ok(false);
-        }
-        let hint = match word {
-            0xd503205f => Hint::WaitForEvent,
-            0xd503207f => Hint::WaitForInterrupt,
-            0xd503209f => Hint::SendEvent,
-            0xd50320bf => Hint::SendEventLocal,
-            _ => return Ok(false),
-        };
-        set(cpu, Register::Pc, pc.wrapping_add(4))?;
-        self.hint(core, hint);
-        cpu.stop()?;
-        Ok(false)
     }
 }

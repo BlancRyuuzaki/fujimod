@@ -6,7 +6,7 @@ import { FileList } from '@fujimod/emulator-ui/ui/file-list';
 import { Icon } from '@fujimod/emulator-ui/ui/icons';
 import { shownError } from '@fujimod/emulator-ui/ui/shown-error';
 import { FileDrop } from '../ui/file-drop';
-import { SiteHeader } from '../ui/site-header';
+import { SiteFrame } from '../ui/SiteFrame';
 import { ContributeDialog } from '../files/ContributeDialog';
 import { uploadReport, type UploadReport, type UploadReceipt } from './upload';
 import { reportPlatform, type ReportPlatform } from './file-guide';
@@ -26,8 +26,7 @@ import type { DeviceFileEntry } from '../device-files';
 import { formatBytes } from '@fujimod/emulator-ui/ui/file-list';
 import { prepareDownload } from './download';
 import { ReportUsb, type CameraChoice, type ReportConnection } from './usb';
-import '../home/site.css';
-import '../navigation.css';
+import { GeneralReport } from './GeneralReport';
 import './style.css';
 export default function BugReport(props: {
   connection?: ReportConnection;
@@ -70,7 +69,9 @@ export default function BugReport(props: {
   onSettled(() => {
     setPlatform(reportPlatform(navigator.userAgent, navigator.maxTouchPoints));
     try {
-      const value = parseReportLink(untrack(() => props.hash) ?? location.hash);
+      const hash = untrack(() => props.hash) ?? location.hash;
+      if (!hash) return;
+      const value = parseReportLink(hash);
       setLink(value);
       if (value.archive) {
         void acceptArchive(validateReport(decode64(value.archive), value), value)
@@ -107,14 +108,7 @@ export default function BugReport(props: {
     if (previous) URL.revokeObjectURL(previous);
     setScreen(
       shown.screen
-        ? URL.createObjectURL(
-            new Blob(
-              [bytes.subarray(shown.screen.offset, shown.screen.offset + shown.screen.bytes)],
-              {
-                type: 'image/bmp',
-              },
-            ),
-          )
+        ? URL.createObjectURL(new Blob([shown.screen], { type: 'image/bmp' }))
         : undefined,
     );
     setDetails(shown);
@@ -253,10 +247,9 @@ export default function BugReport(props: {
     <Show
       when={devTools()}
       fallback={
-        <div class="shell bug-report">
-          <SiteHeader root="../" />
+        <SiteFrame class="bug-report">
           <main>
-            <Show when={link()}>
+            <Show when={link()} fallback={<GeneralReport />}>
               {(value) => (
                 <>
                   <p>
@@ -330,8 +323,8 @@ export default function BugReport(props: {
                         <details>
                           <summary>After restarting the camera</summary>
                           <p>
-                            Open the issue QR screen again, or enable SET UP → FUJIMOD DEVTOOLS →
-                            USB DEBUGGING, then reconnect USB.
+                            Open the issue QR screen again, or enable SET UP → DEVTOOLS → USB
+                            DEBUGGING, then reconnect USB.
                           </p>
                         </details>
                       </Show>
@@ -489,7 +482,7 @@ export default function BugReport(props: {
                       }
                     >
                       <p class="cd-public">Your message will be posted publicly on GitHub.</p>
-                      <Show when={fromUsb() && connected() && connection.remove}>
+                      <Show when={fromUsb() && connected() && connection.remove !== undefined}>
                         <label class="cd-check">
                           <input
                             type="checkbox"
@@ -562,7 +555,7 @@ export default function BugReport(props: {
               <p role="alert">{error()}</p>
             </Show>
           </main>
-        </div>
+        </SiteFrame>
       }
     >
       <DevTools model={untrack(() => props.devToolsModel)} supported={supported} />

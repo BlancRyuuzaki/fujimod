@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::{ffi::c_void, ptr::NonNull};
 
 mod backend;
+mod cache;
 mod clock_poll;
 mod exclusive;
 mod loops;
@@ -31,15 +32,36 @@ use mapping::Mapping;
 #[cfg(test)]
 mod access_exit_tests;
 #[cfg(test)]
+mod cache_tests;
+#[cfg(test)]
 mod tcm_tests;
 #[cfg(test)]
 mod tests;
 
-#[derive(Clone, Copy, Default, serde::Deserialize)]
+const SCTLR: arm::Coprocessor = arm::Coprocessor {
+    cp: 15,
+    opc1: 0,
+    crn: 1,
+    crm: 0,
+    opc2: 0,
+    secure: 0,
+    wide: false,
+};
+/// SCTLR.V: exception vectors at 0xffff0000.
+const SCTLR_V: u64 = 1 << 13;
+
+#[derive(Clone, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Options {
     pub cp14_identity: u32,
     pub tcm: super::tcm::Options,
+    /// The processor's VINITHI input: exception vectors start at 0xffff0000 (SCTLR.V set at reset).
+    #[serde(default)]
+    pub high_vectors: bool,
+    /// Private, non-coherent write-back L1 data cache. Processors sharing
+    /// memory that declare one refuse cross-processor dirty-line hazards.
+    #[serde(default)]
+    pub data_cache: Option<super::data_cache::Options>,
 }
 pub struct Wiring {
     pub memory: Memory,
@@ -163,6 +185,9 @@ pub(super) struct Execution {
     observer_index: RefCell<observers::Index>,
     at_block: Cell<bool>,
     at_instruction: Cell<bool>,
+    data_cache: RefCell<Option<super::data_cache::Cache>>,
+    cache_spans: RefCell<Vec<super::data_cache::Span>>,
+    cache_spans_stale: Cell<bool>,
 }
 
 pub struct Core {
@@ -280,9 +305,23 @@ impl Core {
             observer_index: RefCell::new(observers::Index::default()),
             at_block: Cell::new(false),
             at_instruction: Cell::new(false),
+            data_cache: RefCell::new(None),
+            cache_spans: RefCell::new(Vec::new()),
+            cache_spans_stale: Cell::new(true),
         });
         let owner: Rc<dyn crate::memory::CodeOwner> = e.clone();
         e.id.set(e.memory.register(Rc::downgrade(&owner)));
+        if let Some(cache) = options
+            .data_cache
+            .as_ref()
+            .filter(|c| !c.checked.is_empty())
+        {
+            *e.data_cache.borrow_mut() = Some(super::data_cache::Cache::new(
+                e.id.get(),
+                e.memory.shared().data_lines(cache.geometry())?,
+                cache.checked.clone(),
+            )?);
+        }
         unsafe {
             let r = &mut *record.as_ptr();
             r.ring = (*e.ring.get()).as_mut_ptr();
@@ -326,8 +365,24 @@ impl Core {
                 range: HookRange::All,
             })?;
             e.cpu.hook_watched(stores, true)?;
+            if e.data_cache.borrow().is_some() {
+                // Every access to watched RAM reaches this hook; map_ram
+                // watches the checked ranges.
+                let accesses = e.cpu.install_hook(Hook::Memory {
+                    callback: data_access,
+                    data,
+                    read: true,
+                    write: true,
+                    range: HookRange::All,
+                })?;
+                e.cpu.hook_watched(accesses, true)?;
+            }
         }
         e.cpu.precise_store_pc(true)?;
+        if options.high_vectors {
+            let sctlr = e.cpu.coprocessor(SCTLR, None)?;
+            e.cpu.coprocessor(SCTLR, Some(sctlr | SCTLR_V))?;
+        }
         for bank in 0..2 {
             e.declare_tcm(bank)?;
             e.map_tcm(bank)?;
@@ -392,6 +447,27 @@ impl Execution {
                 ExecutionPolicy::Interactive => 2,
             }
         }
+    }
+    fn enter_supervisor_call(&self) -> Result<(), String> {
+        let cpsr = self.scalar(arm::CPSR)?;
+        // Unicorn's SVC trap leaves PC at the following instruction in both
+        // ARM and Thumb state. It has not changed mode or taken the vector.
+        let return_pc = self.scalar(arm::PC)?;
+        let sctlr = self.cpu.coprocessor(SCTLR, None)? as u32;
+        if sctlr & ((1 << 30) | (1 << 25)) != 0 {
+            return Err("Thumb/big-endian SVC exception entry is not implemented".into());
+        }
+        let vector = if u64::from(sctlr) & SCTLR_V != 0 {
+            0xffff0008
+        } else {
+            8
+        };
+        // Clear IT, J, E and T, switch to the SVC bank, and mask IRQ only.
+        let next = (cpsr & !(0x0600fc00 | 0x01000000 | 0x200 | 0x20 | 0x1f)) | 0x93;
+        self.set(arm::CPSR, next)?;
+        self.set(arm::SPSR, cpsr)?;
+        self.set(arm::CORE[14], return_pc)?;
+        self.set(arm::PC, vector)
     }
     fn accounting(&self) -> Accounting {
         unsafe { Accounting::from_raw(self.record) }
@@ -557,6 +633,8 @@ impl Execution {
                 .at(address)
                 .is_empty()
                 || special(word)
+                || self.data_cache_operation(word).is_some()
+                || self.reads_cache_geometry(word)
                 || self.loop_candidate(address, word)
             {
                 InstructionDisposition::ObserveAndEndBlock
@@ -805,7 +883,7 @@ impl Execution {
         let word = u32::from_le_bytes(bytes);
         let cpsr = self.scalar(arm::CPSR)?;
         let thumb = self.thumb.get();
-        if !thumb && self.execute_loop(address, word)? {
+        if self.execute_loop(address, word)? {
             return Ok(());
         }
         let condition = if thumb {
@@ -928,6 +1006,22 @@ impl Execution {
                 || cp == 15 && opc1 == 0 && crn == 9 && (crm == 1 || (12..=14).contains(&crm)))
         {
             return Err("unconditional R-profile coprocessor substitution is unmodeled".into());
+        }
+        if cp == 15 && word & (1 << 20) == 0 {
+            self.data_cache_instruction(word, opc1, crn, crm, opc2, cpsr)?;
+        }
+        if cp == 15
+            && word & (1 << 20) != 0
+            && (opc1, crn, crm, opc2) == (1, 0, 0, 0)
+            && self.data_cache.borrow().is_some()
+            && (self.thumb.get() || arm::condition_passes(word >> 28, cpsr))
+        {
+            let target = ((word >> 12) & 15) as usize;
+            if target == 15 {
+                return Err("R-profile CCSIDR transfer to PC is unmodeled".into());
+            }
+            self.set(arm::CORE[target], self.cache_geometry_register()?)?;
+            return self.complete(replaced, address, size, cpsr);
         }
         if cp == 15 && opc1 == 0 && crn == 9 && crm == 1 {
             if opc2 > 1 {
@@ -1102,6 +1196,12 @@ unsafe fn store(access: Access, address: u64, size: i32, value: i64, data: *mut 
 unsafe fn exception(exception: arm::Exception, data: *mut c_void) {
     let e = unsafe { context(data) };
     e.guarded(|| {
+        if exception == arm::Exception::SupervisorCall {
+            // The SVC was the last executed instruction of its block.
+            e.settle(0, true)?;
+            e.exception.set(Some(exception));
+            return e.cpu.stop();
+        }
         if matches!(
             exception,
             arm::Exception::PrefetchAbort | arm::Exception::DataAbort
@@ -1120,6 +1220,10 @@ unsafe fn exception(exception: arm::Exception, data: *mut c_void) {
             "unmodeled R-profile architectural exception {exception:?}"
         ))
     });
+}
+unsafe fn data_access(access: Access, address: u64, size: i32, _: i64, data: *mut c_void) {
+    let e = unsafe { context(data) };
+    e.guarded(|| e.data_access(access, address, size));
 }
 unsafe fn device_boundary(_: Access, _: u64, _: i32, _: i64, _: *mut c_void) {}
 

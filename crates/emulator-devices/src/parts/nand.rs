@@ -11,12 +11,12 @@ pub struct Options {
     pub pages_per_block: u32,
     pub spare_bytes: usize,
 }
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Overlay {
     pub offset: u64,
     pub bytes: Arc<[u8]>,
 }
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Nand {
     options: Options,
     base: Arc<[u8]>,
@@ -38,36 +38,55 @@ struct Snapshot {
 struct CommittedImage {
     schema: u32,
     options: Options,
-    base_sha256: String,
     base_bytes: usize,
     overlays: Vec<(u64, Vec<u8>)>,
     spare: Vec<(u32, Vec<u8>)>,
     pages: Vec<(u32, Vec<u8>)>,
     written_spare: Vec<(u32, Vec<u8>)>,
 }
-/// Portable programmed pages relative to the checked immutable medium inputs.
+/// What a NAND chip keeps across loss of power, relative to its checked base
+/// image: the declared input overlays and spare tags it was given, and every
+/// page programmed since. The base itself is identified, not copied.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Changes {
     identity: serde_json::Value,
+    overlays: Vec<(u64, Vec<u8>)>,
+    spare: BTreeMap<u32, Vec<u8>>,
     pages: BTreeMap<u32, Vec<u8>>,
     written_spare: BTreeMap<u32, Vec<u8>>,
 }
 impl Nand {
-    fn immutable_identity(&self) -> serde_json::Value {
-        serde_json::json!({"options":self.options,"base":crate::fingerprint::bytes(&self.base),
-            "overlays":self.overlays.iter().map(|o|(o.offset,crate::fingerprint::bytes(&o.bytes))).collect::<Vec<_>>(),
-            "spare":self.spare.iter().map(|(row,bytes)|(row,crate::fingerprint::bytes(bytes))).collect::<Vec<_>>()})
+    pub fn state(&self) -> serde_json::Value {
+        let pages = |data: &BTreeMap<u32, Vec<u8>>| {
+            data.iter()
+                .map(|(row, bytes)| (*row, crate::state::bytes(bytes)))
+                .collect::<Vec<_>>()
+        };
+        serde_json::json!({"options":self.options,"base":crate::state::bytes(&self.base),
+            "overlays":self.overlays.iter().map(|o|(o.offset,crate::state::bytes(&o.bytes))).collect::<Vec<_>>(),
+            "spare":pages(&self.spare),"pages":pages(&self.pages),"written_spare":pages(&self.written_spare)})
+    }
+    fn base_identity(&self) -> serde_json::Value {
+        serde_json::json!({"options":self.options,"base":crate::state::bytes(&self.base)})
     }
     pub fn changes(&self) -> Changes {
         Changes {
-            identity: self.immutable_identity(),
+            identity: self.base_identity(),
+            overlays: self
+                .overlays
+                .iter()
+                .map(|overlay| (overlay.offset, overlay.bytes.to_vec()))
+                .collect(),
+            spare: self.spare.clone(),
             pages: self.pages.clone(),
             written_spare: self.written_spare.clone(),
         }
     }
+    /// The same chip after a cold reconstruction: this medium's base and
+    /// geometry, carrying the retained medium's inputs and programmed pages.
     pub fn with_changes(&self, changes: &Changes) -> Result<Self, String> {
-        if changes.identity != self.immutable_identity() {
+        if changes.identity != self.base_identity() {
             return Err("NAND durable input identity differs".into());
         }
         let rows = self.options.bytes / self.options.page_bytes as u64;
@@ -82,7 +101,19 @@ impl Nand {
         {
             return Err("NAND durable page extent differs".into());
         }
-        let mut medium = self.clone();
+        let mut medium = Self::new(
+            self.options.clone(),
+            self.base.clone(),
+            changes
+                .overlays
+                .iter()
+                .map(|(offset, bytes)| Overlay {
+                    offset: *offset,
+                    bytes: Arc::from(bytes.as_slice()),
+                })
+                .collect(),
+            changes.spare.clone(),
+        )?;
         medium.pages = changes.pages.clone();
         medium.written_spare = changes.written_spare.clone();
         Ok(medium)
@@ -137,16 +168,6 @@ impl Nand {
         Ok(medium)
     }
 
-    pub fn fingerprint(&self) -> serde_json::Value {
-        let pages = |data: &BTreeMap<u32, Vec<u8>>| {
-            data.iter()
-                .map(|(row, bytes)| (*row, crate::fingerprint::bytes(bytes)))
-                .collect::<Vec<_>>()
-        };
-        serde_json::json!({"options":self.options,"base":crate::fingerprint::bytes(&self.base),
-            "overlays":self.overlays.iter().map(|o|(o.offset,crate::fingerprint::bytes(&o.bytes))).collect::<Vec<_>>(),
-            "spare":pages(&self.spare),"pages":pages(&self.pages),"written_spare":pages(&self.written_spare)})
-    }
     pub fn new(
         options: Options,
         base: Arc<[u8]>,
@@ -155,7 +176,7 @@ impl Nand {
     ) -> Result<Self, String> {
         if options.bytes == 0
             || options.bytes > 0x100000000
-            || !matches!(options.page_bytes, 512 | 2048)
+            || !matches!(options.page_bytes, 512 | 2048 | 4096)
             || !matches!(options.pages_per_block, 32 | 64)
             || options.spare_bytes < 16
             || options.spare_bytes > 512
@@ -257,11 +278,9 @@ impl Nand {
     /// Only committed external backing crosses a power cycle. CPU/controller
     /// state and pending operations never enter this format.
     pub fn committed_image(&self) -> Result<Vec<u8>, String> {
-        use sha2::{Digest, Sha256};
         serde_json::to_vec(&CommittedImage {
             schema: 1,
             options: self.options.clone(),
-            base_sha256: format!("{:x}", Sha256::digest(&self.base)),
             base_bytes: self.base.len(),
             overlays: self
                 .overlays
@@ -278,20 +297,16 @@ impl Nand {
         })
         .map_err(|e| e.to_string())
     }
-    /// Imports media against this receiver's geometry and immutable base identity.
+    /// Imports media against this receiver's geometry and immutable base extent.
     /// Overlays and spare inputs come from the image.
     pub fn restore_committed(&self, bytes: &[u8]) -> Result<Self, String> {
-        use sha2::{Digest, Sha256};
         if bytes.len() > 128 << 20 {
             return Err("NAND committed image exceeds bound".into());
         }
         let image: CommittedImage = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-        if image.schema != 1
-            || image.options != self.options
-            || image.base_bytes != self.base.len()
-            || image.base_sha256 != format!("{:x}", Sha256::digest(&self.base))
+        if image.schema != 1 || image.options != self.options || image.base_bytes != self.base.len()
         {
-            return Err("NAND committed image identity or geometry differs".into());
+            return Err("NAND committed image geometry differs".into());
         }
         let collect = |rows: Vec<(u32, Vec<u8>)>| -> Result<BTreeMap<u32, Vec<u8>>, String> {
             let mut map = BTreeMap::new();
@@ -403,7 +418,7 @@ impl Nand {
         if bytes.len() != self.options.page_bytes || spare.len() > self.options.spare_bytes {
             return Err("NAND program geometry mismatch".into());
         }
-        let mut old = [0; 2048];
+        let mut old = [0; 4096];
         self.read(
             row as u64 * self.options.page_bytes as u64,
             &mut old[..bytes.len()],
@@ -454,7 +469,7 @@ pub fn managed_tag(index: u16) -> Result<[u8; 16], String> {
 mod tests {
     use super::*;
     #[test]
-    fn portable_changes_bind_immutable_inputs_and_preserve_programmed_pages() {
+    fn retained_changes_bind_the_base_and_preserve_inputs_and_programmed_pages() {
         let initial = Nand::new(
             Options {
                 bytes: 0x40000,
@@ -467,13 +482,25 @@ mod tests {
             BTreeMap::new(),
         )
         .unwrap();
-        let mut written = initial.clone();
+        // Inputs layered on after construction (a patched stage-1 block) are
+        // part of the chip and survive a cold reconstruction from the base.
+        let mut written = initial
+            .with_inputs(
+                vec![Overlay {
+                    offset: 0x20000,
+                    bytes: Arc::from([0x5a; 2048]),
+                }],
+                BTreeMap::new(),
+            )
+            .unwrap();
         written.program(0, &[42; 2048], &[17; 64]).unwrap();
-        let encoded = serde_json::to_vec(&written.changes()).unwrap();
-        let changes: Changes = serde_json::from_slice(&encoded).unwrap();
+        let changes = written.changes();
         let restored = initial.with_changes(&changes).unwrap();
-        assert_eq!(restored.fingerprint(), written.fingerprint());
-        assert_ne!(initial.fingerprint(), written.fingerprint());
+        assert_eq!(restored, written);
+        assert_ne!(initial, written);
+        let mut retained = [0; 2048];
+        restored.read(0x20000, &mut retained).unwrap();
+        assert_eq!(retained, [0x5a; 2048]);
         let mut bad = changes.clone();
         bad.pages.insert(500, vec![0; 2048]);
         assert!(initial.with_changes(&bad).is_err());
@@ -536,21 +563,16 @@ mod tests {
             Default::default(),
         )
         .unwrap();
-        medium
-            .program(3, &vec![0x55; 512], &vec![0x33; 16])
-            .unwrap();
-        let state = medium.fingerprint();
+        medium.program(3, &vec![0x55; 512], &[0x33; 16]).unwrap();
+        let state = medium.clone();
         let saved = medium.checkpoint().unwrap();
         let envelope = Checkpoint::encode("medium-keyframe", &saved).unwrap();
         let decoded: Checkpoint = envelope.decode("medium-keyframe").unwrap();
-        assert_eq!(
-            Nand::from_checkpoint(&decoded).unwrap().fingerprint(),
-            state
-        );
+        assert_eq!(Nand::from_checkpoint(&decoded).unwrap(), state);
         assert!(Arc::ptr_eq(&base, &saved.blobs()[0]));
         medium.erase(0).unwrap();
         medium = Nand::from_checkpoint(&saved).unwrap();
-        assert_eq!(medium.fingerprint(), state);
+        assert_eq!(medium, state);
         assert!(Arc::ptr_eq(&base, &medium.checkpoint().unwrap().blobs()[0]));
     }
 }
@@ -641,7 +663,7 @@ mod image_tests {
         initial.read(64 * 2048, &mut bytes).unwrap();
         assert_eq!(bytes, [255; 2048]);
         let mut bad: serde_json::Value = serde_json::from_slice(&image).unwrap();
-        bad["base_sha256"] = serde_json::json!("wrong");
+        bad["base_bytes"] = serde_json::json!(1);
         assert!(
             initial
                 .restore_committed(&serde_json::to_vec(&bad).unwrap())

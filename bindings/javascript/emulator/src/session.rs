@@ -1,6 +1,7 @@
 //! Transport-owned lifetime and typed resolved inputs for the common runtime.
 //! This is not a second processor/body graph resolver. The EXR II resolver will
 //! supply construction here when it lands; unsupported kinds refuse meanwhile.
+use fujimod_catalog_configuration::RunEngine;
 use fujimod_emulator::board::{
     InterruptMap,
     bus::{Bus, Mode},
@@ -13,7 +14,7 @@ use fujimod_framebuffer::raster::PixelOrder;
 use fujimod_emulator_xp5_board::board;
 use fujimod_emulator_xp5_display::display;
 use serde::Deserialize;
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, rc::Rc, sync::Arc, time::Duration};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -142,7 +143,7 @@ pub struct Session {
     pub(super) construction: Option<super::snapshot::Construction>,
     pub(super) capture_order: std::cell::Cell<u64>,
     pub core: fujimod_emulator_session::Session,
-    pub(super) reset_image: Option<Arc<fujimod_emulator_session::checkpoint::Snapshot>>,
+    pub(super) reset_image: Option<Rc<fujimod_emulator_session::checkpoint::Snapshot>>,
     pub(super) powered_on: bool,
     pub(super) generation: u64,
     /// Identifies this session in its checkpoint IDs and input logs.
@@ -207,6 +208,7 @@ impl Session {
                     storage: None,
                     sd: BTreeMap::new(),
                     displays: scanouts,
+                    pwm: Default::default(),
                 };
                 board::register_all(&mut devices, &windows, &mut resources, &mut |w| {
                     Err(format!("unsupported device {}@{:#x}", w.kind, w.base))
@@ -265,6 +267,7 @@ impl Session {
                         },
                         registers,
                         released: c.released,
+                        parked_until_sgi: false,
                         mprofile: None,
                         rprofile: c.rprofile,
                     })
@@ -307,7 +310,7 @@ impl Session {
             )?,
         };
         let mut board = graph.build(
-            factory::Options::new(factory::Engine::Unicorn),
+            factory::Options::new(RunEngine::Unicorn),
             Bus::from_graph(Mode::Strict, devices)?,
             interrupts,
         )?;
@@ -326,6 +329,8 @@ impl Session {
                 resources: Default::default(),
                 nodes: Default::default(),
                 contacts: Default::default(),
+                power_cycle: None,
+                window_action: None,
                 recording_frames: Default::default(),
             },
             owner: next_owner(),
@@ -339,7 +344,7 @@ impl Session {
             history: None,
             failed: false,
         };
-        session.reset_image = session.core.checkpoint(None).ok().map(Arc::new);
+        session.reset_image = session.core.checkpoint(None).ok().map(Rc::new);
         Ok(session)
     }
     pub fn run(&mut self, until: u64) -> Result<(), String> {
@@ -368,6 +373,11 @@ impl Session {
             self.failed = true;
         }
         self.collect_frames();
+        // Supply-off ends this rewind branch. Keyframes cannot represent the
+        // pending cold reconstruction, or belong to its next board owner.
+        if self.core.board.is_powered_off() {
+            self.history = None;
+        }
         result
     }
     pub fn take_host_requests(
@@ -409,8 +419,8 @@ pub(super) fn decode(
     spec: &Firmware,
     firmware: &[u8],
 ) -> Result<Vec<fujimod_firmware::Unit>, String> {
-    if firmware.len() != spec.size || fujimod_firmware::sha256(firmware) != spec.sha256 {
-        return Err("firmware size/SHA-256 mismatch".into());
+    if firmware.len() != spec.size {
+        return Err("firmware size mismatch".into());
     }
     let images = match spec.format {
         Format::Dat => {
@@ -493,7 +503,7 @@ mod tests {
                 "windows":[{"kind":"adc","base":ADC,"size":0x1000,"options":{"samples":vec![RELEASED; 15]}}],
                 "controls": controls},
             "scenario": {"quantum": 16, "firmware": {"size": program.len(),
-                "sha256": fujimod_firmware::sha256(program), "format": "raw",
+                "sha256": "ab".repeat(32), "format": "raw",
                 "mappings": [{"name":"program","offset":0,"size":program.len(),"base":RAM,
                     "encoding":"raw","executable":true}]}},
         })
@@ -505,6 +515,39 @@ mod tests {
         json!({"kind":"ladder-keys","ladders":[{"wire":{"kind":"adc","channel":1},"levels":4096,"rungs":[
             {"key":"Menu","band_low":100,"band_high":200,"sample":150,"basis":"test fixture"},
             {"key":"StickPush","band_low":300,"band_high":400,"sample":350,"basis":"test fixture"}]}]})
+    }
+
+    #[test]
+    fn decode_preserves_size_mappings_and_format_checks_without_hashing() {
+        let program = program();
+        let config: Config = serde_json::from_slice(&config(&program, ladder_keys())).unwrap();
+        let mut firmware = config.scenario.firmware;
+        let mut changed = program.clone();
+        changed[0] ^= 0xff;
+        let units = decode(&firmware, &changed).unwrap();
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].name, "program");
+        assert_eq!(units[0].base, RAM);
+        assert!(units[0].executable);
+        assert_eq!(units[0].bytes, changed);
+        assert_eq!(
+            decode(&firmware, &program[..program.len() - 1]).unwrap_err(),
+            "firmware size mismatch"
+        );
+        assert_eq!(
+            decode(&firmware, &[program.as_slice(), &[0]].concat()).unwrap_err(),
+            "firmware size mismatch"
+        );
+        firmware.mappings[0].offset = program.len() as u64;
+        assert!(decode(&firmware, &program).is_err());
+        firmware.mappings[0].offset = 0;
+        firmware.mappings[0].encoding = Encoding::Method4;
+        assert_eq!(
+            decode(&firmware, &program).unwrap_err(),
+            "raw image cannot use DAT compression"
+        );
+        firmware.format = Format::Dat;
+        assert!(decode(&firmware, &program).is_err());
     }
 
     fn sample(session: &mut Session) -> u16 {

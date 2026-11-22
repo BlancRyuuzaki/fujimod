@@ -4,7 +4,7 @@ use super::contact_driver::{ControlChoice, ControlInput, QueueState};
 use fujimod_emulator_devices::parts::pins::Pin;
 use fujimod_emulator_devices::parts::switch_panel::{Signal, Spec, SwitchPanel};
 use std::collections::BTreeMap;
-use fujimod_emulator_devices::capability::{AnalogInputs, SerialStatus, TouchPanel};
+use fujimod_emulator_devices::capability::{AnalogInputs, GravityInput, SerialStatus, TouchPanel};
 
 /// Host-visible controls and their current positions.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -33,6 +33,18 @@ impl Session {
                     adc.set_sample(channel, value)?;
                 }
                 Ok(())
+            })
+    }
+    pub fn gravity_g(&self, node: &str) -> Result<[f64; 3], String> {
+        self.board
+            .inspect_capability::<dyn GravityInput, _>(self.node(node)?, |sensor| {
+                Ok(sensor.gravity_g())
+            })
+    }
+    pub fn set_gravity_g(&mut self, node: &str, gravity: [f64; 3]) -> Result<(), String> {
+        self.board
+            .edit_capability::<dyn GravityInput, _>(self.node(node)?, |sensor| {
+                sensor.set_gravity_g(gravity)
             })
     }
     pub fn configure_controls(&mut self, spec: Spec) -> Result<(), String> {
@@ -229,7 +241,7 @@ impl Session {
     }
     pub fn rotation(&self, id: &str, steps: i32) -> Result<(String, i32), String> {
         use super::contact_driver::Interface;
-        let (node, sign) = self
+        let (node, edges_per_step) = self
             .contact_driver
             .as_ref()
             .and_then(|d| {
@@ -237,17 +249,17 @@ impl Session {
                     Interface::Rotary {
                         id: found,
                         node,
-                        cycles_per_step,
-                    } if found == id => Some((node, *cycles_per_step)),
+                        edges_per_step,
+                    } if found == id => Some((node, *edges_per_step)),
                     _ => None,
                 })
             })
             .ok_or("physical rotary control is unavailable")?;
-        let cycles = steps.checked_mul(sign).ok_or("rotary step overflow")?;
+        let edges = steps.checked_mul(edges_per_step).ok_or("rotary step overflow")?;
         self.resources
             .encoder(node)?
-            .admit_cycles(self.board.now(), cycles)?;
-        Ok((node.clone(), cycles))
+            .admit_edges(self.board.now(), edges)?;
+        Ok((node.clone(), edges))
     }
     pub fn touch_input(
         &self,

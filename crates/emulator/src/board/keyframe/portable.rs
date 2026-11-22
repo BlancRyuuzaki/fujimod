@@ -20,7 +20,7 @@ struct Header<S, D, E> {
     host_pause: bool,
     isolated_core: Option<usize>,
     hooks: Vec<usize>,
-    mmio: Vec<(usize, u64, usize)>,
+    mmio: Vec<(usize, u64, usize, u64)>,
     controllers: Vec<Option<usize>>,
     observations: Vec<(usize, Vec<u64>)>,
 }
@@ -83,7 +83,7 @@ impl Board {
         if header.processors != n
             || encoded.blobs().len() != n + 1
             || encoded.children().len() != 2
-            || header.hooks != self.hooks.iter().map(|(core, _)| *core).collect::<Vec<_>>()
+            || header.hooks != self.hook_wiring().iter().map(|(core, _)| *core).collect::<Vec<_>>()
             || header.mmio != self.mmio
             || header.controllers
                 != state
@@ -112,6 +112,8 @@ impl Board {
         .any(|v| v.len() != n)
             || saved.pins.len() != n
             || saved.instructions.len() != n
+            || saved.epoch_instructions.len() != n
+            || saved.epoch_instructions.iter().zip(&saved.instructions).any(|(start, now)| start > now)
             || saved.accounted.len() != n
             || saved.mprofile.len() != n
             || saved.aprofile.len() != n
@@ -174,7 +176,7 @@ impl Board {
             quantum: header.quantum,
             host_pause: header.host_pause,
             isolated_core: header.isolated_core,
-            hooks: self.hooks.clone(),
+            hooks: self.hook_wiring(),
             mmio: header.mmio,
             controllers: header.controllers,
             observations: header.observations,

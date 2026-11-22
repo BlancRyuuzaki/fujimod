@@ -20,6 +20,9 @@ pub struct PartAssemblies {
     /// Declared contact actuators.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contact_actuators: Option<Vec<String>>,
+    /// Declared motor-driven contact cams.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_cams: Option<Vec<String>>,
     /// Declared serial outputs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serial_outputs: Option<Vec<String>>,
@@ -165,12 +168,33 @@ pub struct PrimaryControlBus {
     pub transfer_ticks: u64,
 }
 
+/// One further register chip on the secondary bus.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schema", schemars(rename = "HardwareSecondaryBusRegisterChip"))]
+pub struct SecondaryBusRegisterChip {
+    /// Seven-bit chip address.
+    pub address: u64,
+    /// Why this chip and its registers are believed.
+    pub basis: String,
+    /// Bus modes in which the chip answers.
+    pub modes: Vec<u64>,
+    /// Initial register values, each `[register, value]`.
+    pub values: Vec<Vec<u64>>,
+    /// Writable bits, each `[register, mask]`.
+    pub write_masks: Vec<Vec<u64>>,
+}
+
 /// Declared control bus1 replies facts.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schema", schemars(rename = "HardwareSecondaryBusRegisters"))]
 pub struct SecondaryBusRegisters {
+    /// Further register chips on the bus, each with its own register map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_registers: Option<Vec<SecondaryBusRegisterChip>>,
     /// Declared pwic address.
     pub pwic_address: u64,
     /// Declared pwic modes.
@@ -349,6 +373,27 @@ pub struct ControllerModels {
     pub window_analysis: Option<WindowAnalysis>,
 }
 
+/// Raw ADC codes for one encoder phase channel.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct EncoderLevels {
+    pub low: u16,
+    pub high: u16,
+}
+
+/// Physical encoder output levels; channel order is high phase bit, low phase bit.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EncoderOutputs {
+    Gpio,
+    Adc {
+        channels: [usize; 2],
+        levels: [EncoderLevels; 2],
+    },
+}
+
 /// Declared encoders options facts.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -358,7 +403,11 @@ pub struct EncoderTiming {
     /// Declared phase ticks.
     pub phase_ticks: u64,
     /// Declared pins.
-    pub pins: Vec<Pin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pins: Option<Vec<Pin>>,
+    /// Explicit output choice; absent means GPIO for existing bodies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outputs: Option<EncoderOutputs>,
     /// Declared rest phase.
     pub rest_phase: u64,
 }
@@ -372,6 +421,9 @@ pub struct Encoder {
     /// Declared counter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub counter: Option<String>,
+    /// ADC connection for an analog encoder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adc: Option<String>,
     /// Declared name.
     pub name: String,
     /// Declared options.
@@ -510,6 +562,20 @@ pub struct Shutter {
     pub closing_delay_seconds: Vec<Vec<f64>>,
 }
 
+/// Declared focal-plane curtain facts.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schema", schemars(rename = "HardwareCurtains"))]
+pub struct Curtains {
+    /// Image-input comparator output that releases the first curtain.
+    pub first_output: u64,
+    /// Image-input comparator output that releases the second curtain.
+    pub second_output: u64,
+    /// Light added to the interval between the two comparator edges, seconds.
+    pub light_offset_seconds: f64,
+}
+
 /// Declared radiometry facts.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -518,22 +584,42 @@ pub struct Shutter {
 pub struct Radiometry {
     /// Declared pixel clock hz.
     pub pixel_clock_hz: u64,
-    /// Declared projection.
-    pub projection: Projection,
+    /// Declared lens projection; absent when no lens is mounted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<Projection>,
     /// Declared rolling references.
     pub rolling_references: Vec<RollingReference>,
     /// Invalid readouts while a sensor drive-mode change acquires sync.
     pub mode_change_frames: u8,
     /// Declared saturation lux seconds.
     pub saturation_lux_seconds: f64,
-    /// Declared shutter.
-    pub shutter: Shutter,
+    /// Declared leaf shutter; absent for a focal-plane body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutter: Option<Shutter>,
+    /// Declared focal-plane curtains; absent for a leaf-shutter body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curtains: Option<Curtains>,
     /// Declared shutter output.
     pub shutter_output: u64,
     /// Declared ticks per second.
     pub ticks_per_second: u64,
     /// Declared white luminance.
     pub white_luminance: f64,
+    /// Live-view calibration declared separately from the still readout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_view: Option<RadiometricCalibration>,
+}
+
+/// Declared calibration of one radiometric path.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schema", schemars(rename = "HardwareRadiometricCalibration"))]
+pub struct RadiometricCalibration {
+    /// Raw response to the reference white, per colour.
+    pub reference_white: Vec<u64>,
+    /// Exposure that saturates the reference white.
+    pub saturation_lux_seconds: f64,
 }
 
 /// Declared capture color facts.
@@ -718,7 +804,7 @@ pub struct IrisMechanics {
     /// Declared boundary.
     pub boundary: String,
     /// Declared travel limits.
-    pub travel_limits: Vec<u64>,
+    pub travel_limits: Vec<i64>,
 }
 
 /// Declared iris optics facts.
@@ -727,10 +813,34 @@ pub struct IrisMechanics {
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schema", schemars(rename = "HardwareIrisOptics"))]
 pub struct IrisOptics {
+    /// What moves the iris: `lens` (the lens unit's second motor, the default)
+    /// or `bridge` (the stepper behind the bus1 motor bridge).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actuator: Option<String>,
     /// Declared output.
     pub output: String,
     /// Declared positions.
     pub positions: Vec<Vec<f64>>,
+}
+
+/// A neutral-density filter swung in by a lens-unit output register.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schema", schemars(rename = "HardwareNdFilter"))]
+pub struct NdFilter {
+    /// Why the actuator and its factor are believed.
+    pub basis: String,
+    /// Light reduction while the filter is in (8 = 3 EV).
+    pub factor: f64,
+    /// Coil bit that swings the filter in.
+    pub insert_mask: u64,
+    /// Wire that publishes the current transmission factor.
+    pub output: String,
+    /// Lens-unit output register that drives the actuator.
+    pub register: u64,
+    /// Coil bit that swings the filter out.
+    pub remove_mask: u64,
 }
 
 /// Declared sensor capture facts.
@@ -778,6 +888,9 @@ pub struct Imaging {
     /// Declared iris optics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub iris_optics: Option<IrisOptics>,
+    /// Declared neutral-density filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nd_filter: Option<NdFilter>,
     /// Declared sensor capture.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sensor_capture: Option<SensorCapture>,
@@ -1266,6 +1379,20 @@ pub struct XppUsb {
     pub transaction_ticks: u64,
 }
 
+/// XP4 USB PHY programming port, separate from the device controller.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schema", schemars(rename = "HardwareUsbPhy"))]
+pub struct UsbPhy {
+    /// Declared base of the indexed control, parallel and readback words.
+    pub base: u64,
+    /// Declared basis.
+    pub basis: String,
+    /// Declared size.
+    pub size: u64,
+}
+
 /// X-Processor Pro power control: supply hold and power domains.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -1326,6 +1453,37 @@ pub struct XppSdHost {
     pub size: u64,
     /// Ticks of one command or data transfer.
     pub transfer_ticks: u64,
+}
+
+/// X-Processor 4 SD host: one standard SDHCI register bank at the window base.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schema", schemars(rename = "HardwareSdHost"))]
+pub struct SdHost {
+    /// Declared base.
+    pub base: u64,
+    /// Declared basis.
+    pub basis: String,
+    /// Capabilities register (+0x40).
+    pub capabilities: u32,
+    /// Capabilities 2 register (+0x44).
+    pub capabilities_2: u32,
+    /// Ticks for the internal clock to report stable.
+    pub clock_ticks: u64,
+    /// Interrupt line of the SDHCI status, when it is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub irq_route: Option<u32>,
+    /// Declared size.
+    pub size: u64,
+    /// Slot status halfword (+0xfc) and host controller version (+0xfe).
+    pub slot_and_version: u32,
+    /// Ticks of one command or data transfer.
+    pub transfer_ticks: u64,
+    /// Offsets of vendor words beyond the standard bank that read back their
+    /// last write.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vendor_offsets: Vec<u64>,
 }
 
 /// X-Processor Pro reset and gate controls; SD channel reset lines.
@@ -1592,6 +1750,24 @@ pub struct JpegCodec {
     pub size: u64,
 }
 
+/// X-Processor Pro movie H.264 encoder.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schema", schemars(rename = "HardwareH264Encoder"))]
+pub struct H264Encoder {
+    /// Declared base.
+    pub base: u64,
+    /// Declared basis.
+    pub basis: String,
+    /// Interrupt line of the completion status.
+    pub irq_route: u32,
+    /// Time from a start to the completion of its run, in device ticks.
+    pub run_ticks: u64,
+    /// Declared size.
+    pub size: u64,
+}
+
 /// Declared input buffer facts.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -1630,6 +1806,10 @@ pub struct ImagingRegisters {
     pub input_buffer: InputBuffer,
     /// Declared normal irqs.
     pub normal_irqs: Vec<u64>,
+    /// Completion interrupt lines of the two RAW read-out DMA channels
+    /// (command window +0x40 and +0xc0). Left out, the channels refuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_dma_irqs: Option<Vec<u64>>,
     /// Declared receiver base.
     pub receiver_base: u64,
     /// Declared reset ticks.
@@ -1939,12 +2119,18 @@ pub struct RegisterLayouts {
     /// Declared X-Processor Pro JPEG decoder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jpeg_decoder: Option<JpegCodec>,
+    /// Declared X-Processor Pro movie H.264 encoder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h264_encoder: Option<H264Encoder>,
     /// Declared HDMI transmitter without a sink.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hdmi_tx: Option<HdmiTransmitter>,
     /// Declared X-Processor Pro SD channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xpp_sd: Option<XppSdHost>,
+    /// Declared X-Processor 4 SD hosts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sd_hosts: Vec<SdHost>,
     /// Declared X-Processor Pro reset and gate controls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reset_gates: Option<ResetGates>,
@@ -1963,6 +2149,9 @@ pub struct RegisterLayouts {
     /// Declared X-Processor Pro USB device controller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xpp_usb: Option<XppUsb>,
+    /// Declared XP4 USB PHY programming port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usb_phy: Option<UsbPhy>,
     /// Declared interrupts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interrupts: Option<Interrupts>,
@@ -2135,6 +2324,12 @@ pub struct BlockParameters {
     /// Declared companion irq base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub companion_irq_base: Option<u64>,
+    /// Declared virtual time from an I2C byte command to its completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub byte_ns: Option<u64>,
+    /// Declared interrupt line of the block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interrupt: Option<u32>,
     /// Declared receive request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receive_request: Option<u64>,
@@ -2323,6 +2518,8 @@ pub enum DeviceKind {
     RawConversionRegisters,
     /// Raw Statistics Control.
     RawStatisticsControl,
+    /// SATA host controller register block.
+    SataHost,
     /// Shared still processor with body-declared CFA.
     StillProcessor,
     /// S P I1 Serial Bus.

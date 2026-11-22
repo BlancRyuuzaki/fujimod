@@ -1,5 +1,6 @@
 //! Bounded Motorola-master PL022 transport (ARM DDI 0194H).
 //! FIFO/request state and serial clock edges are independent of executing code.
+use fujimod_emulator_devices::checkpoint::Checkpoint;
 use fujimod_emulator_devices::bus::InterruptLine;
 use fujimod_emulator_devices::dma::{Direction, Port, Request, SharedPort};
 use fujimod_emulator_parts_io::serial::{Frame, Wire};
@@ -7,9 +8,13 @@ use fujimod_emulator_devices::{Cx, Device};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 const DEPTH: usize = 8;
+/// Side-effect-free registers: CR0, CR1, SR, CPSR, IMSC, RIS, MIS, DMACR.
+/// DR (pops the receive FIFO) and ICR (write-only) are never published.
+const PUBLISHED: [u64; 8] = [0, 4, 0xc, 0x10, 0x14, 0x18, 0x1c, 0x24];
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Clock {
     pub source_hz: u64,
@@ -42,6 +47,12 @@ struct Engine {
     clock: Clock,
     state: State,
     wire: Box<dyn Wire>,
+    /// Register values as of the last access, advance or restore. They change
+    /// only at those points or at a deadline this device declares.
+    published: [Arc<AtomicU32>; PUBLISHED.len()],
+    /// The same values for halfword reads; every register fits 16 bits
+    /// and a read returns the same value at either width.
+    published16: [Arc<AtomicU16>; PUBLISHED.len()],
 }
 impl Engine {
     fn frame(&self, word: u16) -> Result<Frame, String> {
@@ -197,10 +208,17 @@ impl Engine {
         self.state.pending.is_some() || !self.state.tx.is_empty()
     }
     fn read(&mut self, offset: u64, now: u64) -> Result<u64, String> {
-        Ok(match offset {
+        if offset == 8 {
+            return Ok(self.receive(now)? as u64);
+        }
+        self.register(offset)
+            .ok_or_else(|| "PL022 register is unmodeled".into())
+    }
+    /// A register whose read has no side effect.
+    fn register(&self, offset: u64) -> Option<u64> {
+        Some(match offset {
             0 => self.state.control as u64,
             4 => self.state.enable as u64,
-            8 => self.receive(now)? as u64,
             0xc => {
                 u64::from(self.state.tx.is_empty())
                     | (u64::from(self.state.tx.len() < DEPTH) << 1)
@@ -213,8 +231,15 @@ impl Engine {
             0x18 => self.ris() as u64,
             0x1c => (self.ris() & self.state.mask) as u64,
             0x24 => self.state.dma as u64,
-            _ => return Err("PL022 register is unmodeled".into()),
+            _ => return None,
         })
+    }
+    fn publish_registers(&self) {
+        for (i, offset) in PUBLISHED.into_iter().enumerate() {
+            let value = self.register(offset).unwrap();
+            self.published[i].store(value as u32, Ordering::Release);
+            self.published16[i].store(value as u16, Ordering::Release);
+        }
     }
     fn write(&mut self, offset: u64, value: u64, now: u64) -> Result<(), String> {
         match offset {
@@ -231,9 +256,9 @@ impl Engine {
                 if self.state.pending.is_some() && value != self.state.enable as u64 {
                     return Err("PL022 control change during a frame is unmodeled".into());
                 }
-                if value & 2 == 0 && !self.state.rx.is_empty() {
-                    return Err("PL022 disable with unread FIFO data is unmodeled".into());
-                }
+                // Clearing SSE does not flush the FIFOs (PL022 TRM): unread receive
+                // words stay readable. The X-T5 4.31 M-core disables the companion
+                // SSP (0x21430) with IBIS sensor replies still queued.
                 let old = self.state.enable;
                 self.state.enable = value as u8;
                 if let Err(e) = self.start(now) {
@@ -283,25 +308,73 @@ impl Port for DmaPort {
             return Err("PL022 DMA width is unmodeled".into());
         }
         let mut e = self.0.lock().map_err(|_| "PL022 state poisoned")?;
-        let word = e.receive(now)? as u64;
-        Ok(word & (u64::MAX >> (64 - bytes as u32 * 8)))
+        let word = e.receive(now);
+        e.publish_registers();
+        Ok(word? as u64 & (u64::MAX >> (64 - bytes as u32 * 8)))
     }
     fn transmit(&mut self, now: u64, bytes: u8, value: u64) -> Result<(), String> {
         if !matches!(bytes, 1 | 2) || value >> (bytes as u32 * 8) != 0 {
             return Err("PL022 DMA width/value is unmodeled".into());
         }
-        self.0
-            .lock()
-            .map_err(|_| "PL022 state poisoned")?
-            .transmit(now, value as u16)
+        let mut e = self.0.lock().map_err(|_| "PL022 state poisoned")?;
+        let result = e.transmit(now, value as u16);
+        e.publish_registers();
+        result
     }
 }
 pub struct Controller {
     base: u64,
     engine: Arc<Mutex<Engine>>,
     interrupts: Vec<InterruptLine>,
+    /// The board declares that the interrupt output reaches no modeled input. Without
+    /// lines and without this declaration, a raised interrupt refuses.
+    interrupt_unconnected: bool,
 }
 impl Controller {
+    fn validate_state(
+        &self, e: &Engine, clock: Clock, interrupts: Vec<InterruptLine>, base: Option<u64>,
+        state: &State,
+    ) -> Result<(), String> {
+        if clock != e.clock
+            || interrupts != self.interrupts
+            || base != Some(self.base)
+            || state.tx.len() > DEPTH
+            || state.rx.len() > DEPTH
+            || state.control & 0x30 != 0
+            || state.enable & !0xb != 0
+            || state.divider & 1 != 0
+            || state.mask & !15 != 0
+            || state.dma & !3 != 0
+            || state.pending.as_ref().is_some_and(|p| {
+                !(4..=16).contains(&p.frame.bits) || p.frame.mode > 3 || state.enable & 2 == 0
+            })
+            || state.pending.is_some() && state.divider < 2
+            || state.pending.is_some() != state.clock_chain.is_some()
+            || state.idle_since.is_some() && (state.pending.is_some() || state.rx.is_empty())
+            || state.timeout && (state.rx.is_empty() || state.pending.is_some())
+            || state
+                .requests
+                .iter()
+                .zip(Engine::request_levels(&state))
+                .any(|(r, level)| r.since().is_some() != level)
+        {
+            return Err("invalid PL022 checkpoint state or wiring".into());
+        }
+        if let Some(pending) = &state.pending {
+            let (origin, cycles) = state.clock_chain.unwrap();
+            if cycles == 0
+                || e.at(origin, cycles)? != pending.at
+                || pending.frame.bits != (state.control & 15) as u8 + 1
+                || pending.frame.mode != ((state.control >> 6) & 3) as u8
+                || pending.frame.word > u16::MAX >> (16 - pending.frame.bits)
+                || pending.token.is_none() != (state.enable & 1 != 0)
+            {
+                return Err("invalid PL022 pending frame".into());
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(
         base: u64,
         clock: Clock,
@@ -312,15 +385,29 @@ impl Controller {
         {
             return Err("invalid PL022 clock or aperture".into());
         }
+        let engine = Engine {
+            clock,
+            state: State::default(),
+            wire,
+            published: Default::default(),
+            published16: Default::default(),
+        };
+        engine.publish_registers();
         Ok(Self {
             base,
             interrupts,
-            engine: Arc::new(Mutex::new(Engine {
-                clock,
-                state: State::default(),
-                wire,
-            })),
+            interrupt_unconnected: false,
+            engine: Arc::new(Mutex::new(engine)),
         })
+    }
+    /// Declares the interrupt output unconnected: raising it then drives nothing.
+    /// Refuses when the controller already drives interrupt lines.
+    pub fn with_unconnected_interrupt(mut self) -> Result<Self, String> {
+        if !self.interrupts.is_empty() {
+            return Err("PL022 interrupt output is both connected and unconnected".into());
+        }
+        self.interrupt_unconnected = true;
+        Ok(self)
     }
     pub fn port(&self) -> SharedPort {
         Arc::new(Mutex::new(DmaPort(self.engine.clone())))
@@ -330,12 +417,13 @@ impl Controller {
         (matches!(size, 2 | 4) && offset <= 0x24 && offset & 3 == 0).then_some(offset)
     }
     fn publish(&self, e: &mut Engine, cx: &mut Cx<'_>) {
+        e.publish_registers();
         let high = e.irq();
         if high == e.state.irq_published {
             return;
         }
         e.state.irq_published = high;
-        if self.interrupts.is_empty() && high {
+        if self.interrupts.is_empty() && !self.interrupt_unconnected && high {
             cx.unmodeled();
         }
         for &line in &self.interrupts {
@@ -359,8 +447,8 @@ impl Device for Controller {
         self.publish(&mut e, cx);
         match result {
             Ok(value) => value,
-            Err(_) => {
-                cx.unmodeled();
+            Err(error) => {
+                cx.unsupported(error);
                 0
             }
         }
@@ -375,23 +463,84 @@ impl Device for Controller {
             .advance(cx.now())
             .and_then(|_| e.write(offset, value, cx.now()));
         self.publish(&mut e, cx);
-        if result.is_err() {
-            cx.unmodeled();
+        if let Err(error) = result {
+            cx.unsupported(error);
         }
     }
     fn advance(&mut self, cx: &mut Cx<'_>) {
         let mut e = self.engine.lock().unwrap();
-        if e.advance(cx.now()).is_err() {
-            cx.unmodeled();
+        if let Err(error) = e.advance(cx.now()) {
+            cx.unsupported(error);
         }
         self.publish(&mut e, cx);
     }
     fn next_deadline(&self, now: u64) -> Option<u64> {
         self.engine.lock().unwrap().next(now)
     }
+    fn fast_reads(
+        &self,
+        window_base: u64,
+        window_size: u64,
+    ) -> Vec<fujimod_emulator_devices::bus::FastReadWord> {
+        let e = self.engine.lock().unwrap();
+        use fujimod_emulator_devices::bus::{FastReadValue, FastReadWord};
+        PUBLISHED
+            .into_iter()
+            .enumerate()
+            .flat_map(|(i, offset)| {
+                [
+                    FastReadValue::AtomicU32(e.published[i].clone()),
+                    FastReadValue::AtomicU16(e.published16[i].clone()),
+                ]
+                .map(|value| (offset, value))
+            })
+            .filter_map(|(offset, value)| {
+                let address = self.base.checked_add(offset)?;
+                let end = address.checked_add(value.width())?;
+                (address >= window_base && end <= window_base.checked_add(window_size)?).then(
+                    || FastReadWord {
+                        offset: address - window_base,
+                        value,
+                    },
+                )
+            })
+            .collect()
+    }
     fn pollable(&self, address: u64, size: u8) -> bool {
         self.offset(address, size)
             .is_some_and(|o| matches!(o, 0 | 4 | 0xc | 0x10 | 0x14 | 0x18 | 0x1c | 0x24))
+    }
+    fn poll_stable(&self, address: u64, size: u8) -> bool {
+        // SSPSR follows the FIFOs and the frame in flight. They change at a
+        // data register access and when a frame ends, which is a deadline.
+        self.offset(address, size) == Some(0xc)
+    }
+    fn checkpoint(&self) -> Result<Checkpoint, String> {
+        let e = self.engine.lock().map_err(|_| "PL022 state poisoned")?;
+        Ok(Checkpoint::encode(self.name(), &(e.clock, self.base, &self.interrupts, &e.state))?
+            .with_children(vec![e.wire.checkpoint()?]))
+    }
+    fn validate_checkpoint(&self, saved: &Checkpoint) -> Result<(), String> {
+        let (clock, base, interrupts, state): (Clock, u64, Vec<InterruptLine>, State) =
+            saved.decode(self.name())?;
+        let [wire] = saved.children() else { return Err("PL022 snapshot lacks wire state".into()); };
+        let e = self.engine.lock().map_err(|_| "PL022 state poisoned")?;
+        self.validate_state(&e, clock, interrupts, Some(base), &state)?;
+        e.wire.validate_checkpoint(wire)?;
+        if let Some((token, frame)) = state.pending.as_ref().and_then(|pending| {
+            Some((pending.token?, pending.frame))
+        }) {
+            e.wire.validate_pending(wire, token, frame)?;
+        }
+        Ok(())
+    }
+    fn restore_checkpoint(&mut self, saved: &Checkpoint) -> Result<(), String> {
+        self.validate_checkpoint(saved)?;
+        let (_, _, _, state): (Clock, u64, Vec<InterruptLine>, State) = saved.decode(self.name())?;
+        let mut e = self.engine.lock().map_err(|_| "PL022 state poisoned")?;
+        e.wire.restore_checkpoint(&saved.children()[0])?;
+        e.state = state;
+        Ok(())
     }
     fn save(&self) -> Value {
         let e = self.engine.lock().unwrap();
@@ -405,46 +554,10 @@ impl Device for Controller {
         let state: State =
             serde_json::from_value(value["state"].clone()).map_err(|e| e.to_string())?;
         let mut e = self.engine.lock().map_err(|_| "PL022 state poisoned")?;
-        if clock != e.clock
-            || interrupts != self.interrupts
-            || value["base"].as_u64() != Some(self.base)
-            || state.tx.len() > DEPTH
-            || state.rx.len() > DEPTH
-            || state.control & 0x30 != 0
-            || state.enable & !0xb != 0
-            || state.divider & 1 != 0
-            || state.mask & !15 != 0
-            || state.dma & !3 != 0
-            || state.pending.as_ref().is_some_and(|p| {
-                !(4..=16).contains(&p.frame.bits) || p.frame.mode > 3 || state.enable & 2 == 0
-            })
-            || state.pending.is_some() && state.divider < 2
-            || state.pending.is_some() != state.clock_chain.is_some()
-            || !state.rx.is_empty() && state.enable & 2 == 0
-            || state.idle_since.is_some() && (state.pending.is_some() || state.rx.is_empty())
-            || state.timeout && (state.rx.is_empty() || state.pending.is_some())
-            || state
-                .requests
-                .iter()
-                .zip(Engine::request_levels(&state))
-                .any(|(r, level)| r.since().is_some() != level)
-        {
-            return Err("invalid PL022 checkpoint state or wiring".into());
-        }
-        if let Some(pending) = &state.pending {
-            let (origin, cycles) = state.clock_chain.unwrap();
-            if cycles == 0
-                || e.at(origin, cycles)? != pending.at
-                || pending.frame.bits != (state.control & 15) as u8 + 1
-                || pending.frame.mode != ((state.control >> 6) & 3) as u8
-                || pending.frame.word > u16::MAX >> (16 - pending.frame.bits)
-                || pending.token.is_none() != (state.enable & 1 != 0)
-            {
-                return Err("invalid PL022 pending frame".into());
-            }
-        }
+        self.validate_state(&e, clock, interrupts, value["base"].as_u64(), &state)?;
         e.wire.restore(&value["wire"])?;
         e.state = state;
+        e.publish_registers();
         Ok(())
     }
 }

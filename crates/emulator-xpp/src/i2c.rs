@@ -8,7 +8,7 @@
 //! is unsupported. Addresses without a part are NACKed. Written values read
 //! back; no part behavior beyond the register file is modeled. The last
 //! transfers are kept for inspection.
-use fujimod_emulator_ip::dw_i2c::Bus;
+use fujimod_emulator_devices::parts::i2c::{Bus, RegisterInput};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
@@ -96,6 +96,29 @@ impl Parts {
     }
 }
 
+impl RegisterInput for Parts {
+    fn set_register_input(&mut self, address: u16, register: u8, value: u16) -> Result<(), String> {
+        let index = self
+            .parts
+            .iter()
+            .position(|part| part.address == address)
+            .ok_or_else(|| format!("I2C part {address:#x} is not declared"))?;
+        let part = &self.parts[index];
+        if part.width == 1 && value > u16::from(u8::MAX) {
+            return Err(format!(
+                "I2C part {address:#x} register input exceeds its 1-byte width"
+            ));
+        }
+        let Some(current) = self.state.registers[index].get_mut(&register) else {
+            return Err(format!(
+                "I2C part {address:#x} register {register:#x} is not declared"
+            ));
+        };
+        *current = value;
+        Ok(())
+    }
+}
+
 impl Bus for Parts {
     fn start(&mut self, address: u16, read: bool) -> bool {
         let s = &mut self.state;
@@ -114,20 +137,21 @@ impl Bus for Parts {
         });
         s.active.is_some()
     }
-    fn write(&mut self, byte: u8) {
+    fn write(&mut self, byte: u8) -> Result<(), String> {
         self.log(byte);
         let Some(index) = self.state.active else {
-            return;
+            return Ok(());
         };
         let part = self.parts[index].clone();
         let Some(register) = self.state.selected else {
             self.state.selected = Some(byte & part.select_mask);
-            return;
+            return Ok(());
         };
         let shift = Self::shift(&part, self.state.byte);
         let value = self.state.registers[index].entry(register).or_default();
         *value = *value & !(0xff << shift) | u16::from(byte) << shift;
         self.next_byte(&part);
+        Ok(())
     }
     fn read(&mut self) -> Result<u8, String> {
         let Some(index) = self.state.active else {
@@ -212,7 +236,7 @@ mod tests {
         let mut parts = gauge();
         assert!(!parts.start(0x37, false));
         assert!(parts.start(0x36, false));
-        parts.write(0x10);
+        parts.write(0x10).unwrap();
         assert!(parts.start(0x36, true));
         assert_eq!(parts.read(), Ok(0x34));
         assert_eq!(parts.read(), Ok(0x12));
@@ -221,10 +245,10 @@ mod tests {
         let saved = parts.save();
         assert!(parts.start(0x36, false));
         for byte in [0x18, 0xbb, 0x03] {
-            parts.write(byte);
+            parts.write(byte).unwrap();
         }
         assert!(parts.start(0x36, false));
-        parts.write(0x18);
+        parts.write(0x18).unwrap();
         assert!(parts.start(0x36, true));
         assert_eq!(parts.read(), Ok(0xbb));
         assert_eq!(parts.read(), Ok(0x03));
@@ -255,9 +279,46 @@ mod tests {
         }])
         .unwrap();
         assert!(parts.start(0x39, false));
-        parts.write(0xb8);
+        parts.write(0xb8).unwrap();
         assert!(parts.start(0x39, true));
         assert_eq!(parts.read(), Ok(0x34));
         assert_eq!(parts.read(), Ok(0x02));
+    }
+
+    #[test]
+    fn external_register_input_changes_only_declared_part_values() {
+        let mut parts = Parts::new(vec![Part {
+            address: 0x39,
+            select_mask: 0x1f,
+            width: 1,
+            little_endian: true,
+            registers: [(0x13, 0), (0x18, 0), (0x19, 0)].into(),
+        }])
+        .unwrap();
+        parts.set_register_input(0x39, 0x18, 0xbc).unwrap();
+        parts.set_register_input(0x39, 0x19, 2).unwrap();
+        assert!(parts.start(0x39, false));
+        parts.write(0xb8).unwrap();
+        assert!(parts.start(0x39, true));
+        assert_eq!(parts.read(), Ok(0xbc));
+        assert_eq!(parts.read(), Ok(2));
+        assert!(
+            parts
+                .set_register_input(0x39, 0x20, 1)
+                .unwrap_err()
+                .contains("not declared")
+        );
+        assert!(
+            parts
+                .set_register_input(0x38, 0x18, 1)
+                .unwrap_err()
+                .contains("not declared")
+        );
+        assert!(
+            parts
+                .set_register_input(0x39, 0x18, 0x100)
+                .unwrap_err()
+                .contains("1-byte width")
+        );
     }
 }

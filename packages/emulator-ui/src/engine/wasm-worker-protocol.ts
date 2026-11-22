@@ -36,7 +36,7 @@ export type WasmRequest =
   | { action: 'card_insert'; present: boolean }
   | { action: 'restart_card'; files: CardFile[] }
   | { action: 'rollback'; seconds: number }
-  | { action: 'checkpoint' | 'undo' | 'history' | 'fingerprint' }
+  | { action: 'checkpoint' | 'undo' | 'history' | 'complete_state' }
   | { action: 'restore_checkpoint'; id: string }
   | { action: 'replay_history'; bytes: Uint8Array }
   | { action: 'profile'; limit?: number }
@@ -49,7 +49,7 @@ export type WasmWorkerEvent =
   | { type: 'reply'; serial: number; result?: unknown }
   | { type: 'error'; serial?: number; error: string; fault?: EngineFault }
   | { type: 'progress'; message: string; percent?: number; assets?: AssetProgress[] }
-  | { type: 'state'; state: SessionState }
+  | { type: 'state'; state: SessionState; supplyOn: boolean }
   | { type: 'metrics'; metrics: CameraPerformance }
   | { type: 'saved'; savedAt?: number; revision?: number; error?: string }
   | { type: 'frame'; bitmap: ImageBitmap; width: number; height: number; sequence: number }

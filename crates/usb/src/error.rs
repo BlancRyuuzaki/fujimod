@@ -15,6 +15,9 @@ pub enum TransferStage {
 pub enum Error {
     #[error("card file operation failed: {0}")]
     Card(String),
+    /// Camera RAM holds no installed file-service descriptor, as on stock firmware.
+    #[error("the camera has no installed file service")]
+    NoFileService,
     #[error("the camera already has an open service session")]
     SessionAlreadyOpen,
     #[error("callback slot restoration failed: {0}")]
@@ -26,6 +29,8 @@ pub enum Error {
     },
     #[error(transparent)]
     Proxy(#[from] fujimod_usb_proxy::Error),
+    #[error(transparent)]
+    WebRtc(#[from] fujimod_webrtc::Error),
     #[error("USB device access failed: {0}")]
     Usb(#[from] nusb::Error),
     #[error("emulator resource {operation:?} failed: {source}")]

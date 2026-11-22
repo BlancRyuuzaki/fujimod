@@ -5,7 +5,7 @@ use super::exposure::ExposedFrame;
 use fujimod_emulator_devices::parts::optics::ApertureHandle;
 use fujimod_emulator_imaging::{
     analysis::ImageLayout,
-    exposure::{Calibration, ExposureHandle},
+    exposure::{Calibration, ExposureHandle, NormalizedRgb},
     exr2_isp::parameters::ParameterHandle,
     film::{Film, FilmPixels},
     scene::{SensorFramesHandle, frames::SensorImage},
@@ -13,13 +13,20 @@ use fujimod_emulator_imaging::{
 use std::sync::{Arc, Mutex};
 pub struct Renderer {
     frames: SensorFramesHandle,
-    exposure: ExposureHandle,
-    aperture: ApertureHandle,
-    calibration: Calibration,
+    input: Input,
     parameters: ParameterHandle,
     projection: Option<Arc<super::optics::Projection>>,
     previous: Option<Arc<Image>>,
 }
+enum Input {
+    Physical {
+        exposure: ExposureHandle,
+        aperture: ApertureHandle,
+        calibration: Calibration,
+    },
+    Normalized(NormalizedRgb),
+}
+
 /// The live front end's fixed gain between the sensor readout the statistics
 /// measure and the image it hands the film stage (Q10; 3.78x, within 0.1 EV of
 /// the 12-bit live readout's factor of four). An X70 in REC shows its preview
@@ -64,34 +71,63 @@ impl Renderer {
     ) -> Result<Self, String> {
         Ok(Self {
             frames,
-            exposure,
-            aperture,
-            calibration: calibration.validate()?,
+            input: Input::Physical {
+                exposure,
+                aperture,
+                calibration: calibration.validate()?,
+            },
             parameters,
             projection: projection.map(Arc::new),
             previous: None,
         })
     }
+    pub fn normalized_rgb(
+        calibration: NormalizedRgb,
+        frames: SensorFramesHandle,
+        parameters: ParameterHandle,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            frames,
+            input: Input::Normalized(calibration.validate()?),
+            parameters,
+            projection: None,
+            previous: None,
+        })
+    }
+    pub fn physical(&self) -> bool {
+        matches!(self.input, Input::Physical { .. })
+    }
     pub fn checkpoint(&self) -> Result<fujimod_emulator_devices::checkpoint::Checkpoint, String> {
-        fujimod_emulator_devices::checkpoint::Checkpoint::encode(
-            "radiometric-renderer",
-            &(self.calibration, self.projection.as_ref().map(|p| p.spec())),
-        )
+        use fujimod_emulator_devices::checkpoint::Checkpoint;
+        match self.input {
+            Input::Physical { calibration, .. } => Checkpoint::encode(
+                "radiometric-renderer",
+                &(calibration, self.projection.as_ref().map(|p| p.spec())),
+            ),
+            Input::Normalized(calibration) => {
+                Checkpoint::encode("normalized-rgb-renderer", &calibration)
+            }
+        }
     }
     pub fn validate_checkpoint(
         &self,
         saved: &fujimod_emulator_devices::checkpoint::Checkpoint,
     ) -> Result<(), String> {
-        let (calibration, projection): (
-            Calibration,
-            Option<fujimod_emulator_imaging::optics::Spec>,
-        ) = saved.decode("radiometric-renderer")?;
-        if calibration != self.calibration
-            || projection.as_ref() != self.projection.as_ref().map(|p| p.spec())
-            || !saved.blobs().is_empty()
-            || !saved.children().is_empty()
-        {
-            return Err("radiometric renderer checkpoint calibration differs".into());
+        let matches = match self.input {
+            Input::Physical { calibration, .. } => {
+                let (stored, projection): (
+                    Calibration,
+                    Option<fujimod_emulator_imaging::optics::Spec>,
+                ) = saved.decode("radiometric-renderer")?;
+                stored == calibration
+                    && projection.as_ref() == self.projection.as_ref().map(|p| p.spec())
+            }
+            Input::Normalized(calibration) => {
+                saved.decode::<NormalizedRgb>("normalized-rgb-renderer")? == calibration
+            }
+        };
+        if !matches || !saved.blobs().is_empty() || !saved.children().is_empty() {
+            return Err("renderer checkpoint response differs".into());
         }
         Ok(())
     }
@@ -104,17 +140,36 @@ impl Renderer {
         Ok(())
     }
     pub fn fingerprint(&self) -> serde_json::Value {
-        serde_json::json!({"calibration":self.calibration,"projection":self.projection.as_ref().map(|p|p.spec())})
+        match self.input {
+            Input::Physical { calibration, .. } => serde_json::json!({
+                "calibration":calibration,"projection":self.projection.as_ref().map(|p|p.spec())
+            }),
+            Input::Normalized(calibration) => serde_json::json!({"normalized_rgb":calibration}),
+        }
     }
     pub fn capture(&mut self) -> Result<Option<Arc<Image>>, String> {
-        let Some(mut exposure) = ExposedFrame::capture(
-            &self.frames,
-            &self.exposure,
-            &self.aperture,
-            self.calibration,
-        )?
-        else {
-            return Ok(None);
+        let mut exposure = match &self.input {
+            Input::Physical {
+                exposure,
+                aperture,
+                calibration,
+            } => {
+                let Some(sample) =
+                    ExposedFrame::capture(&self.frames, exposure, aperture, *calibration)?
+                else {
+                    return Ok(None);
+                };
+                sample
+            }
+            Input::Normalized(calibration) => {
+                let frame = self
+                    .frames
+                    .lock()
+                    .map_err(|_| "sensor input poisoned")?
+                    .current
+                    .clone();
+                ExposedFrame::from_normalized_rgb(frame, *calibration)?
+            }
         };
         exposure.focus_shift_mm = self.projection.as_ref().map(|p| p.focus()).transpose()?;
         exposure.view = self
@@ -136,21 +191,25 @@ impl Renderer {
             p.words[0x204 / 4] & 32767,
         ]
         .map(|wb| {
-            let gained = u64::from(wb) * digital * LIVE_FRONT_END_GAIN_Q10;
+            let front_end = if self.physical() {
+                LIVE_FRONT_END_GAIN_Q10
+            } else {
+                1024
+            };
+            let gained = u64::from(wb) * digital * front_end;
             ((gained + (1 << 19)) >> 20).min(32767) as u32
         });
-        if let Some(old) = &self.previous {
-            if Arc::ptr_eq(&old.exposure.frame, &exposure.frame)
-                && old.exposure.exposure == exposure.exposure
-                && old.exposure.aperture_squared == exposure.aperture_squared
-                && old.exposure.focus_shift_mm == exposure.focus_shift_mm
-                && old.exposure.view == exposure.view
-                && old.gain == gain
-                && old.digital_gain_q10 == digital as u32
-                && old.film.matches(|o| p.words[o / 4])
-            {
-                return Ok(Some(old.clone()));
-            }
+        if let Some(old) = &self.previous
+            && Arc::ptr_eq(&old.exposure.frame, &exposure.frame)
+            && old.exposure.exposure == exposure.exposure
+            && old.exposure.aperture_squared == exposure.aperture_squared
+            && old.exposure.focus_shift_mm == exposure.focus_shift_mm
+            && old.exposure.view == exposure.view
+            && old.gain == gain
+            && old.digital_gain_q10 == digital as u32
+            && old.film.matches(|o| p.words[o / 4])
+        {
+            return Ok(Some(old.clone()));
         }
         let mut film = self
             .previous
@@ -255,6 +314,11 @@ impl Image {
         grid: [usize; 2],
         windows: &[[usize; 4]],
     ) -> Result<ExposedFrame, String> {
+        fujimod_perf::add_work(fujimod_perf::DeviceWorkCounter::MeasurementWindowsCalls, 1);
+        fujimod_perf::add_work(
+            fujimod_perf::DeviceWorkCounter::MeasurementWindowPixels,
+            grid[0].saturating_mul(grid[1]) as u64,
+        );
         if grid.contains(&0) || grid.iter().any(|&v| v > 16384) {
             return Err("invalid physical readout grid".into());
         }
@@ -384,7 +448,11 @@ impl Image {
                         let mut memo = FilmPixels::new(&self.film);
                         for (local_y, row) in rows.chunks_exact_mut(layout.stride).enumerate() {
                             let y = range.start + local_y;
-                            for (x, pair) in row[..layout.width * 2].chunks_exact_mut(4).enumerate()
+                            for (x, pair) in row[..layout.width * 2]
+                                .as_chunks_mut::<4>()
+                                .0
+                                .iter_mut()
+                                .enumerate()
                             {
                                 let left =
                                     self.color(frame.sample(x * 2, y, [width, height]), &mut memo);
@@ -422,7 +490,12 @@ impl Image {
             }
             for (y, row) in out.chunks_exact_mut(layout.stride).enumerate() {
                 let sy = ((2 * y + 1) * height / (2 * layout.height)).min(height - 1);
-                for (x, pair) in row[..layout.width * 2].chunks_exact_mut(4).enumerate() {
+                for (x, pair) in row[..layout.width * 2]
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .enumerate()
+                {
                     let sample = |x: usize| {
                         colors
                             [sy * width + ((2 * x + 1) * width / (2 * layout.width)).min(width - 1)]
@@ -500,7 +573,7 @@ impl Image {
                 }
             }
         }
-        for (word, count) in out.chunks_exact_mut(4).zip(bins) {
+        for (word, count) in out.as_chunks_mut::<4>().0.iter_mut().zip(bins) {
             word.copy_from_slice(&count.to_le_bytes());
         }
         if cache.len() == 8 {
@@ -608,7 +681,9 @@ mod tests {
             .unwrap();
         assert!(
             clipped
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .all(|p| u16::from_le_bytes([p[0], p[1]]) == 16383)
         );
     }
@@ -675,7 +750,12 @@ mod tests {
         let mut output = vec![0; layout.bytes().unwrap()];
         for (y, row) in output.chunks_exact_mut(layout.stride).enumerate() {
             let source_y = ((2 * y + 1) * height / (2 * layout.height)).min(height - 1);
-            for (x, pair) in row[..layout.width * 2].chunks_exact_mut(4).enumerate() {
+            for (x, pair) in row[..layout.width * 2]
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .enumerate()
+            {
                 let sample = |x: usize| {
                     colors[source_y * width
                         + ((2 * x + 1) * width / (2 * layout.width)).min(width - 1)]
@@ -782,7 +862,9 @@ mod tests {
         assert_eq!(pixels.len(), 432);
         assert!(
             pixels
-                .chunks_exact(36)
+                .as_chunks::<36>()
+                .0
+                .iter()
                 .all(|r| r[32..].iter().all(|v| *v == 0))
         );
         parameters.lock().unwrap().words[0] = 1;
@@ -856,16 +938,18 @@ mod tests {
         assert_eq!(output, restored.render(layout, 0).unwrap());
         // The two-pixel black/white pattern averages in linear irradiance;
         // point sampling before film would select alternating endpoints.
-        assert!(output.chunks_exact(4).all(|p| p[0] == p[1]));
-        assert!(output.chunks_exact(4).all(|p| p == &output[..4]));
+        assert!(output.as_chunks::<4>().0.iter().all(|p| p[0] == p[1]));
+        assert!(output.as_chunks::<4>().0.iter().all(|p| p == &output[..4]));
         assert_eq!(before, frame.fingerprint());
         let mut bins = [0; 1024];
         frame
             .histogram([64, 48], [0, 0, 64, 48], &mut bins)
             .unwrap();
         let total: u32 = bins
-            .chunks_exact(4)
-            .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| u32::from_le_bytes(*w))
             .sum();
         assert_eq!(total, 64 * 48 / 2);
         assert_eq!(frame.histograms.lock().unwrap().len(), 1);

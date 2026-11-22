@@ -1,0 +1,122 @@
+//! X-Processor 4 USB condition register: bit 0 reports the USB cable present.
+//! It is a board strap, not a writable register, and the DWC3 driver's only
+//! cable source: the X-T3's `0x01d8a330`/`0x01d8a34c` and `0x011655a8` and
+//! the X-T30's `0x01d184bc`/`0x01d184d8` and `0x01150f24` all read
+//! `0xfff4a300`. The X-T30 usbcont cable action `0x01ea3af4` additionally runs
+//! the power-controller port detection `0x01ea3954`, which writes register 20
+//! = `0xb00`, reads register 21 and proceeds only when `(value & 0xfd) == 1`,
+//! so its emulated attach also needs a declared register 21.
+use fujimod_emulator_devices::{Cx, Device};
+use serde_json::Value;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
+pub struct UsbCondition {
+    base: u64,
+    present: Arc<AtomicBool>,
+}
+impl UsbCondition {
+    pub fn new(base: u64, present: bool) -> Result<Self, String> {
+        if base & 3 != 0 || base > u32::MAX as u64 - 4 {
+            return Err("Invalid XP4 USB condition register".into());
+        }
+        Ok(Self {
+            base,
+            present: Arc::new(AtomicBool::new(present)),
+        })
+    }
+    /// The cable presence the register reports; the board switches it with the USB link.
+    pub fn presence(&self) -> Arc<AtomicBool> {
+        self.present.clone()
+    }
+}
+impl Device for UsbCondition {
+    fn name(&self) -> &'static str {
+        "xp4-usb-condition"
+    }
+    fn read(&mut self, cx: &mut Cx<'_>, address: u64, size: u8) -> u64 {
+        if address != self.base || size != 4 {
+            cx.unmodeled();
+            return 0;
+        }
+        u64::from(self.present.load(Ordering::SeqCst))
+    }
+    fn write(&mut self, cx: &mut Cx<'_>, address: u64, size: u8, _value: u64) {
+        // A strap: the value is the cable's, not the writer's.
+        if address != self.base || size != 4 {
+            cx.unmodeled();
+        }
+    }
+    fn checkpoint(&self) -> Result<fujimod_emulator_devices::checkpoint::Checkpoint, String> {
+        fujimod_emulator_devices::checkpoint::Checkpoint::encode(self.name(), &(self.base, self.present.load(Ordering::SeqCst)))
+    }
+    fn validate_checkpoint(&self, data: &fujimod_emulator_devices::checkpoint::Checkpoint) -> Result<(), String> {
+        let (base, _): (u64, bool) = data.decode(self.name())?;
+        if base != self.base {
+            return Err("Invalid XP4 USB condition checkpoint".into());
+        }
+        Ok(())
+    }
+    fn restore_checkpoint(&mut self, data: &fujimod_emulator_devices::checkpoint::Checkpoint) -> Result<(), String> {
+        self.validate_checkpoint(data)?;
+        let (_, present): (u64, bool) = data.decode(self.name())?;
+        self.present.store(present, Ordering::SeqCst);
+        Ok(())
+    }
+    fn save(&self) -> Value {
+        serde_json::json!({ "base": self.base, "present": self.present.load(Ordering::SeqCst) })
+    }
+    fn restore(&mut self, value: &Value) -> Result<(), String> {
+        let base = value
+            .get("base")
+            .and_then(Value::as_u64)
+            .ok_or("Invalid XP4 USB condition checkpoint")?;
+        if base != self.base {
+            return Err("Invalid XP4 USB condition checkpoint".into());
+        }
+        if let Some(present) = value.get("present").and_then(Value::as_bool) {
+            self.present.store(present, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fujimod_emulator_devices::Host;
+
+    #[derive(Default)]
+    struct NoOp;
+    impl Host for NoOp {
+        fn now(&self) -> u64 {
+            0
+        }
+        fn schedule(&mut self, _: usize, _: u64, _: u64) {}
+        fn set_irq(&mut self, _: u32, _: bool) {}
+        fn raise_irq(&mut self, _: usize, _: u32) -> Result<(), String> {
+            Ok(())
+        }
+        fn ram_read(&self, _: u64, _: &mut [u8]) -> Result<(), String> {
+            Err("no ram".into())
+        }
+        fn ram_write(&mut self, _: u64, _: &[u8]) -> Result<(), String> {
+            Err("no ram".into())
+        }
+        fn record(&mut self, _: fujimod_emulator_devices::Record) {}
+    }
+
+    #[test]
+    fn reports_presence_and_refuses_other_words() {
+        let mut absent = UsbCondition::new(0xfff4a300, false).unwrap();
+        let mut host = NoOp;
+        assert_eq!(absent.read(&mut Cx::new(&mut host, 0, 0, 0), 0xfff4a300, 4), 0);
+        let mut present = UsbCondition::new(0xfff4a300, true).unwrap();
+        assert_eq!(present.read(&mut Cx::new(&mut host, 0, 0, 0), 0xfff4a300, 4), 1);
+        let mut cx = Cx::new(&mut host, 0, 0, 0);
+        present.read(&mut cx, 0xfff4a304, 4);
+        assert!(cx.refusal().is_some());
+    }
+}

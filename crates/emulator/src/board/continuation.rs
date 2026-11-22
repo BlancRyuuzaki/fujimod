@@ -12,6 +12,8 @@ use std::{
 pub struct ReadSet {
     pub stores: Vec<(u64, u64)>,
     pub devices: BTreeSet<usize>,
+    /// The predicate read the host contact queue (`Session::control_state`).
+    pub contacts: bool,
 }
 /// The first observed event that ended a watched continuation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -21,6 +23,9 @@ pub enum ContinuationStop {
         range_index: usize,
         range: (u64, u64),
         address: u64,
+        /// CPU core that performed the store, or `None` when a modeled bus
+        /// component performed it without CPU ownership.
+        core: Option<usize>,
         change_confirmed: bool,
     },
     /// A watched device published a changed state.
@@ -43,7 +48,7 @@ impl Stops {
     /// that rewrites a status word with its current value does not end a wait.
     /// `written` holds the bytes at `address` after the store. `stores` is
     /// sorted and disjoint.
-    pub fn store(&mut self, address: u64, written: &[u8]) {
+    pub fn store(&mut self, core: Option<usize>, address: u64, written: &[u8]) {
         let end = address.saturating_add(written.len() as u64);
         let first = self.stores.partition_point(|&(_, hi)| hi <= address);
         for (offset, (&(lo, hi), before)) in self.stores[first..]
@@ -59,6 +64,7 @@ impl Stops {
                     range_index: first + offset,
                     range: (lo, hi),
                     address: from,
+                    core,
                     change_confirmed: false,
                 });
                 self.fired = true;
@@ -70,6 +76,7 @@ impl Stops {
                     range_index: first + offset,
                     range: (lo, hi),
                     address: from + changed as u64,
+                    core,
                     change_confirmed: true,
                 });
                 self.fired = true;
@@ -98,6 +105,8 @@ pub(super) fn finish_instruction(cpu: &dyn Cpu) -> Result<(), String> {
 pub(super) struct StoreWatch {
     /// Each core's address views and hook spans the hooks were installed for.
     cores: Vec<(Vec<MemoryMap>, Vec<(u64, u64)>)>,
+    // Native hooks hold raw pointers into each box; boxing keeps them stable as the Vec grows.
+    #[allow(clippy::vec_box)]
     contexts: Vec<Box<Context>>,
     hooks: Vec<(usize, Vec<HookId>)>,
     pub(super) active: bool,
@@ -144,7 +153,10 @@ unsafe fn written(_: Access, address: u64, size: i32, _: i64, data: *mut c_void)
                 }
             };
             cpu.read_memory(address, written)?;
-            state.continuation.borrow_mut().store(physical, written);
+            state
+                .continuation
+                .borrow_mut()
+                .store(Some(context.core), physical, written);
             if fired(&state.continuation) {
                 finish_instruction(&*cpu)?;
             }
@@ -209,6 +221,13 @@ impl Board {
     pub(super) fn track_device_read(&self, id: usize) {
         if let Some(reads) = self.read_set.borrow_mut().as_mut() {
             reads.devices.insert(id);
+        }
+    }
+    /// Record a read of the host contact queue; a session run with a watched
+    /// contact driver (`Driver::set_watched`) ends at the queue's next change.
+    pub fn track_contacts(&self) {
+        if let Some(reads) = self.read_set.borrow_mut().as_mut() {
+            reads.contacts = true;
         }
     }
     pub(super) fn track_device_kind(&self, kind: &str, bus: &Bus) {

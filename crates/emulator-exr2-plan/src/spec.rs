@@ -95,6 +95,8 @@ pub enum SensorControls {
         projection: Option<serde_json::Value>,
         frame_clock: Option<serde_json::Value>,
     },
+    /// Store-only (register high, register low, value) records; no radiometry.
+    RegisterRecords {},
 }
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
@@ -108,12 +110,19 @@ pub enum SerialEndpoint {
         position: Option<String>,
         optics: Option<Iris>,
         focus: Option<FocusAxis>,
+        #[serde(default)]
+        nd: Option<NdFilter>,
     },
     Stabilizer {
         options: serde_json::Value,
     },
     Registers {
         options: serde_json::Value,
+    },
+    WakeRegisters {
+        options: serde_json::Value,
+        clock: String,
+        ticks_per_second: u64,
     },
     Panel {
         options: serde_json::Value,
@@ -130,6 +139,22 @@ pub enum SerialEndpoint {
 pub struct Iris {
     pub output: String,
     pub positions: Vec<(i64, f64)>,
+    /// Optional ND transmission wire (factor on f-number squared, 1 = no filter).
+    #[serde(default)]
+    pub nd: Option<String>,
+}
+/// A built-in ND filter on a lens-unit output register: `insert_mask` / `remove_mask`
+/// coil pulses move it; while it is in, `transmission` holds `factor` and the
+/// `aperture` wire (f-number squared) is scaled by it.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NdFilter {
+    pub register: u16,
+    pub insert_mask: u16,
+    pub remove_mask: u16,
+    pub factor: f64,
+    pub aperture: String,
+    pub transmission: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -207,6 +232,12 @@ pub enum Model {
         transport: serde_json::Value,
         configuration: serde_json::Value,
         startup_ticks: u64,
+        /// Ticks after startup until the lens returns its ready output high; absent keeps it low.
+        #[serde(default)]
+        busy_ticks: Option<u64>,
+        /// Ticks each started lens operation holds the ready output low; absent reports none.
+        #[serde(default)]
+        operation_ticks: Option<u64>,
         pins: serde_json::Value,
         gpio: String,
         controllers: Vec<String>,
@@ -266,7 +297,9 @@ pub enum Model {
         options: serde_json::Value,
         wiring: serde_json::Value,
     },
-    ExrClocks { options: serde_json::Value },
+    ExrClocks {
+        options: serde_json::Value,
+    },
     ExrMemoryInterface,
     Clocks {
         options: clock::Options,
@@ -300,6 +333,13 @@ pub enum Model {
         options: serde_json::Value,
         gpio: String,
     },
+    ContactCam {
+        options: serde_json::Value,
+        gpio: String,
+        /// Logic-level wire whose rising edge releases the cam's latch.
+        #[serde(default)]
+        release: Option<String>,
+    },
     #[serde(rename = "exr2-pulse")]
     PulseUnit {
         options: pulse::Options,
@@ -319,7 +359,10 @@ pub enum Model {
     },
     Encoder {
         options: serde_json::Value,
-        gpio: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        gpio: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        adc: Option<String>,
         counter: Option<String>,
     },
     #[serde(rename = "i2c-motor-bridge")]
@@ -329,9 +372,16 @@ pub enum Model {
         pulses: String,
         gpio: String,
         clock_irq: InterruptLine,
+        /// Iris driven by this bridge: physical position to f-number.
+        #[serde(default)]
+        optics: Option<Iris>,
     },
     Block86000 {
         options: pulse::block86000::Options,
+    },
+    #[serde(rename = "register-stub")]
+    RegisterStub {
+        options: fujimod_emulator_devices::exr::register_stub::Options,
     },
     ExrAdc {
         options: fujimod_emulator_devices::exr::adc::Options,
@@ -339,6 +389,9 @@ pub enum Model {
     #[serde(rename = "exr-command-gpu")]
     ExrCommandGpu {
         options: fujimod_emulator_devices::exr::command_gpu::Options,
+        /// Completion interrupt output for lists that ask for one.
+        #[serde(default)]
+        irq: Option<InterruptLine>,
     },
     #[serde(rename = "exr-display-pipe")]
     ExrDisplayPipe {
@@ -372,11 +425,16 @@ pub enum Model {
     },
     SdHost {
         options: serde_json::Value,
+        #[serde(default)]
+        clock_gate: Option<String>,
         card: Card,
         pins: Option<CardPins>,
         present: bool,
         protected: bool,
         irq: InterruptLine,
+    },
+    SataHost {
+        options: fujimod_emulator_devices::exr2::sata_host::Options,
     },
     SdioHost {
         options: serde_json::Value,
@@ -401,6 +459,10 @@ pub enum Model {
         statistics_grid: Option<String>,
         frame_period: Option<String>,
         edges: String,
+        /// Logic-level wires each comparator output drives: high once it
+        /// fires, low when started again.
+        #[serde(default)]
+        comparator_outputs: [Option<String>; 6],
     },
     OutputChannel {
         options: serde_json::Value,
@@ -476,6 +538,8 @@ pub enum Model {
     },
     FaceDetector {
         options: serde_json::Value,
+        #[serde(default)]
+        routes: Option<String>,
     },
     FaceResults {
         profile: serde_json::Value,
@@ -522,6 +586,7 @@ impl Model {
             Model::Adc { .. } => "adc",
             Model::Gpio { .. } => "gpio",
             Model::ContactActuator { .. } => "contact-actuator",
+            Model::ContactCam { .. } => "contact-cam",
             Model::PulseUnit { .. } => "exr2-pulse",
             Model::SerialChannel { .. } => "serial-channel",
             Model::SpiController { .. } => "spi-controller",
@@ -529,6 +594,7 @@ impl Model {
             Model::Encoder { .. } => "encoder",
             Model::I2cMotorBridge { .. } => "i2c-motor-bridge",
             Model::Block86000 { .. } => "block86000",
+            Model::RegisterStub { .. } => "register-stub",
             Model::ExrAdc { .. } => "exr-adc",
             Model::ExrCommandGpu { .. } => "exr-command-gpu",
             Model::ExrDisplayPipe { .. } => "exr-display-pipe",
@@ -539,6 +605,7 @@ impl Model {
             Model::HdmiSink { .. } => "hdmi-sink",
             Model::SerialAudio { .. } => "serial-audio",
             Model::SdHost { .. } => "sd-host",
+            Model::SataHost { .. } => "sata-host",
             Model::SdioHost { .. } => "sdio-host",
             Model::UsbEndpoints { .. } => "usb-endpoints",
             Model::ImageInput { .. } => "image-input",
@@ -569,12 +636,21 @@ impl Model {
     pub fn node_references(&self) -> Vec<&str> {
         let mut refs = vec![];
         match self {
-            Self::Power { gpio, .. } | Self::ContactActuator { gpio, .. } => {
+            Self::Power { gpio, .. }
+            | Self::ContactActuator { gpio, .. }
+            | Self::ContactCam { gpio, .. } => {
                 refs.push(gpio.as_str())
             }
             Self::SdHost {
-                pins: Some(pins), ..
-            } => refs.push(pins.gpio.as_str()),
+                pins, clock_gate, ..
+            } => {
+                if let Some(pins) = pins {
+                    refs.push(pins.gpio.as_str());
+                }
+                if let Some(clock) = clock_gate {
+                    refs.push(clock.as_str());
+                }
+            }
             Self::ExternalFrames {
                 activity: Some(signal),
                 ..
@@ -593,15 +669,23 @@ impl Model {
             }
             Self::SerialChannel { gpio, endpoint, .. } => {
                 refs.push(gpio.as_str());
-                if let SerialEndpoint::LensUnit { pulses, gpio, .. } = endpoint {
-                    refs.extend([pulses.as_str(), gpio.as_str()]);
+                match endpoint {
+                    SerialEndpoint::LensUnit { pulses, gpio, .. } => {
+                        refs.extend([pulses.as_str(), gpio.as_str()])
+                    }
+                    SerialEndpoint::WakeRegisters { clock, .. } => refs.push(clock.as_str()),
+                    _ => {}
                 }
             }
             Self::SpiController { routes } => {
                 for route in routes {
                     refs.push(route.gpio.as_str());
-                    if let SerialEndpoint::LensUnit { pulses, gpio, .. } = &route.endpoint {
-                        refs.extend([pulses.as_str(), gpio.as_str()]);
+                    match &route.endpoint {
+                        SerialEndpoint::LensUnit { pulses, gpio, .. } => {
+                            refs.extend([pulses.as_str(), gpio.as_str()])
+                        }
+                        SerialEndpoint::WakeRegisters { clock, .. } => refs.push(clock.as_str()),
+                        _ => {}
                     }
                 }
             }
@@ -612,8 +696,11 @@ impl Model {
                 refs.extend(controllers.iter().map(String::as_str));
             }
             Self::GpioContactResponse { gpio, .. } => refs.push(gpio.as_str()),
-            Self::Encoder { gpio, counter, .. } => {
-                refs.push(gpio.as_str());
+            Self::Encoder {
+                gpio, adc, counter, ..
+            } => {
+                refs.extend(gpio.as_deref());
+                refs.extend(adc.as_deref());
                 refs.extend(counter.as_deref());
             }
             Self::I2cMotorBridge { pulses, gpio, .. } => {

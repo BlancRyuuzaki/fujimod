@@ -73,14 +73,29 @@ struct PendingHostRequest {
     payload: Vec<u8>,
     published: bool,
 }
+/// What an equal-shape untiling copy (control 1, destination shape equal to
+/// the source extent) stores for each pixel word. The renderer writes RGBA8
+/// as memory bytes A,B,G,R; the processor selects the readback law.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PixmapReadback {
+    /// Rotates packed channels (RGBA8 to bytes B,G,R,A). The law the XPP and
+    /// XP5 boards assume; no camera measurement backs it.
+    RotatesChannels,
+    /// Keeps each pixel word, so the pixmap holds the renderer's A,B,G,R
+    /// bytes. On an X-T3 5.11 (camera runs 2026-11-11/12) a CPU word stored
+    /// in the LCD pixmap shows with alpha in its lowest byte and red in its
+    /// highest, while stock vglib screens show correctly.
+    PreservesWords,
+}
 pub struct Renderer {
     state: Arc<Mutex<State>>,
     base: u64,
     irq: u32,
+    readback: PixmapReadback,
     webgpu_bridge: bool,
 }
 impl Renderer {
-    pub fn new(base: u64, irq: u32) -> Result<Self, String> {
+    pub fn new(base: u64, irq: u32, readback: PixmapReadback) -> Result<Self, String> {
         if base & 0xfff != 0 || base > 0xffffd000 || !(32..1020).contains(&irq) {
             return Err("Invalid DMP register base or physical IRQ".into());
         }
@@ -88,6 +103,7 @@ impl Renderer {
             state: Arc::new(Mutex::new(State::default())),
             base,
             irq,
+            readback,
             webgpu_bridge: crate::webgpu_bridge_enabled(),
         })
     }
@@ -522,8 +538,11 @@ impl Texture {
         let m = self.matrix;
         let px = x as f64 + 0.5;
         let py = y as f64 + 0.5;
-        let tx = (m[0] * px + m[1] * py + m[2]) * self.width as f64;
-        let ty = (m[3] * px + m[4] * py + m[5]) * self.height as f64;
+        // The matrix gives coordinates normalized over the image's valid extent (0x158): the
+        // client sends scale = width / backing (0x117/0x118) with the backing size (0x152),
+        // so 1.0 is the image's own width and height, not the padded backing.
+        let tx = (m[0] * px + m[1] * py + m[2]) * self.valid[0] as f64;
+        let ty = (m[3] * px + m[4] * py + m[5]) * self.valid[1] as f64;
         // Declared software nearest sampling with transparent image border.
         if tx < 0.0 || ty < 0.0 || tx >= self.valid[0] as f64 || ty >= self.valid[1] as f64 {
             return Ok([0; 4]);
@@ -707,6 +726,20 @@ fn rectangles(
     paths: &[PathDraw],
     fills: &[FillDraw],
 ) -> Result<Vec<(u64, Vec<u8>)>, String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    let mode = gpu_mode();
+    #[cfg(target_arch = "wasm32")]
+    let mode = (false, false);
+    rectangles_on(cx, paths, fills, mode)
+}
+
+/// `rectangles` with an explicit host renderer: `(gpu_requested, verify_gpu)`.
+fn rectangles_on(
+    cx: &mut Cx<'_>,
+    paths: &[PathDraw],
+    fills: &[FillDraw],
+    #[cfg_attr(target_arch = "wasm32", allow(unused_variables))] mode: (bool, bool),
+) -> Result<Vec<(u64, Vec<u8>)>, String> {
     if paths.len() != fills.len() || paths.len() > 4096 {
         return Err("DMP unmatched/bounded draw lists".into());
     }
@@ -877,7 +910,13 @@ fn rectangles(
         } else {
             None
         };
-        let solid = packed(get(r, 0x185)?.to_le_bytes(), r, &f.stream.gamma, order)?;
+        // Only solid paints read the solid color: the X-T20 2.11 VG driver can
+        // draw an image before it has written 0x185.
+        let solid = if image || has_gradient {
+            [0; 4]
+        } else {
+            packed(get(r, 0x185)?.to_le_bytes(), r, &f.stream.gamma, order)?
+        };
         let coverage_index = coverage_inputs.len();
         coverage_inputs.push(scanline::CoverageInput::new(
             &contours,
@@ -909,7 +948,7 @@ fn rectangles(
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    let (gpu_requested, verify_gpu) = gpu_mode();
+    let (gpu_requested, verify_gpu) = mode;
     #[cfg(not(target_arch = "wasm32"))]
     let gpu_enabled = if gpu_requested {
         match fujimod_emulator_gpu::context() {
@@ -925,6 +964,7 @@ fn rectangles(
         let gpu_context = fujimod_emulator_gpu::context()?;
         let _gpu_guard = gpu_context.acquire()?;
         let gpu_coverages = gpu_coverage::coverage_batch(&coverage_inputs)?;
+        let mut verified = None;
         if verify_gpu {
             let cpu_coverages: Vec<_> = coverage_inputs
                 .iter()
@@ -942,11 +982,12 @@ fn rectangles(
                     ));
                 }
             }
-            paint_cpu_draws(&prepared, &coverage_inputs, &cpu_coverages, &mut output)?;
+            let mut cpu_output = output.clone();
+            paint_cpu_draws(&prepared, &coverage_inputs, &cpu_coverages, &mut cpu_output)?;
+            verified = Some(cpu_output);
         }
 
         let mut surfaces: BTreeMap<u64, Arc<fujimod_emulator_gpu::GpuSurface>> = BTreeMap::new();
-        let mut write_flags: BTreeMap<u64, Vec<bool>> = BTreeMap::new();
         for draw in &prepared {
             if surfaces.contains_key(&draw.address) {
                 let key = surfaces.get(&draw.address).unwrap().key();
@@ -981,17 +1022,11 @@ fn rectangles(
             let surface = gpu_context.get_or_create_target(key, Some(guest_bytes))?;
             gpu_context.clear_write_masks(key)?;
             surfaces.insert(draw.address, surface);
-            write_flags.insert(
-                draw.address,
-                vec![false; draw.width as usize * draw.height as usize],
-            );
         }
 
         for draw in &prepared {
             let input = &coverage_inputs[draw.coverage_index];
             let coverage = &gpu_coverages[draw.coverage_index];
-            let [x0, x1, y0, y1] = input.bounds;
-            let bbox_width = x1.saturating_sub(x0);
             let target = &output.get(&draw.address).unwrap().2;
             gpu_paint::paint_resident(
                 surfaces.get(&draw.address).unwrap(),
@@ -1012,27 +1047,8 @@ fn rectangles(
                 draw.gradient.as_ref(),
                 &draw.fill.stream.gradient_deltas,
             )?;
-            let flags = write_flags.get_mut(&draw.address).unwrap();
-            for y in y0..y1 {
-                for x in x0..x1 {
-                    let covered = coverage[(y - y0) * bbox_width + x - x0] != 0;
-                    let in_scissor = draw.clips.iter().any(|clip| {
-                        x as u32 >= clip[0]
-                            && (x as u32) < clip[2]
-                            && y as u32 >= clip[1]
-                            && (y as u32) < clip[3]
-                    });
-                    if covered && in_scissor {
-                        let target_y = if draw.flip {
-                            draw.height as usize - 1 - y
-                        } else {
-                            y
-                        };
-                        flags[target_y * draw.width as usize + x] = true;
-                    }
-                }
-            }
         }
+        let write_flags = written_pixels(&prepared, &coverage_inputs, &gpu_coverages);
 
         let limits = gpu_context.device().limits();
         let mask_batch_limit = (limits.max_storage_buffer_binding_size as usize / 12)
@@ -1059,8 +1075,8 @@ fn rectangles(
         let mut gpu_writes = Vec::new();
         for (address, surface) in &surfaces {
             let readback = gpu_context.readback(surface.key())?;
-            if verify_gpu {
-                let cpu_bytes = &output.get(address).unwrap().2;
+            if let Some(cpu_output) = &verified {
+                let cpu_bytes = &cpu_output.get(address).unwrap().2;
                 if cpu_bytes != &readback.bytes {
                     let offset = cpu_bytes
                         .iter()
@@ -1082,11 +1098,8 @@ fn rectangles(
                 gpu_writes.push((range_address, readback.bytes[offset..end].to_vec()));
             }
         }
-        if verify_gpu {
-            return Ok(output
-                .into_iter()
-                .map(|(address, (_, _, bytes))| (address, bytes))
-                .collect());
+        if let Some(cpu_output) = verified {
+            return Ok(written_ranges(&cpu_output, &write_flags, &prepared));
         }
         return Ok(gpu_writes);
     }
@@ -1096,10 +1109,83 @@ fn rectangles(
         .map(scanline::coverage_image)
         .collect();
     paint_cpu_draws(&prepared, &coverage_inputs, &coverages, &mut output)?;
-    Ok(output
-        .into_iter()
-        .map(|(address, (_, _, bytes))| (address, bytes))
-        .collect())
+    let write_flags = written_pixels(&prepared, &coverage_inputs, &coverages);
+    Ok(written_ranges(&output, &write_flags, &prepared))
+}
+
+/// Pixels a batch writes, per target, row-major in target rows (after the
+/// flip): covered by a draw's path and inside one of its scissors. The raster
+/// stores only these pixels, so they alone are published and timed.
+fn written_pixels(
+    prepared: &[PreparedPaint<'_>],
+    coverage_inputs: &[scanline::CoverageInput],
+    coverages: &[Vec<u32>],
+) -> BTreeMap<u64, Vec<bool>> {
+    let mut written: BTreeMap<u64, Vec<bool>> = BTreeMap::new();
+    for draw in prepared {
+        let flags = written
+            .entry(draw.address)
+            .or_insert_with(|| vec![false; draw.width as usize * draw.height as usize]);
+        let [x0, x1, y0, y1] = coverage_inputs[draw.coverage_index].bounds;
+        let coverage = &coverages[draw.coverage_index];
+        let bbox_width = x1.saturating_sub(x0);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let covered = coverage[(y - y0) * bbox_width + x - x0] != 0;
+                let in_scissor = draw.clips.iter().any(|clip| {
+                    x as u32 >= clip[0]
+                        && (x as u32) < clip[2]
+                        && y as u32 >= clip[1]
+                        && (y as u32) < clip[3]
+                });
+                if covered && in_scissor {
+                    let target_y = if draw.flip {
+                        draw.height as usize - 1 - y
+                    } else {
+                        y
+                    };
+                    flags[target_y * draw.width as usize + x] = true;
+                }
+            }
+        }
+    }
+    written
+}
+
+/// Contiguous guest byte ranges of the written pixels, in address order.
+fn written_ranges(
+    output: &BTreeMap<u64, (u32, u32, Vec<u8>)>,
+    written: &BTreeMap<u64, Vec<bool>>,
+    prepared: &[PreparedPaint<'_>],
+) -> Vec<(u64, Vec<u8>)> {
+    let mut ranges = Vec::new();
+    for (address, flags) in written {
+        let (width, _, bytes) = output.get(address).unwrap();
+        let tiled = prepared
+            .iter()
+            .find(|draw| draw.address == *address)
+            .is_some_and(|draw| draw.tiled);
+        let width = *width as usize;
+        let mut guest = vec![false; flags.len()];
+        for (index, _) in flags.iter().enumerate().filter(|(_, written)| **written) {
+            guest[pixel_index(index % width, index / width, width, tiled)] = true;
+        }
+        let mut start = None;
+        for pixel in 0..=guest.len() {
+            match (start, guest.get(pixel).copied().unwrap_or(false)) {
+                (None, true) => start = Some(pixel),
+                (Some(first), false) => {
+                    ranges.push((
+                        *address + first as u64 * 4,
+                        bytes[first * 4..pixel * 4].to_vec(),
+                    ));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+    }
+    ranges
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1195,7 +1281,7 @@ mod tests {
         }
     }
     fn register(bus: &mut TestBus, base: u64, size: u64) -> Result<(), String> {
-        bus.register(base, size, Box::new(Renderer::new(base, 153)?))?;
+        bus.register(base, size, Box::new(Renderer::new(base, 153, PixmapReadback::RotatesChannels)?))?;
         bus.register(0xff90e73c, 4, Box::new(AddressHigh))?;
         Ok(())
     }
@@ -1212,7 +1298,7 @@ mod tests {
     #[test]
     fn pending_dma_has_exact_deadline_early_noop_and_restorable_program_independent_effects() {
         let experiment = |base, irq, pc, core| {
-            let mut renderer = Renderer::new(base, irq).unwrap();
+            let mut renderer = Renderer::new(base, irq, PixmapReadback::RotatesChannels).unwrap();
             let mut host = RecordingHost {
                 now: 100,
                 ram_base: 0x1000,
@@ -1238,7 +1324,7 @@ mod tests {
             assert_eq!(renderer.save(), before);
             assert_eq!(host.ram, vec![0xa5; 64]);
             assert!(host.irqs.is_empty());
-            let mut restored = Renderer::new(base, irq).unwrap();
+            let mut restored = Renderer::new(base, irq, PixmapReadback::RotatesChannels).unwrap();
             restored.restore(&before).unwrap();
             host.now = 1260;
             renderer.event(&mut Cx::new(&mut host, core, pc, 0), token + 1);
@@ -1261,7 +1347,7 @@ mod tests {
     }
     #[test]
     fn copy_unit_configuration_stores_only_the_initialization_value() {
-        let mut renderer = Renderer::new(0xfff88000, 92).unwrap();
+        let mut renderer = Renderer::new(0xfff88000, 92, PixmapReadback::RotatesChannels).unwrap();
         let mut host = RecordingHost::default();
         let mut cx = Cx::new(&mut host, 0, 0xdda2ec, 0);
         assert_eq!(renderer.read(&mut cx, 0xfff88c1c, 4), 0);
@@ -1323,9 +1409,15 @@ mod tests {
             15,
             6,
             &[
-                1.0f32.to_bits(), 0, 0,
-                0, 1.0f32.to_bits(), 0,
-                0, 0, 1.0f32.to_bits(),
+                1.0f32.to_bits(),
+                0,
+                0,
+                0,
+                1.0f32.to_bits(),
+                0,
+                0,
+                0,
+                1.0f32.to_bits(),
             ],
         );
         append_packet(&mut words, 0x65, 15, 4, &[0]);
@@ -1375,9 +1467,12 @@ mod tests {
             (0xa3, (16 << 16) | 16),
             (0xa4, 0),
             (0xa5, 0),
-            (0x185, 0),
         ] {
             append_packet(&mut words, index, 15, 4, &[value]);
+        }
+        // An image paint needs no solid color.
+        if !image {
+            append_packet(&mut words, 0x185, 15, 4, &[0]);
         }
         let gamma: Vec<u32> = (0..=255).collect();
         append_packet(&mut words, 0x188, 15, 4, &gamma);
@@ -1440,7 +1535,8 @@ mod tests {
         assert!(host.bytes(0x102000, 1024).unwrap().iter().all(|b| *b == 0));
         let (device, at, token) = host.events.pop().unwrap();
         host.now = at;
-        bus.event(&mut Cx::new(&mut host, 0, 0, 0), device, token).unwrap();
+        bus.event(&mut Cx::new(&mut host, 0, 0, 0), device, token)
+            .unwrap();
         assert!(host.bytes(0x102000, 1024).unwrap().iter().all(|b| *b == 0));
         assert_eq!(host.irqs.last(), Some(&(153, true)));
         for (ack, status) in [(0x1800, COMMAND), (0x1020, 0)] {
@@ -1457,9 +1553,10 @@ mod tests {
         let mut bad_geometry = path.clone();
         bad_geometry[22] = 0;
         assert!(parse_path(&bad_geometry, Stream::default()).is_err());
-        assert!(bus
-            .write(&mut Cx::new(&mut host, 0, 0, 0), 0xff93cc18, 4, 1)
-            .is_err());
+        assert!(
+            bus.write(&mut Cx::new(&mut host, 0, 0, 0), 0xff93cc18, 4, 1)
+                .is_err()
+        );
         assert!(host.events.is_empty());
         put(&mut host, 0x100000, &[11, 0x100000]);
         assert!(linked_words(&Cx::new(&mut host, 0, 0, 0), 0x100000, 2).is_err());
@@ -1480,7 +1577,8 @@ mod tests {
         submit(&mut bus, &mut host, &image_path, &image_fill, 0x2000);
         let (device, at, token) = host.events.pop().unwrap();
         host.now = at;
-        bus.event(&mut Cx::new(&mut host, 0, 0, 0), device, token).unwrap();
+        bus.event(&mut Cx::new(&mut host, 0, 0, 0), device, token)
+            .unwrap();
         let output = host.bytes(0x102000, 1024).unwrap();
         assert_eq!(output.len(), 1024);
         assert!(output.iter().any(|byte| *byte != 0));
@@ -1493,16 +1591,73 @@ mod tests {
             .stream
             .regs;
         sample_regs.insert(0x10c, 0x3a0000);
-        let texture = Texture::new(
-            &Cx::new(&mut host, 0, 0, 0),
-            &sample_regs,
-            0x102000,
-            1024,
-        )
-        .unwrap();
+        let texture =
+            Texture::new(&Cx::new(&mut host, 0, 0, 0), &sample_regs, 0x102000, 1024).unwrap();
         assert_eq!(texture.sample(1, 1).unwrap(), [0, 16, 0, 255]);
+
+        // An 8x8 image in a 16x16 backing, drawn over 16x16: the normalized matrix spans the
+        // 8x8 valid extent, so the whole destination samples the image (stretched 2x).
+        let mut padded = sample_regs.clone();
+        padded.insert(0x10c, 0x3b0000);
+        padded.insert(0x158, (8 << 16) | 8);
+        let texture = Texture::new(&Cx::new(&mut host, 0, 0, 0), &padded, 0x102000, 1024).unwrap();
+        assert_eq!(
+            texture.sample(15, 15).unwrap(),
+            texture.sample(14, 14).unwrap()
+        );
+        assert_ne!(texture.sample(15, 15).unwrap(), [0; 4]);
+        assert_eq!(texture.sample(15, 0).unwrap(), [112, 0, 0, 255]);
     }
 
+    /// A draw publishes only the pixels it covers, and its completion time
+    /// counts only those bytes, whichever host renderer painted it: guest
+    /// stores to other pixels during the DMA stay, and the CPU and GPU
+    /// renderers schedule the same completion.
+    #[test]
+    fn a_draw_publishes_and_times_only_its_covered_pixels() {
+        let path = path_program(1, [0, 0, 8, 8]);
+        let fill = fill_program(1, false);
+        let mut host = RecordingHost {
+            ram: vec![0xaa; 0x4000],
+            events: Vec::new(),
+            irqs: Vec::new(),
+            ram_base: 0x100000,
+            ..RecordingHost::default()
+        };
+        put(&mut host, 0x100000, &path);
+        put(&mut host, 0x100800, &fill);
+        let mut bus = TestBus::default();
+        register(&mut bus, 0xff93c000, 0x3000).unwrap();
+        submit(&mut bus, &mut host, &path, &fill, 0x1000);
+        let (device, at, token) = host.events.pop().unwrap();
+        // The 8x8 draw is the first tile of the 16x16 Morton target: 64 pixels.
+        assert_eq!(at, host.now + 1000 + 5 * 64 * 4);
+        let outside = 0x102000 + pixel_index(12, 12, 16, true) as u64 * 4;
+        host.ram_write(outside, &[0x55; 4]).unwrap();
+        host.now = at;
+        bus.event(&mut Cx::new(&mut host, 0, 0, 0), device, token)
+            .unwrap();
+        let target = host.bytes(0x102000, 1024).unwrap();
+        assert!(target[..256].iter().all(|byte| *byte == 0));
+        assert_eq!(host.bytes(outside, 4).unwrap(), [0x55; 4]);
+        let untouched = (256..1024)
+            .filter(|offset| (0x102000 + *offset as u64) & !3 != outside)
+            .all(|offset| target[offset] == 0xaa);
+        assert!(untouched);
+
+        let paths = parse_path(&path, Stream::default()).unwrap().1;
+        let fills = parse_fill(&fill, Stream::default()).unwrap().1;
+        let mut cx = Cx::new(&mut host, 0, 0, 0);
+        let cpu = rectangles_on(&mut cx, &paths, &fills, (false, false)).unwrap();
+        assert_eq!(cpu.len(), 1);
+        assert_eq!((cpu[0].0, cpu[0].1.len()), (0x102000, 256));
+        if fujimod_emulator_gpu::context().is_ok() {
+            assert_eq!(
+                rectangles_on(&mut cx, &paths, &fills, (true, false)).unwrap(),
+                cpu
+            );
+        }
+    }
 }
 
 impl State {
@@ -1555,7 +1710,7 @@ impl State {
             banks: None,
         })
     }
-    fn copy_job(&self, cx: &Cx<'_>, trigger: u32) -> Result<Job, String> {
+    fn copy_job(&self, cx: &Cx<'_>, trigger: u32, readback: PixmapReadback) -> Result<Job, String> {
         self.idle()?;
         let control = self.r(0xc10);
         let mode = control & 255;
@@ -1614,11 +1769,13 @@ impl State {
         }
         let input = cx.ram_bytes(source, count)?;
         let original = cx.ram_bytes(dest, destination_count)?;
+        let rotates = readback == PixmapReadback::RotatesChannels;
         let bytes = if let Some((width, height, pitch, native)) = shape {
             let mut bytes = original;
             // Control 2 uploads linear pixels into Morton tiles. Control 1
             // untiles bottom-up rows. Pitched native pixmaps retain pixel
-            // words; the equal-shape readback form rotates packed channels.
+            // words; the equal-shape readback form follows the selected
+            // PixmapReadback.
             for y in 0..height {
                 for x in 0..width {
                     let (i, j) = if mode == 2 {
@@ -1631,13 +1788,13 @@ impl State {
                     };
                     if bpp == 4 {
                         let mut p = u32::from_le_bytes(input[i..i + 4].try_into().unwrap());
-                        if mode == 1 && !native {
+                        if mode == 1 && !native && rotates {
                             p = p.rotate_right(8);
                         }
                         bytes[j..j + 4].copy_from_slice(&p.to_le_bytes());
                     } else {
                         let mut p = u16::from_le_bytes(input[i..i + 2].try_into().unwrap());
-                        if mode == 1 && !native {
+                        if mode == 1 && !native && rotates {
                             p = p.rotate_right(match format {
                                 3 => 1,
                                 4 => 4,
@@ -1750,7 +1907,7 @@ impl Device for Renderer {
                     s.begin(cx, job);
                 }
                 0xc18 if v != 0 => {
-                    let job = s.copy_job(cx, v)?;
+                    let job = s.copy_job(cx, v, self.readback)?;
                     s.regs.insert(o, v);
                     s.begin(cx, job);
                 }
@@ -1792,9 +1949,7 @@ impl Device for Renderer {
                     if self.webgpu_bridge {
                         let payload = s.gles.encode_webgpu_request(&data)?;
                         let id = s.next_host_request;
-                        let next_id = id
-                            .checked_add(1)
-                            .ok_or("DMP WebGPU request ID exhausted")?;
+                        let next_id = id.checked_add(1).ok_or("DMP WebGPU request ID exhausted")?;
                         cx.request_pause()?;
                         s.next_host_request = next_id;
                         s.host_request = Some(PendingHostRequest {
@@ -2003,7 +2158,7 @@ impl Device for Renderer {
         Ok(())
     }
     fn fingerprint(&self) -> Result<Value, String> {
-        Ok(self.checkpoint()?.fingerprint())
+        Ok(self.checkpoint()?.state())
     }
     fn next_deadline(&self, _: u64) -> Option<u64> {
         self.state.lock().unwrap().deadline

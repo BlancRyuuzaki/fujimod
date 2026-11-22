@@ -25,10 +25,16 @@ pub trait Endpoint: Send {
     fn checkpoint(&self) -> Result<fujimod_emulator_devices::checkpoint::Checkpoint, String> {
         Err(format!("{} has no binary snapshot", self.name()))
     }
-    fn validate_checkpoint(&self, _: &fujimod_emulator_devices::checkpoint::Checkpoint) -> Result<(), String> {
+    fn validate_checkpoint(
+        &self,
+        _: &fujimod_emulator_devices::checkpoint::Checkpoint,
+    ) -> Result<(), String> {
         Err(format!("{} has no binary snapshot", self.name()))
     }
-    fn restore_checkpoint(&mut self, _: &fujimod_emulator_devices::checkpoint::Checkpoint) -> Result<(), String> {
+    fn restore_checkpoint(
+        &mut self,
+        _: &fujimod_emulator_devices::checkpoint::Checkpoint,
+    ) -> Result<(), String> {
         Err(format!("{} has no binary snapshot", self.name()))
     }
 
@@ -94,16 +100,15 @@ impl RegisterFile {
             }
             status[address as usize] = true;
         }
-        if let Some(clock) = &options.clock {
-            if clock.ticks_per_second == 0
+        if let Some(clock) = &options.clock
+            && (clock.ticks_per_second == 0
                 || clock.initial_seconds > clock.maximum_seconds
                 || clock
                     .registers
                     .iter()
-                    .any(|&r| r >= 128 || !present[r as usize])
-            {
-                return Err("invalid serial register clock input".into());
-            }
+                    .any(|&r| r >= 128 || !present[r as usize]))
+        {
+            return Err("invalid serial register clock input".into());
         }
         Ok(Self {
             values,
@@ -164,28 +169,27 @@ impl Endpoint for RegisterFile {
         if shift.word & 0x8000 != 0 {
             if !self.status[address] {
                 self.values[address] = shift.word as u8;
-                if let Some(clock) = &mut self.clock {
-                    if let Some(byte) = clock.registers.iter().position(|&r| r as usize == address)
-                    {
-                        let seconds = (u64::from(clock.initial_seconds)
-                            + at.saturating_sub(clock.started) / clock.ticks_per_second)
-                            .min(u64::from(u32::MAX)) as u32;
-                        let shift_bits = byte * 8;
-                        clock.initial_seconds = (seconds & !(255 << shift_bits))
-                            | (u32::from(shift.word as u8) << shift_bits);
-                        clock.started = at;
-                    }
+                if let Some(clock) = &mut self.clock
+                    && let Some(byte) = clock.registers.iter().position(|&r| r as usize == address)
+                {
+                    let seconds = (u64::from(clock.initial_seconds)
+                        + at.saturating_sub(clock.started) / clock.ticks_per_second)
+                        .min(u64::from(u32::MAX)) as u32;
+                    let shift_bits = byte * 8;
+                    clock.initial_seconds = (seconds & !(255 << shift_bits))
+                        | (u32::from(shift.word as u8) << shift_bits);
+                    clock.started = at;
                 }
             }
             return Ok(0);
         }
-        if let Some(clock) = &self.clock {
-            if let Some(byte) = clock.registers.iter().position(|&r| r as usize == address) {
-                let seconds = (u64::from(clock.initial_seconds)
-                    + at.saturating_sub(clock.started) / clock.ticks_per_second)
-                    .min(u64::from(clock.maximum_seconds));
-                return Ok((seconds >> (byte * 8) & 255) as u16);
-            }
+        if let Some(clock) = &self.clock
+            && let Some(byte) = clock.registers.iter().position(|&r| r as usize == address)
+        {
+            let seconds = (u64::from(clock.initial_seconds)
+                + at.saturating_sub(clock.started) / clock.ticks_per_second)
+                .min(u64::from(clock.maximum_seconds));
+            return Ok((seconds >> (byte * 8) & 255) as u16);
         }
         Ok(u16::from(self.values[address]))
     }
@@ -255,11 +259,17 @@ impl Endpoint for FixedInput {
     fn checkpoint(&self) -> Result<fujimod_emulator_devices::checkpoint::Checkpoint, String> {
         fujimod_emulator_devices::checkpoint::Checkpoint::encode(self.name(), &self.0)
     }
-    fn validate_checkpoint(&self, saved: &fujimod_emulator_devices::checkpoint::Checkpoint) -> Result<(), String> {
+    fn validate_checkpoint(
+        &self,
+        saved: &fujimod_emulator_devices::checkpoint::Checkpoint,
+    ) -> Result<(), String> {
         let _: FixedOptions = saved.decode(self.name())?;
         Ok(())
     }
-    fn restore_checkpoint(&mut self, saved: &fujimod_emulator_devices::checkpoint::Checkpoint) -> Result<(), String> {
+    fn restore_checkpoint(
+        &mut self,
+        saved: &fujimod_emulator_devices::checkpoint::Checkpoint,
+    ) -> Result<(), String> {
         self.0 = saved.decode(self.name())?;
         Ok(())
     }

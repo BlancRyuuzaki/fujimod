@@ -120,11 +120,8 @@ impl Profile {
             let mut words = BTreeMap::new();
             let base = ranges[0].0;
             for ((a, _), bytes) in ranges.iter().zip(&before) {
-                for (i, b) in bytes.chunks_exact(4).enumerate() {
-                    words.insert(
-                        a - base + i as u64 * 4,
-                        u32::from_le_bytes(b.try_into().unwrap()),
-                    );
+                for (i, b) in bytes.as_chunks::<4>().0.iter().enumerate() {
+                    words.insert(a - base + i as u64 * 4, u32::from_le_bytes(*b));
                 }
             }
             let mut read_error: Option<String> = None;
@@ -208,7 +205,7 @@ impl Profile {
                     p.regs.insert(o as u32, v);
                     p.written.insert(o as u32);
                 }
-                let convert=|frame:fujimod_framebuffer::frame::Frame|->Result<(u32,u32,Vec<u8>),String>{let rgb=frame.rgb.ok_or("Display has no pixels")?;Ok((frame.width as u32,frame.height as u32,rgb.chunks_exact(3).flat_map(|p|[p[0],p[1],p[2],255]).collect()))};
+                let convert=|frame:fujimod_framebuffer::frame::Frame|->Result<(u32,u32,Vec<u8>),String>{let rgb=frame.rgb.ok_or("Display has no pixels")?;Ok((frame.width as u32,frame.height as u32,rgb.as_chunks::<3>().0.iter().flat_map(|p|[p[0],p[1],p[2],255]).collect()))};
                 let render = |c: &Compositor,
                               read: &mut dyn FnMut(u64, usize) -> Result<Vec<u8>, String>|
                  -> Result<Option<(u32, u32, Vec<u8>)>, String> {
@@ -262,14 +259,25 @@ impl Profile {
                 if let Ok(Some((w, h, rgba, _))) = compose(words, read) {
                     emit("frame.bmp".into(), w, h, rgba)?;
                 }
-                for (r, bit) in [(0x00, 2)].into_iter().chain((0..4).map(|i| (0x200, i))) {
-                    if words.get(&r).copied().unwrap_or(0) & (1 << bit) == 0 {
-                        continue;
-                    }
+                use fujimod_framebuffer_xpp::{
+                    CONTROL, Decoder, LAYER_ENABLE, OSD_ENABLE, VIDEO_ENABLE,
+                };
+                // The video plane alone, then each enabled OSD layer alone.
+                let decoder = Decoder { words };
+                let control =
+                    words.get(&CONTROL).copied().unwrap_or(0) & !(VIDEO_ENABLE | OSD_ENABLE);
+                let video =
+                    decoder
+                        .video_shown()
+                        .then_some((CONTROL, 0, control | VIDEO_ENABLE, 0));
+                let shown = decoder.layers_shown();
+                let layers = (0..4)
+                    .filter(|bit| shown & (1 << bit) != 0)
+                    .map(|bit| (LAYER_ENABLE, bit, control | OSD_ENABLE, 1 << bit));
+                for (r, bit, control, enable) in video.into_iter().chain(layers) {
                     let mut layer = words.clone();
-                    layer.insert(0, words.get(&0).copied().unwrap_or(0) & !(1 << 2));
-                    layer.insert(0x200, 0);
-                    layer.insert(r, if r == 0 { words[&0] } else { 1 << bit });
+                    layer.insert(CONTROL, control);
+                    layer.insert(LAYER_ENABLE, enable);
                     if let Ok(Some((w, h, rgba, _))) = compose(&layer, read) {
                         emit(format!("layer/{r:x}.{bit}.bmp"), w, h, rgba)?;
                     }
@@ -283,7 +291,7 @@ impl Profile {
                 let decode = |r: &[u32]| {
                     fujimod_framebuffer_xp4::decode(
                         r,
-                        picture.then_some(fujimod_framebuffer_xp4::Picture::Bgra8888Straight),
+                        picture.then_some(fujimod_framebuffer_xp4::Picture::Abgr8888Straight),
                         video.then_some(fujimod_framebuffer_xp4::Video::YyCbCr422),
                     )
                 };
@@ -413,7 +421,7 @@ mod capture_tests {
     use super::*;
     fn fixture(a: u64, n: usize) -> Vec<u8> {
         let words: BTreeMap<u64, u32> = [
-            (0, 4),
+            (0, 5),
             (0x10, 0x333),
             (0x14, 0x10000),
             (0x2c, 0x10000),
@@ -440,7 +448,7 @@ mod capture_tests {
     fn an_unknown_enabled_layer_cannot_be_published_as_a_complete_frame() {
         let images = Profile::Xpp.capture(1, |a, n| Ok(fixture(a, n))).unwrap();
         assert!(!images.iter().any(|i| i.name == "frame.bmp"));
-        let layer = images.iter().find(|i| i.name == "layer/0.2.bmp").unwrap();
+        let layer = images.iter().find(|i| i.name == "layer/0.0.bmp").unwrap();
         assert_eq!(&layer.bytes[122..], &[0, 0, 0, 255, 255, 255, 255, 255]);
     }
     #[test]

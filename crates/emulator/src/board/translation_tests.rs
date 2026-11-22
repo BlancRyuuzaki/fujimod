@@ -4,6 +4,7 @@
 //! table and one level-3 table describe an identity page, a page whose output
 //! address differs from its input address, a Device page, a write-protected
 //! page and an execute-never page.
+use fujimod_catalog_configuration::RunEngine;
 use super::{
     Board,
     bus::{Bus, Mode},
@@ -50,7 +51,7 @@ fn board() -> Board {
     .unwrap();
     graph
         .build(
-            factory::Options::new(factory::Engine::Unicorn)
+            factory::Options::new(RunEngine::Unicorn)
                 .with_translation_cache_size_bytes(1 << 20),
             Bus::new(Mode::Strict),
             None,

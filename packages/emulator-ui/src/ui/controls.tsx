@@ -237,7 +237,7 @@ export class ControlSession {
   releaseAll() {
     this.stopRotation?.();
     this.stopShutter?.(true);
-    for (const key of [...this.holds.keys()]) this.release(key);
+    for (const key of this.holds.keys()) this.release(key);
   }
   feedback(ids: string[], glow = false) {
     this.active = ids;
@@ -359,7 +359,6 @@ export class ControlSession {
   }
   setPowered(on: boolean) {
     this.powered = on;
-    if (this.powerID) this.positions.set(this.powerID, on ? 'ON' : 'OFF');
     this.changed();
   }
   synchronize(positions: Record<string, string>) {
@@ -622,7 +621,7 @@ function Dial(props: { session: ControlSession; id: string; node: ControlNode })
   });
   return (
     <div
-      ref={dial}
+      ref={(element) => (dial = element)}
       class={['dial-wrapper', props.session.classes(props.id)]}
       tabindex="0"
       role="slider"

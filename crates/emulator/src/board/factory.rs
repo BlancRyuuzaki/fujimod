@@ -1,20 +1,18 @@
 //! Checked construction and memory ownership for every execution backend.
+use fujimod_catalog_configuration::RunEngine;
 use super::{Board, InterruptMap, bus::Bus, set};
 use fujimod_emulator_cpu::{Cpu, Model, Register, memory::Backing, timeline::Ratio};
 use fujimod_emulator_cpu_unicorn::Library;
 use std::ptr::NonNull;
 
-#[derive(Clone, Copy)]
-pub enum Engine {
-    Unicorn,
-    Hypervisor,
-}
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Processor {
     pub model: Model,
     pub registers: Vec<(Register, u64)>,
     pub released: bool,
+    #[serde(default)]
+    pub parked_until_sgi: bool,
     pub mprofile: Option<super::mprofile::Config>,
     pub rprofile: Option<fujimod_emulator_cpu_unicorn::rprofile::core::Options>,
 }
@@ -70,16 +68,32 @@ pub struct Graph {
 pub const TRANSLATION_CACHE_BYTES: u32 = 128 << 20;
 
 pub struct Options {
-    pub engine: Engine,
+    pub engine: RunEngine,
     translation_cache_size_bytes: Option<u32>,
+    epoch: Option<(u64, Vec<u64>)>,
+    ram_fill: Option<u8>,
 }
 
 impl Options {
-    pub fn new(engine: Engine) -> Self {
+    pub fn new(engine: RunEngine) -> Self {
         Self {
             engine,
             translation_cache_size_bytes: None,
+            epoch: None,
+            ram_fill: None,
         }
+    }
+
+    /// Initialize declared physical memory before boot images are loaded.
+    pub fn with_ram_fill(mut self, byte: u8) -> Self {
+        self.ram_fill = Some(byte);
+        self
+    }
+
+    /// Start fresh devices and processors on a continuing virtual timeline.
+    pub fn with_epoch(mut self, tick: u64, previous_instructions: Vec<u64>) -> Self {
+        self.epoch = Some((tick, previous_instructions));
+        self
     }
 
     /// Set a smaller cache for focused tests.
@@ -135,6 +149,14 @@ pub fn translation_cache_size_bytes(processors: usize) -> Result<u32, String> {
         Ok(TRANSLATION_CACHE_BYTES)
     }
 }
+/// Reject configurations whose selected engine cannot run the requested processors.
+pub fn validate_engine(engine: RunEngine, models: impl IntoIterator<Item = Model>) -> Result<(), String> {
+    if engine == RunEngine::Hypervisor && models.into_iter().any(|model| !matches!(model, Model::ArmV8A | Model::CortexM4)) {
+        return Err("Hypervisor boards support AArch64 cores and Unicorn M-profile companions".into());
+    }
+    Ok(())
+}
+
 pub(super) struct Engines {
     unicorn: Option<Library>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -142,24 +164,15 @@ pub(super) struct Engines {
 }
 impl Engines {
     fn new(graph: &Graph, options: &Options) -> Result<Self, String> {
-        if matches!(options.engine, Engine::Hypervisor)
-            && graph
-                .processors
-                .iter()
-                .any(|p| !matches!(p.model, Model::ArmV8A | Model::CortexM4))
-        {
-            return Err(
-                "Hypervisor boards support AArch64 cores and Unicorn M-profile companions".into(),
-            );
-        }
+        validate_engine(options.engine, graph.processors.iter().map(|processor| processor.model))?;
         let need_uc = graph
             .processors
             .iter()
-            .any(|p| matches!(options.engine, Engine::Unicorn) || p.model != Model::ArmV8A);
+            .any(|p| matches!(options.engine, RunEngine::Unicorn) || p.model != Model::ArmV8A);
         let need_hvf = graph
             .processors
             .iter()
-            .any(|p| matches!(options.engine, Engine::Hypervisor) && p.model == Model::ArmV8A);
+            .any(|p| matches!(options.engine, RunEngine::Hypervisor) && p.model == Model::ArmV8A);
         let unicorn = if need_uc {
             Some(Library::linked()?)
         } else {
@@ -189,7 +202,7 @@ impl Engines {
         memory: &fujimod_emulator_cpu_unicorn::memory::Memory,
     ) -> Result<Box<dyn Cpu>, String> {
         let model = processor.model;
-        if model == Model::ArmV8A && matches!(options.engine, Engine::Hypervisor) {
+        if model == Model::ArmV8A && matches!(options.engine, RunEngine::Hypervisor) {
             #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             return Ok(Box::new(
                 self.hypervisor
@@ -216,7 +229,7 @@ impl Engines {
                 memory.clone(),
             )?));
         }
-        if let Some(config) = processor.rprofile {
+        if let Some(config) = processor.rprofile.clone() {
             Ok(Box::new(
                 fujimod_emulator_cpu_unicorn::rprofile::core::Core::new(
                     raw,
@@ -321,7 +334,10 @@ impl Graph {
                 .filter(|m| m.core == p.core)
                 .any(|m| p.address < m.address + m.size as u64 && end > m.address)
             {
-                return Err("peripheral mapping overlaps RAM".into());
+                return Err(format!(
+                    "peripheral mapping overlaps RAM: core {} address {:#x} size {:#x} (physical {:#x})",
+                    p.core, p.address, p.size, p.physical
+                ));
             }
             if self.peripherals[..i].iter().any(|q| {
                 q.core == p.core && q.address < end && p.address < q.address + q.size as u64
@@ -412,7 +428,14 @@ impl Graph {
         let ram = super::memory::Memory::new(
             self.ram
                 .iter()
-                .map(|r| Ok((r.base, Backing::aligned_zeros(r.size, 0x4000)?)))
+                .map(|r| {
+                    let backing = Backing::aligned_zeros(r.size, 0x4000)?;
+                    if let Some(byte) = options.ram_fill {
+                        // The backing is exclusively owned and not yet mapped by a CPU.
+                        unsafe { std::ptr::write_bytes(backing.as_ptr(), byte, r.size) };
+                    }
+                    Ok((r.base, backing))
+                })
                 .collect::<Result<Vec<_>, String>>()?,
             self.dma_mappings.clone(),
         )?;
@@ -420,7 +443,7 @@ impl Graph {
             .processors
             .iter()
             .filter(|processor| {
-                matches!(options.engine, Engine::Unicorn) || processor.model != Model::ArmV8A
+                matches!(options.engine, RunEngine::Unicorn) || processor.model != Model::ArmV8A
             })
             .count();
         let translation_cache_size_bytes = match options.translation_cache_size_bytes {
@@ -463,14 +486,29 @@ impl Graph {
             }
         }
         let released = self.processors.iter().map(|p| p.released).collect();
-        let mut board = Board::new(
+        let (start_tick, previous_instructions) = match options.epoch {
+            Some((tick, counts)) => (tick, Some(counts)),
+            None => (0, None),
+        };
+        let mut board = Board::new_at(
             cpus,
             bus,
             self.instructions_per_tick,
             interrupts,
             released,
             ram,
+            start_tick,
+            previous_instructions,
         )?;
+        {
+            let mut state = board.state.borrow_mut();
+            for (core, processor) in self.processors.iter().enumerate() {
+                if processor.released && processor.parked_until_sgi {
+                    state.parked_until_sgi[core] = true;
+                    state.waiting[core] = true;
+                }
+            }
+        }
         board.translation_cache_size_bytes = translation_cache_size_bytes;
         board.state.borrow_mut().decoders = super::decoder::Decoders::new(self.decoders);
         board.mappings = self.mappings.clone();
@@ -498,6 +536,11 @@ impl Graph {
         }
         board.map_interrupts()?;
         board.retained_engines = Some(engines);
+        board
+            .state
+            .borrow()
+            .memory
+            .track_from_fill(&board.cpus, options.ram_fill.unwrap_or(0));
         Ok(board)
     }
 }
@@ -534,7 +577,7 @@ mod peripheral_page_tests {
             processors: vec![Processor {
                 model: Model::ArmV8A,
                 registers: vec![],
-                released: true,
+                released: true, parked_until_sgi: false,
                 mprofile: None,
                 rprofile: None,
             }],

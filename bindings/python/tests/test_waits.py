@@ -1,17 +1,33 @@
 """Read-set waits follow dependencies and preserve hard execution ceilings."""
-from dataclasses import asdict
+from contextlib import contextmanager
 import json
+from unittest.mock import patch
 
 import pytest
 
+from fujimod.emulator import waits
 from fujimod.emulator.waits import (
     MAX_CONTINUATION_STOP_CAUSES,
     ContinuationStopCause,
     ContinuationStopCount,
-    WaitMetrics,
+    WaitStops,
+    wait_kind,
     wait_steps,
     wait_until,
 )
+
+
+@contextmanager
+def observed_spans(records):
+    """Capture the span category and final properties without a native build."""
+    @contextmanager
+    def span(kind, wait=None, properties=None, wait_counter=None):
+        try:
+            yield
+        finally:
+            records.append((kind, wait, dict(properties or {}), wait_counter))
+    with patch.object(waits.perf, 'span', span):
+        yield
 
 
 class Reads:
@@ -67,12 +83,29 @@ class Board:
 
 def test_read_set_changes_after_short_circuit_and_tracks_device_reads():
     board = Board()
-    report = WaitMetrics('dependent')
-    assert wait_until(board, lambda: board.read(8) >= 3 and board.device('timer') >= 6,
-                      'dependent', instruction_limit=20, metrics=report)
+    records = []
+    with patch.object(waits.perf, 'begin_wait', return_value=42) as begin_wait:
+        with observed_spans(records):
+            assert wait_until(board, lambda: board.read(8) >= 3 and board.device('timer') >= 6,
+                              'dependent', instruction_limit=20)
+    begin_wait.assert_called_once_with('dependent')
     assert board.calls == [(20, None, [(8,12)], []), (17, None, [(8,12)], ['timer'])]
-    assert (report.polls, report.continuations, report.instructions, report.ticks) == (3,2,6,6)
+    assert records == [('wait', 'other', dict(instructions=6, ticks=6, polls=3,
+                                              continuations=2), 42)]
     assert board.native.stop_calls == 0
+
+
+def test_wait_categories_are_the_ledger_vocabulary():
+    assert [wait_kind(description) for description in (
+        'native physical DOWN release',
+        'input parameter gate',
+        'native selected OSD frame',
+        'initialized REC after shooting',
+        'card load recipe',
+        'shutter half press',
+        'anything else',
+    )] == ['debounce', 'input_gate', 'osd_frame', 'rec_return',
+           'card_load', 'shutter', 'other']
 
 
 def test_already_ready_never_runs_and_unwatchable_false_predicate_refuses():
@@ -130,6 +163,7 @@ def test_device_publications_at_the_current_tick_are_progress():
     def publish(*args, **kwargs):
         nonlocal publications
         publications += 1
+        board.native.stop = {'kind': 'device', 'id': 0, 'device': 'sink'}
         return True
 
     def ready():
@@ -174,11 +208,11 @@ def test_stop_profile_aggregates_causes_per_wait():
         'address': 8,
         'change_confirmed': True,
     }
-    board.stop_events = [store_stop, {'kind': 'device', 'id': 2}, store_stop]
-    report = WaitMetrics('profiled')
+    board.stop_events = [store_stop, {'kind': 'device', 'id': 2, 'device': 'timer'}, store_stop]
+    report = WaitStops()
 
     assert wait_until(board, lambda: board.read(8) >= 9, 'profiled',
-                      instruction_limit=20, metrics=report, profile_stops=True)
+                      instruction_limit=20, stops=report, profile_stops=True)
 
     assert report.continuation_stops == [
         ContinuationStopCount(
@@ -188,7 +222,7 @@ def test_stop_profile_aggregates_causes_per_wait():
             ),
             2,
         ),
-        ContinuationStopCount(ContinuationStopCause('device', device_id=2), 1),
+        ContinuationStopCount(ContinuationStopCause('device', device_id=2, device='timer'), 1),
     ]
     assert report.continuation_stop_overflow == 0
     assert board.native.stop_calls == 3
@@ -197,33 +231,37 @@ def test_stop_profile_aggregates_causes_per_wait():
 def test_stop_profile_bounds_distinct_causes_and_counts_overflow():
     board = Board()
     event_count = MAX_CONTINUATION_STOP_CAUSES + 3
-    board.stop_events = [{'kind': 'device', 'id': index} for index in range(event_count)]
-    board.stop_events[-1] = {'kind': 'device', 'id': 0}
-    report = WaitMetrics('bounded profile')
+    board.stop_events = [{'kind': 'device', 'id': index, 'device': f'device-{index}'} for index in range(event_count)]
+    board.stop_events[-1] = {'kind': 'device', 'id': 0, 'device': 'device-0'}
+    report = WaitStops()
 
     assert wait_until(board, lambda: board.device('timer') >= event_count * 3,
                       'bounded profile', instruction_limit=event_count * 3 + 1,
-                      metrics=report, profile_stops=True)
+                      stops=report, profile_stops=True)
 
     assert len(report.continuation_stops) == MAX_CONTINUATION_STOP_CAUSES
     assert report.continuation_stops[0] == ContinuationStopCount(
-        ContinuationStopCause('device', device_id=0), 2)
+        ContinuationStopCause('device', device_id=0, device='device-0'), 2)
     assert report.continuation_stop_overflow == 2
     assert sum(item.count for item in report.continuation_stops) + report.continuation_stop_overflow == event_count
 
 
 def test_profiled_wait_metrics_are_json_serializable():
     board = Board()
-    board.stop_events = [{'kind': 'device', 'id': 4}]
-    report = WaitMetrics('serializable')
+    board.stop_events = [{'kind': 'device', 'id': 4, 'device': 'timer'}]
+    report = WaitStops()
 
     assert wait_until(board, lambda: board.device('timer') >= 3, 'serializable',
-                      instruction_limit=10, metrics=report, profile_stops=True)
+                      instruction_limit=10, stops=report, profile_stops=True)
 
-    serialized = json.dumps(asdict(report))
+    serialized = json.dumps(dict(
+        continuations=report.continuations,
+        continuation_stops=report.continuation_stops,
+        continuation_stop_overflow=report.continuation_stop_overflow,
+    ), default=lambda item: item.__dict__)
     decoded = json.loads(serialized)
     assert decoded['continuation_stops'] == [
-        {'cause': {'kind': 'device', 'device_id': 4, 'range_index': None,
+        {'cause': {'kind': 'device', 'device_id': 4, 'device': 'timer', 'range_index': None,
                    'physical_range': None, 'address': None, 'change_confirmed': None},
          'count': 1}
     ]
@@ -232,11 +270,11 @@ def test_profiled_wait_metrics_are_json_serializable():
 
 def test_stop_profile_requires_a_report_and_native_observation_api():
     board = Board()
-    with pytest.raises(ValueError, match='requires metrics'):
+    with pytest.raises(ValueError, match='requires stops'):
         wait_until(board, lambda: 'ready', 'missing report', profile_stops=True)
     board.native.continuation_stop = None
     with pytest.raises(ValueError, match='does not expose'):
-        wait_until(board, lambda: 'ready', 'missing API', metrics=WaitMetrics('missing API'),
+        wait_until(board, lambda: 'ready', 'missing API', stops=WaitStops(),
                    profile_stops=True)
 
 
@@ -245,4 +283,4 @@ def test_stop_profile_rejects_a_missing_cause_for_a_published_continuation():
     board.run = lambda *args, **kwargs: True
     with pytest.raises(RuntimeError, match='without a cause'):
         wait_until(board, lambda: board.read(8) >= 100, 'missing cause',
-                   metrics=WaitMetrics('missing cause'), profile_stops=True)
+                   stops=WaitStops(), profile_stops=True)

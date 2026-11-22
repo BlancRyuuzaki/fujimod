@@ -35,9 +35,25 @@ visitor), but not release files: every download path ends at
 `patches.json` schema 2 has, per firmware entry, two download switches, both false
 unless the release sets them:
 
-- `sd_card`: offer FujiMod SD boot for this body.
-- `installable`: offer FujiMod installable (SD boot files plus `FPUPDATE.DAT`).
-  Accepted only when the release contains that body's `FPUPDATE.DAT` output.
+- `sd_boot_v1`: offer FujiMod SD boot v1 for this body.
+- `sd_boot_v1_installable`: offer FujiMod installable (SD boot files plus the update DAT).
+  Accepted only when the release contains that body's update DAT output and the
+  entry's `update_filename`, the name the body's updater looks for
+  (`FPUPDATE.DAT`, `FWUP0009.DAT`, …).
+
+Each firmware entry lists the mods built into its release in `mods`; the
+SD card download orders its cameras by that count.
+
+An optional `card` list names the files the release offers for the SD card.
+Each entry has the card `path` in upper-case 8.3 names
+(`FUJIMOD/RECIPES/AGFAOPT.JSN`), the release `asset` that holds it, its
+`sha256` and `bytes`, and optionally `title` and `author`. Entries with a
+`processor` (a catalog processor name such as `EXR Processor II`) are that
+processor's SD boot files at the card root (`FFBOOT.BIN`, `FFSYS.BIN`,
+`FM_EXR2.BIN`) and are written only for its cameras; the others are optional
+files the user may leave out. Local development adds a card file directory
+(`card.json` and its assets) to the configured release with
+`FUJIMOD_CARD_FILES`.
 
 An optional `notes.md` (one per release, not per body) is referenced from
 `patches.json` by filename. Without it no notes are shown. The
@@ -56,7 +72,7 @@ and verified when used.
 `notesText` (Markdown text). `notes` retains the index's filename.
 The home controller exposes this value as `state.release`. To find download
 availability, find the entry in `state.release.firmwares` by the chosen DAT's
-SHA-256 and read `entry.downloads.sd_card` or `entry.downloads.installable`.
+SHA-256 and read `entry.downloads.sd_boot_v1` or `entry.downloads.sd_boot_v1_installable`.
 The validator fills missing switches with `false`; malformed values fail.
 Use `notesText` with the restricted renderer described above. Resolve patch
 filenames against `assetBase`, including when passing it to the patch worker.
@@ -73,7 +89,7 @@ rows styled like the camera list rows (icon, title, subtitle, chevron):
 | Row                            | Subtitle with a chosen DAT              | Unavailable                         |
 | ------------------------------ | --------------------------------------- | ----------------------------------- |
 | Download FujiMod installable   | `X70 • 1.10 • Includes SD boot version` | _Not available for this camera yet_ |
-| Download FujiMod SD boot       | `X70 • 1.10 base firmware`              | _Not available for this camera yet_ |
+| Download FujiMod SD boot v1       | `X70 • 1.10 base firmware`              | _Not available for this camera yet_ |
 | Run FujiMod in your browser    | `X70 • 1.10 with FujiMod 0.0.1`         |                                     |
 | Run unmodified in your browser | `X70 • 1.10 official firmware`          |                                     |
 
@@ -116,13 +132,16 @@ Before each SD boot or firmware-update button combination, switch the camera
 OFF, then remove and reinsert the battery. Show the hand-drawn battery-cycle
 SVG beside this instruction.
 
-- **FujiMod SD boot:** 1. Download the SD card files, with the disclaimer
+- **FujiMod SD boot v1:** 1. Download the SD card files, with the disclaimer
   below and a blue button. 2. Copy them to a FAT32 SD card (`ffsys.bin`,
   `ffboot.bin`). 3. Boot from the SD card with the `sd` combination only.
-- **FujiMod installable:** 1. Download the files, orange button. 2. Copy all files including `FPUPDATE.DAT`. 3. Try it from the SD card first
+  Hold the buttons only while turning the power switch on; once the switch is
+  in the ON position, release them.
+- **FujiMod installable:** 1. Download the files, orange button. 2. Copy all files including the update DAT. 3. Try it from the SD card first
   (`sd` combination) and shoot normally until satisfied. 4. Install it: turn
   the camera OFF, remove and reinsert the battery, then power on holding the
-  `firmware_update` combination. 5. Optional: SET-UP → FUJIMOD DEVTOOLS → BUILD OVERLAY → OFF.
+  `firmware_update` combination. Release the buttons once the switch is in the
+  ON position. 5. Optional: SET-UP → DEVTOOLS → BUILD OVERLAY → OFF.
 
 Disclaimer, in bold above each download button:
 
@@ -134,11 +153,29 @@ Disclaimer, in bold above each download button:
 Followed by: "[Recovery tools](/recovery/) are available in the very unlikely
 event this bricks your camera."
 
+## SD card download
+
+The homepage section after the feature catalog builds one card for any set of
+release cameras. A floating checklist lists every release camera by mod count;
+cameras whose root boot files differ from a chosen camera's are disabled. The
+section is drawn as an SD card holding the card's file tree, with notes above
+the files they describe. Optional card files and `FUJIMOD/.git` (Track
+changes with Git) have include boxes; excluded files are dimmed.
+
+Choosing a camera loads `/ota/<FIRMWARE>/latest.json`, the camera update
+release whose store files fill `FUJIMOD/SYSTEM/STORE/`. The download writes
+the processor's boot files, the chosen card files, each camera's first-install
+`A.JSN` (generation 1) and `STATE.JSN`, and every store file once, checks each
+fetched file's size and SHA-256, and zips the card's root as
+`fujimod-sd-card-<release>.zip`. With Git tracking, `FUJIMOD/.git` holds one
+commit of every file under `FUJIMOD/` and an index, so `git status` starts
+clean.
+
 ## Download filenames
 
-Archives use `fujimod-{recovery,green-led,modified}-{sd-boot,installable}-{model}-{firmware}-build-{build}.zip`.
+Archives use `fujimod-{sd-card-recovery,green-led,modified-sd-boot-v1,modified-installable}-{model}-{firmware}-build-{build}.zip`.
 The model is lowercase with hyphens instead of spaces; firmware versions retain
 periods, and the build is the website's eight-character Git commit SHA.
-For example: `fujimod-recovery-sd-boot-x-t1-5.52-build-1234abcd.zip`.
+For example: `fujimod-sd-card-recovery-x-t1-5.52-build-1234abcd.zip`.
 Camera-required filenames inside each archive stay intact. Modified installable
-archives include the SD boot files and `FPUPDATE.DAT`.
+archives include the SD boot files and the body's `update_filename` DAT.

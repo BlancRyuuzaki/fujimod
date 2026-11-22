@@ -53,6 +53,16 @@ impl Ratio {
                 (0, phase)
             });
         }
+        // The common span fits 64 bits; the wide form is the same value.
+        if let Some(fraction) = entries
+            .checked_mul(self.denominator)
+            .and_then(|span| span.checked_add(phase))
+        {
+            return Ok((
+                u128::from(fraction / self.numerator),
+                fraction % self.numerator,
+            ));
+        }
         let fraction = u128::from(phase) + u128::from(entries) * u128::from(self.denominator);
         Ok((
             fraction / u128::from(self.numerator),
@@ -68,6 +78,10 @@ impl Ratio {
         }
         if now >= deadline {
             return Ok(0);
+        }
+        // `phase < numerator` and `deadline > now` keep the difference positive.
+        if let Some(span) = (deadline - now).checked_mul(self.numerator) {
+            return Ok((span - phase).div_ceil(self.denominator));
         }
         let need = u128::from(deadline - now) * u128::from(self.numerator) - u128::from(phase);
         Ok(need
@@ -111,11 +125,15 @@ pub struct Timeline {
 }
 impl Timeline {
     pub fn new(ratio: Ratio, processors: usize) -> Result<Self, String> {
+        Self::new_at(ratio, processors, 0)
+    }
+    /// Begin a new powered epoch on the existing virtual-time axis.
+    pub fn new_at(ratio: Ratio, processors: usize, start_tick: u64) -> Result<Self, String> {
         if ratio.numerator < ratio.denominator {
             return Err("timeline requires at least one instruction per board tick".into());
         }
         Ok(Self {
-            now: 0,
+            now: start_tick,
             phase: 0,
             ratio,
             sequence: 0,
@@ -155,6 +173,22 @@ impl Timeline {
     /// One processor's own position, for its architectural counters.
     pub fn processor_clock(&self, core: usize) -> Result<crate::Clock, String> {
         let (numerator, denominator) = self.ratio.parts();
+        // The common position fits 64 bits; the wide form is the same value.
+        if let Some(frontier) = self
+            .now
+            .checked_mul(numerator)
+            .and_then(|ticks| ticks.checked_add(self.phase))
+            && let Some(behind) = self.lag(core)?.checked_mul(denominator)
+        {
+            let position = frontier
+                .checked_sub(behind)
+                .ok_or("processor position precedes guest time zero")?;
+            return Ok(crate::Clock {
+                now: position / numerator,
+                phase: position % numerator,
+                ratio: self.ratio,
+            });
+        }
         let position = (u128::from(self.now) * u128::from(numerator) + u128::from(self.phase))
             .checked_sub(u128::from(self.lag(core)?) * u128::from(denominator))
             .ok_or("processor position precedes guest time zero")?;
@@ -294,6 +328,16 @@ impl Timeline {
         self.now = at;
         Ok(true)
     }
+    /// Advance an unpowered machine without executing its old device events.
+    /// The old powered epoch cannot be resumed after this operation.
+    pub fn advance_unpowered(&mut self, at: u64) -> Result<(), String> {
+        if at < self.now { return Err("unpowered time moved backward".into()); }
+        self.queue.clear();
+        self.lags.fill(0);
+        self.now = at;
+        self.phase = 0;
+        Ok(())
+    }
     pub fn pop_due(&mut self) -> Option<Event> {
         if self.queue.peek().is_some_and(|e| e.0.at <= self.now) {
             self.queue.pop().map(|e| e.0)
@@ -381,6 +425,18 @@ impl Timeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fresh_epoch_keeps_virtual_time_and_starts_with_no_events() {
+        let mut timeline = Timeline::new_at(Ratio::new(2, 1).unwrap(), 2, 9000).unwrap();
+        assert_eq!(timeline.now(), 9000);
+        assert_eq!(timeline.processor_clock(0).unwrap().now, 9000);
+        assert_eq!(timeline.next_event(), None);
+        assert!(timeline.schedule(Target::DeviceEvent(0), 8999, 0).is_err());
+        timeline.schedule(Target::DeviceEvent(0), 9003, 7).unwrap();
+        assert!(timeline.advance_waiting(true, None).unwrap());
+        assert_eq!(timeline.now(), 9003);
+        assert_eq!(timeline.pop_due().unwrap().token, 7);
+    }
     #[test]
     fn replacing_a_model_deadline_preserves_explicit_and_processor_events() {
         let mut t = Timeline::new(Ratio::new(1, 1).unwrap(), 1).unwrap();
@@ -535,5 +591,69 @@ mod tests {
         let before = overflow.save();
         assert!(overflow.advance_instructions(100).is_err());
         assert_eq!(overflow.save(), before);
+    }
+    #[test]
+    fn narrow_clock_arithmetic_equals_the_wide_form() {
+        let values = [
+            0u64,
+            1,
+            2,
+            7,
+            99,
+            1 << 20,
+            (1 << 32) - 1,
+            1 << 32,
+            62_000_000_000,
+            (1 << 62) + 5,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        for (numerator, denominator) in [(1u64, 1u64), (7, 2), (5, 5), (1 << 32, 3), (1 << 32, 1 << 32)] {
+            let ratio = Ratio::new(numerator, denominator).unwrap();
+            for phase in [0, numerator / 2, numerator - 1] {
+                for &entries in &values {
+                    let fraction = u128::from(phase) + u128::from(entries) * u128::from(denominator);
+                    assert_eq!(
+                        ratio.advance_phase(phase, entries).unwrap(),
+                        (
+                            fraction / u128::from(numerator),
+                            (fraction % u128::from(numerator)) as u64
+                        )
+                    );
+                }
+                for &now in &values {
+                    for &deadline in &values {
+                        let wide = if now >= deadline {
+                            0
+                        } else {
+                            (u128::from(deadline - now) * u128::from(numerator) - u128::from(phase))
+                                .div_ceil(u128::from(denominator))
+                                .min(u128::from(u64::MAX)) as u64
+                        };
+                        assert_eq!(ratio.budget(now, phase, deadline).unwrap(), wide);
+                    }
+                }
+                for &now in &values {
+                    for &lag in &values {
+                        let mut timeline = Timeline::new_at(ratio, 1, now).unwrap();
+                        timeline.phase = phase;
+                        timeline.lags[0] = lag;
+                        let wide = (u128::from(now) * u128::from(numerator) + u128::from(phase))
+                            .checked_sub(u128::from(lag) * u128::from(denominator));
+                        match (timeline.processor_clock(0), wide) {
+                            (Ok(clock), Some(position)) => assert_eq!(
+                                (clock.now, clock.phase),
+                                (
+                                    (position / u128::from(numerator)) as u64,
+                                    (position % u128::from(numerator)) as u64
+                                )
+                            ),
+                            (Err(_), None) => (),
+                            (clock, wide) => panic!("{:?} against {wide:?}", clock.map(|c| c.now)),
+                        }
+                    }
+                }
+            }
+        }
     }
 }

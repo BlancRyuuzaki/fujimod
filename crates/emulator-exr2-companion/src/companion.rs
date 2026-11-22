@@ -717,9 +717,9 @@ impl Device for ProgramUpload {
         state.program.clear();
         state.pending_program.clear();
         let mut value = json!({"state":state,"options":self.options});
-        value["state"]["program"] = fujimod_emulator_devices::fingerprint::bytes(&self.state.program);
+        value["state"]["program"] = fujimod_emulator_devices::state::bytes(&self.state.program);
         value["state"]["pending_program"] =
-            fujimod_emulator_devices::fingerprint::bytes(&self.state.pending_program);
+            fujimod_emulator_devices::state::bytes(&self.state.pending_program);
         Ok(value)
     }
 
@@ -1081,12 +1081,7 @@ mod tests {
         setup(&mut model, &mut host);
         assert_eq!(write(&mut model, &mut host, CHANNEL_CONTROL, 0x40001), None);
         assert_eq!(
-            write(
-                &mut model,
-                &mut host,
-                DESCRIPTOR_POINTER,
-                (RAM_BASE + 0x100) as u64
-            ),
+            write(&mut model, &mut host, DESCRIPTOR_POINTER, RAM_BASE + 0x100),
             None
         );
         assert!(write(&mut model, &mut host, TRANSFER_CONTROL, 1).is_some());

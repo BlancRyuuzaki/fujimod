@@ -122,6 +122,11 @@ export function startSession(
         }
     });
   }
+  function showPowerState(s: SessionState) {
+    s.live = s.poweredOn === false ? 'OFF' : 'LIVE';
+    s.message = s.poweredOn === false ? 'Camera is powered off' : 'Camera ready';
+    s.error = false;
+  }
   function finishLoading() {
     setState((s) => {
       s.loading = false;
@@ -199,19 +204,23 @@ export function startSession(
       latestFault = undefined;
       panel.resume();
       setCardEngine(engine);
-      setState((s) => {
-        s.live = 'LIVE';
-      });
+      setState(showPowerState);
     } catch (error) {
       reportFault(error);
     } finally {
       finishLoading();
     }
   }
+  async function turnOn() {
+    if (!engine || state.loading || state.poweredOn !== false) return;
+    const inputs = panel.powerID ? [{ id: panel.powerID, position: 'ON' }] : [];
+    await restartOperation(() => engine!.powerCycle(inputs, progress));
+  }
   function reset() {
     ++generation;
     void webcam.stop(false);
     setState((s) => {
+      s.poweredOn = undefined;
       s.loadingAssets = [];
       s.webcamError = '';
     });
@@ -312,19 +321,21 @@ export function startSession(
     viewer.configureTouch(inputs, active, (error) => {
       if (current === generation) reportFault(error);
     });
+    panel.synchronize(positions);
     active.powerChanges((on) => {
+      if (current !== generation) return;
       panel.setPowered(on);
       viewer.powered(on);
+      setState((s) => {
+        s.poweredOn = on;
+        if (!s.loading) showPowerState(s);
+      });
     });
-    panel.synchronize(positions);
     setCardEngine(active);
     finishLoading();
     options.ready();
-    setState((s) => {
-      s.live = 'LIVE';
-    });
+    setState(showPowerState);
     refs.viewer.dataset.bootSeconds = ((performance.now() - started) / 1000).toFixed(3);
-    status('Camera ready');
   }
   async function replay(steps: readonly ReplayStep[]) {
     panel.disable();
@@ -353,7 +364,8 @@ export function startSession(
     progress,
     finishLoading,
     undo,
-    restart: options.restart,
+    restart: () => options.restart(),
+    turnOn,
     hasFault: () => !!latestFault,
     saveCamera: async () => {
       await engine?.saveCamera();

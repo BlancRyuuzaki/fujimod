@@ -10,7 +10,7 @@ pub use crate::ladders::{ControlLadder, LadderRung, LadderWire};
 
 use crate::facts::{
     ControlInterface, DecodedTouch, GpioScanner, ManualReference, NativeKeyNames, ScannerReader,
-    ScannerRecordWitness, ScannerTable,
+    ScannerInputKind, ScannerRecordWitness, ScannerTable,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -232,7 +232,7 @@ pub enum ControlSurface {
     Right,
 }
 
-/// An explicit binding in one of two distinct firmware input vocabularies.
+/// A debug key, native input name, or exact located scanner-row identity.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -251,6 +251,11 @@ pub enum InputBinding {
     NativeInput {
         /// Exact name in the firmware's located native input vocabulary.
         name: String,
+    },
+    /// Stable identity of a located scanner row, even when it has no command name.
+    ScannerRow {
+        /// Generated scanner row identity, such as `row-69`.
+        row: String,
     },
 }
 
@@ -559,6 +564,28 @@ pub struct LocatedScannerRecord {
     pub witness: ScannerRecordWitness,
 }
 
+/// Configuration-byte offsets used by a calibrated analog phase decoder.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(
+    all(target_arch = "wasm32", not(target_os = "emscripten")),
+    derive(tsify::Tsify),
+    tsify(hashmap_as_object, missing_as_null)
+)]
+pub struct AdcEncoderCalibration {
+    /// Little-endian u16 center offsets, one for each channel.
+    pub centers: [u16; 2],
+    /// Little-endian signed u16 center adjustment offset.
+    pub offset: u16,
+    /// Byte holding the Schmitt half-band width.
+    pub hysteresis: u16,
+    /// Byte holding accepted edges per native direction event.
+    pub edges_per_step: u16,
+    /// Byte selecting normal or reversed native direction.
+    pub direction: u16,
+}
+
 /// Located electrical meaning, separate from scanner table operands.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -569,6 +596,15 @@ pub struct LocatedScannerRecord {
     tsify(hashmap_as_object, missing_as_null)
 )]
 pub enum ElectricalInput {
+    /// A callback whose Boolean result is the conjunction of several ADC bands.
+    AdcConjunction {
+        /// Every term must hold for the callback to return one.
+        terms: Vec<AdcTerm>,
+        /// Located callback evaluating all terms.
+        callback: u64,
+        /// Callback result interpreted as an active input.
+        expected_result: u32,
+    },
     /// Analog input interpreted using located sample bands or calibration offsets.
     Adc {
         /// Body connection carrying this analog input.
@@ -591,6 +627,15 @@ pub enum ElectricalInput {
         /// Firmware interpretation of the contact.
         scanner: GpioScanner,
     },
+    /// Conjunction of the ordered digital contacts in one body connection.
+    GpioContacts {
+        /// Body connection carrying all of the contacts, in predicate order.
+        connection_id: String,
+        /// Required logic level of each contact.
+        expected_levels: Vec<bool>,
+        /// Firmware callback evaluating the conjunction.
+        callback: u64,
+    },
     /// Physical encoder interpreted by a located quadrature decoder.
     GpioQuadrature {
         /// Body connection carrying the encoder phases.
@@ -607,6 +652,34 @@ pub enum ElectricalInput {
         guard: u64,
         /// Located decoder activation threshold.
         threshold: u32,
+    },
+    /// Physical encoder whose decoder emits each accepted transition without a latch.
+    GpioTransition {
+        /// Ordered body connection carrying the two encoder phases.
+        connection_id: String,
+        /// Decoder phase mapping.
+        phase_map: [u8; 4],
+        /// Decoder transition values indexed by new phase, then old phase.
+        transitions: [u8; 16],
+        /// Decoder-local direction event, distinct from the UI event.
+        decoder_event: u32,
+        /// Located decoder guard address.
+        guard: u64,
+        /// Located decoder activation threshold.
+        threshold: u32,
+    },
+    /// Calibrated analog phase decoder with a native edge accumulator.
+    AdcTransition {
+        /// Ordered body connection carrying the two analog channels.
+        connection_id: String,
+        /// Decoder phase mapping.
+        phase_map: [u8; 4],
+        /// Decoder transition values indexed by new phase, then old phase.
+        transitions: [u8; 16],
+        /// Decoder-local direction event, distinct from the UI event.
+        decoder_event: u32,
+        /// Configuration offsets for thresholds, edge count, and direction.
+        calibration_offsets: AdcEncoderCalibration,
     },
     /// Physical encoder whose firmware counts whole phase cycles, one event per cycle.
     GpioFixedCycle {
@@ -628,6 +701,50 @@ pub enum ElectricalInput {
         /// Masked status value while the input is active.
         active_value: u32,
     },
+}
+
+/// One ADC connection and the band required by a compound callback.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(
+    all(target_arch = "wasm32", not(target_os = "emscripten")),
+    derive(tsify::Tsify),
+    tsify(hashmap_as_object, missing_as_null)
+)]
+pub struct AdcTerm {
+    /// Body connection carrying this sample.
+    pub connection_id: String,
+    /// Unconditional interval tested on this sample.
+    pub interval: AdcInterval,
+}
+
+impl ElectricalInput {
+    fn validate_conjunction(&self) -> Result<(), String> {
+        if let Self::AdcConjunction {
+            terms,
+            callback,
+            expected_result,
+        } = self
+        {
+            let mut seen = BTreeSet::new();
+            if !(2..=12).contains(&terms.len())
+                || *callback == 0
+                || callback % 4 != 0
+                || *expected_result > 1
+                || terms.iter().any(|term| {
+                    term.connection_id.is_empty()
+                        || !seen.insert(&term.connection_id)
+                        || !term.interval.bounds_valid()
+                        || term.interval.condition().is_some()
+                        || !term.interval.exclusions().is_empty()
+                })
+            {
+                return Err("invalid ADC conjunction".into());
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Bounds of one accepted analog interval.
@@ -656,9 +773,9 @@ pub enum AdcInterval {
     /// Byte offsets of little-endian u16 bounds in the loaded configuration.
     ConfigurationU16 {
         /// Byte offset of the inclusive lower sample value.
-        lower: u16,
+        lower: u32,
         /// Byte offset of the inclusive upper sample value.
-        upper: u16,
+        upper: u32,
         /// Scanner state the firmware requires before the interval counts, when present.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         when: Option<AdcCondition>,
@@ -686,7 +803,7 @@ impl AdcInterval {
     fn bounds_valid(&self) -> bool {
         match self {
             Self::Literal { lower, upper, .. } => lower <= upper,
-            Self::ConfigurationU16 { lower, upper, .. } => *lower != u16::MAX && *upper != u16::MAX,
+            Self::ConfigurationU16 { lower, upper, .. } => *lower != u32::MAX && *upper != u32::MAX,
         }
     }
 }
@@ -1074,15 +1191,13 @@ impl PhysicalControls {
                     ..
                 },
             ) = &control.behavior
-            {
-                if bound
+                && bound
                     .iter()
                     .any(|position| !positions.contains(&position.id))
-                {
-                    return Err(format!(
-                        "physical control {id} binds an undocumented position"
-                    ));
-                }
+            {
+                return Err(format!(
+                    "physical control {id} binds an undocumented position"
+                ));
             }
             if let Some(role) = control.role
                 && !roles.insert(role)
@@ -1417,30 +1532,39 @@ impl FirmwareControlIds {
                 ));
             }
             if let Some(electrical) = &input.electrical {
-                let connection_id = match electrical {
+                let connection_ids: Vec<&String> = match electrical {
                     ElectricalInput::Adc { connection_id, .. }
                     | ElectricalInput::Gpio { connection_id, .. }
-                    | ElectricalInput::GpioQuadrature { connection_id, .. } => connection_id,
+                    | ElectricalInput::GpioContacts { connection_id, .. }
+                    | ElectricalInput::GpioTransition { connection_id, .. }
+                    | ElectricalInput::AdcTransition { connection_id, .. }
+                    | ElectricalInput::GpioQuadrature { connection_id, .. } => vec![connection_id],
                     ElectricalInput::GpioFixedCycle { connection_id, .. }
-                    | ElectricalInput::SerialStatus { connection_id, .. } => connection_id,
+                    | ElectricalInput::SerialStatus { connection_id, .. } => vec![connection_id],
+                    ElectricalInput::AdcConjunction { terms, .. } => {
+                        terms.iter().map(|term| &term.connection_id).collect()
+                    }
                 };
-                if !connections.contains(connection_id.as_str()) {
-                    return Err(format!(
-                        "input {} has unknown electrical connection {connection_id}",
-                        input.id
-                    ));
-                }
-                if let InputTarget::Control { control_id } = &input.target
-                    && !physical
-                        .control(control_id)?
-                        .control
-                        .connection_ids
-                        .contains(connection_id)
-                {
-                    return Err(format!(
-                        "input {} uses a connection not assigned to {control_id}",
-                        input.id
-                    ));
+                electrical.validate_conjunction()?;
+                for connection_id in connection_ids {
+                    if !connections.contains(connection_id.as_str()) {
+                        return Err(format!(
+                            "input {} has unknown electrical connection {connection_id}",
+                            input.id
+                        ));
+                    }
+                    if let InputTarget::Control { control_id } = &input.target
+                        && !physical
+                            .control(control_id)?
+                            .control
+                            .connection_ids
+                            .contains(connection_id)
+                    {
+                        return Err(format!(
+                            "input {} uses a connection not assigned to {control_id}",
+                            input.id
+                        ));
+                    }
                 }
                 if let ElectricalInput::GpioFixedCycle { cycle_sign, .. } = electrical
                     && !matches!(cycle_sign, -1 | 1)
@@ -1449,6 +1573,48 @@ impl FirmwareControlIds {
                         "input {} has an invalid encoder cycle sign",
                         input.id
                     ));
+                }
+                if let ElectricalInput::GpioTransition {
+                    phase_map, transitions, decoder_event, guard, threshold, ..
+                } = electrical {
+                    let mut phases = *phase_map;
+                    phases.sort_unstable();
+                    if phases != [0, 1, 2, 3]
+                        || transitions.iter().any(|event| *event > 2)
+                        || !matches!(*decoder_event, 1 | 2)
+                        || !transitions.contains(&(*decoder_event as u8))
+                        || *guard == 0
+                        || *threshold != 1
+                        || input.scanner.is_some()
+                    {
+                        return Err(format!("input {} has an invalid transition encoder", input.id));
+                    }
+                }
+                if let ElectricalInput::AdcTransition {
+                    phase_map,
+                    transitions,
+                    decoder_event,
+                    calibration_offsets,
+                    ..
+                } = electrical
+                    && (*phase_map != [0, 1, 2, 3]
+                        || transitions.iter().any(|event| *event > 3)
+                        || !matches!(*decoder_event, 1 | 2)
+                        || calibration_offsets.centers.contains(&u16::MAX)
+                        || calibration_offsets.offset == u16::MAX
+                        || input.scanner.is_some())
+                {
+                    return Err(format!("input {} has an invalid analog encoder", input.id));
+                }
+                if let ElectricalInput::GpioContacts { expected_levels, callback, .. } = electrical
+                    && (!(2..=8).contains(&expected_levels.len())
+                        || *callback == 0
+                        || input.scanner.as_ref().is_none_or(|scanner|
+                            scanner.witness.input_kind != ScannerInputKind::Kind5
+                                || u64::from(scanner.witness.source) != *callback
+                                || scanner.witness.upper != 1))
+                {
+                    return Err(format!("input {} has an invalid GPIO conjunction", input.id));
                 }
                 if let ElectricalInput::Adc {
                     intervals,
@@ -1518,7 +1684,9 @@ impl FirmwareControlIds {
                 if matches!(
                     electrical,
                     ElectricalInput::Adc { .. }
+                        | ElectricalInput::AdcConjunction { .. }
                         | ElectricalInput::Gpio { .. }
+                        | ElectricalInput::GpioContacts { .. }
                         | ElectricalInput::SerialStatus { .. }
                 ) && input.scanner.is_none()
                 {
@@ -1613,6 +1781,29 @@ impl FirmwareControlIds {
                 }
                 event
             }
+            InputBinding::ScannerRow { row } => {
+                let mut matches = self.inputs.iter().filter(|input| input.id == *row);
+                let input = matches
+                    .next()
+                    .ok_or_else(|| format!("unknown firmware scanner row {row}"))?;
+                if matches.next().is_some() {
+                    return Err(format!("duplicate firmware scanner row {row}"));
+                }
+                let row_index = row
+                    .strip_prefix("row-")
+                    .and_then(|value| value.parse::<u32>().ok());
+                if row_index.is_none_or(|index| {
+                    input
+                        .scanner
+                        .as_ref()
+                        .is_none_or(|scanner| scanner.index != index)
+                }) {
+                    return Err(format!(
+                        "firmware input {row} is not the declared scanner row"
+                    ));
+                }
+                input.event
+            }
         };
         let mut matches = self.inputs.iter().filter(|input| input.event == event
             && matches!(&input.target, InputTarget::Control { control_id: owner } if owner == control_id));
@@ -1636,6 +1827,11 @@ impl FirmwareControlIds {
                 "native-only input {} unexpectedly declares a debug transport key",
                 input.id
             ));
+        }
+        if let InputBinding::ScannerRow { row } = binding
+            && (input.id != *row || input.scanner.is_none())
+        {
+            return Err(format!("firmware input {row} is not the declared scanner row"));
         }
         Ok(input)
     }
@@ -1762,6 +1958,73 @@ mod tests {
                 json!({"kind":"literal","lower":0,"upper":65536})
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn compound_adc_preserves_wide_configuration_offsets() {
+        let value = json!({"kind":"adc_conjunction","callback":4096,"expected_result":1,
+            "terms":[{"connection_id":"vertical","interval":{"kind":"configuration_u16","lower":72506,"upper":72504}},
+                     {"connection_id":"press","interval":{"kind":"literal","lower":100,"upper":200}}]});
+        let input: ElectricalInput = serde_json::from_value(value.clone()).unwrap();
+        input.validate_conjunction().unwrap();
+        assert_eq!(serde_json::to_value(input).unwrap(), value);
+        for changed in [
+            json!({"kind":"adc_conjunction","callback":4096,"expected_result":2,"terms":value["terms"]}),
+            json!({"kind":"adc_conjunction","callback":4096,"expected_result":1,"terms":[value["terms"][0].clone()]}),
+            json!({"kind":"adc_conjunction","callback":4096,"expected_result":1,"terms":[value["terms"][0].clone(),value["terms"][0].clone()]}),
+        ] {
+            let input: ElectricalInput = serde_json::from_value(changed).unwrap();
+            assert!(input.validate_conjunction().is_err());
+        }
+        let overflow: AdcInterval = serde_json::from_value(
+            json!({"kind":"configuration_u16","lower":4294967295u32,"upper":1}),
+        )
+        .unwrap();
+        assert!(!overflow.bounds_valid());
+    }
+
+    #[test]
+    fn compound_adc_checks_every_connection_and_scanner_witness() {
+        let (mut physical, mut firmware) = fixture();
+        let compound = json!({"kind":"adc_conjunction","callback":4096,"expected_result":1,
+            "terms":[{"connection_id":"contact","interval":{"kind":"literal","lower":1,"upper":2}},
+                     {"connection_id":"second","interval":{"kind":"configuration_u16","lower":72506,"upper":72504}}]});
+        firmware
+            .inputs
+            .iter_mut()
+            .find(|i| i.id == "input-movie")
+            .unwrap()
+            .electrical = Some(serde_json::from_value(compound).unwrap());
+        assert!(
+            firmware
+                .validate(&physical, &BTreeSet::from(["contact"]))
+                .is_err()
+        );
+        assert!(
+            firmware
+                .validate(&physical, &BTreeSet::from(["contact", "second"]))
+                .is_err()
+        );
+        physical
+            .controls
+            .get_mut("movie")
+            .unwrap()
+            .connection_ids
+            .push("second".into());
+        firmware
+            .validate(&physical, &BTreeSet::from(["contact", "second"]))
+            .unwrap();
+        firmware
+            .inputs
+            .iter_mut()
+            .find(|i| i.id == "input-movie")
+            .unwrap()
+            .scanner = None;
+        assert!(
+            firmware
+                .validate(&physical, &BTreeSet::from(["contact", "second"]))
+                .is_err()
         );
     }
 
@@ -2040,7 +2303,8 @@ mod tests {
 
     #[test]
     fn native_only_action_remains_physical_and_refuses_debug_transport() {
-        let (physical, firmware) = fixture();
+        let (physical, mut firmware) = fixture();
+        firmware.inputs.last_mut().unwrap().id = "row-0".into();
         let action = physical
             .action(&firmware, "movie", ControlOperation::Press)
             .unwrap();
@@ -2065,6 +2329,49 @@ mod tests {
                     "movie",
                     &InputBinding::DebugKey {
                         name: "FUNCTION3".into()
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(
+            firmware
+                .input(
+                    "movie",
+                    &InputBinding::ScannerRow {
+                        row: "row-0".into()
+                    }
+                )
+                .unwrap()
+                .event,
+            61
+        );
+        assert!(
+            firmware
+                .input(
+                    "menu_ok",
+                    &InputBinding::ScannerRow {
+                        row: "row-0".into()
+                    }
+                )
+                .is_err()
+        );
+        assert!(
+            firmware
+                .input(
+                    "movie",
+                    &InputBinding::ScannerRow {
+                        row: "row-1".into()
+                    }
+                )
+                .is_err()
+        );
+        firmware.inputs.last_mut().unwrap().id = "row-1".into();
+        assert!(
+            firmware
+                .input(
+                    "movie",
+                    &InputBinding::ScannerRow {
+                        row: "row-1".into()
                     }
                 )
                 .is_err()

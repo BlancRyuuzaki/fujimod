@@ -79,7 +79,7 @@ fn model_recipe(name: &str) -> Result<Value, String> {
         // 5.7 ms range measured on hardware.
         "graphics" => serde_json::from_str::<Value>("{\"kind\":\"vector-gpu\",\"options\":{\"ram_bytes\":536870912,\"max_fill_bytes\":67108864,\"max_copy_bytes\":67108864,\"max_clear_bytes\":67108864,\"bytes_per_tick\":16,\"copy_bytes_per_tick\":25,\"gles_base_ticks\":2544,\"gles_draw_ticks\":312,\"gles_filled_pixel_microticks\":158400,\"gles_blended_pixel_microticks\":114000,\"max_command_capture_bytes\":524288,\"copy_profile\":\"vg-32bpp-untile-unrotated\",\"clear_profile\":\"declared-vg-ui-primitives-unmeasured\"},\"controllers\":[\"irq0\",\"irq1\"]}").map_err(|e| e.to_string())?,
         "scanout" => serde_json::from_str::<Value>("{\"kind\":\"scanout\",\"options\":{\"ram_bytes\":536870912,\"packing\":\"yycbcr\",\"matrix\":\"bt601-full\",\"graphics_profile\":\"mode1-abgr8888-straight\",\"backdrop_profile\":\"declared-black-canvas-unmeasured\",\"rectangle_profile\":\"exr2-signed-ycbcr-rectangle-overlay-unmeasured\",\"max_pixels\":8847360,\"reset_ticks\":2}}").map_err(|e| e.to_string())?,
-        "display_timing" => serde_json::from_str::<Value>("{\"kind\":\"display-timing\",\"options\":{\"mode\":\"configured_clocked\",\"frame_ticks\":400000,\"stop_ticks\":2,\"output_hold\":true},\"clock\":\"clocks\",\"controllers\":[\"irq0\",\"irq1\"]}").map_err(|e| e.to_string())?,
+        "display_timing" => serde_json::from_str::<Value>("{\"kind\":\"display-timing\",\"options\":{\"mode\":\"configured_clocked\",\"frame_ticks\":400000,\"stop_ticks\":2},\"clock\":\"clocks\",\"controllers\":[\"irq0\",\"irq1\"]}").map_err(|e| e.to_string())?,
         "display_formatter" => serde_json::from_str::<Value>("{\"kind\":\"formatter\",\"options\":{\"latch_delay\":2}}").map_err(|e| e.to_string())?,
         "image_transfer" => json!({"kind":"image-transfer", "irq":{"core":0,"line":73}}),
         "avc_codec" => json!({"kind":"avc-codec", "options":{"backend":"software"}, "irq":{"core":0,"line":75}}),
@@ -124,9 +124,14 @@ const NODE_RULES: &[NodeRule] = &[
         dependencies: &[],
     },
     NodeRule {
+        name: "clocks",
+        blocks: &["clock-controller", "clock-controller-aux"],
+        dependencies: &[],
+    },
+    NodeRule {
         name: "serial_spi1",
         blocks: &["serial-spi1"],
-        dependencies: &["serial_gpio"],
+        dependencies: &["serial_gpio", "clocks"],
     },
     NodeRule {
         name: "dram_controller",
@@ -141,11 +146,6 @@ const NODE_RULES: &[NodeRule] = &[
     NodeRule {
         name: "reset_control",
         blocks: &["reset-controller"],
-        dependencies: &[],
-    },
-    NodeRule {
-        name: "clocks",
-        blocks: &["clock-controller", "clock-controller-aux"],
         dependencies: &[],
     },
     NodeRule {
@@ -409,6 +409,7 @@ fn card_recipe(
     selection: &ResolvedSelection,
     browser: &RunBrowserCamera,
     dram_address_space_limit_bytes: u64,
+    high_speed: bool,
 ) -> Result<Value, String> {
     let slot = selection
         .body
@@ -431,6 +432,7 @@ fn card_recipe(
             "clock_ticks": 2,
             "rca": 4660,
             "ram_bytes": dram_address_space_limit_bytes,
+            "high_speed": high_speed,
         },
         "card": {
             "kind": "formatted",
@@ -469,7 +471,6 @@ fn implementation_wires() -> BTreeMap<String, WireKind> {
         ("lens_aperture".into(), WireKind::Aperture),
         ("lens_focus".into(), WireKind::Focus),
         ("usb_cable".into(), WireKind::LogicLevel(false)),
-        ("display_output_hold".into(), WireKind::LogicLevel(false)),
         ("imaging_routes".into(), WireKind::IrqRoutes),
         ("image_outputs".into(), WireKind::OutputChannels),
         ("memory_outputs".into(), WireKind::MemoryOutputs),
@@ -891,16 +892,15 @@ fn set_spi_route(
     let route = routes
         .get_mut(usize::from(channel))
         .ok_or_else(|| format!("X70 SPI implementation has no channel {channel}"))?;
-    if route["endpoint"]["kind"] == "lens-unit" {
-        if endpoint_id
+    if route["endpoint"]["kind"] == "lens-unit"
+        && endpoint_id
             != selection
                 .body
                 .lens
                 .as_ref()
                 .map_or("", |lens| lens.part_id.as_str())
-        {
-            return Err("X70 lens SPI endpoint identity differs from its body attachment".into());
-        }
+    {
+        return Err("X70 lens SPI endpoint identity differs from its body attachment".into());
     }
     route["options"]["selection"] = json!(gpio_selection(selection, select_connection_id)?);
     if let Some(bits) = word_bits {
@@ -1256,7 +1256,7 @@ fn apply_body_facts(
                 .unwrap_or(Value::Null);
             recipe["routes"][usize::from(lens.route.channel)]["endpoint"]["optics"] = optics;
             recipe["routes"][usize::from(lens.route.channel)]["endpoint"]["focus"] =
-                serde_json::to_value(&lens.focus).map_err(|error| error.to_string())?;
+                serde_json::to_value(lens.focus).map_err(|error| error.to_string())?;
         }
         "power_peripherals" => {
             let power = selection
@@ -1991,6 +1991,10 @@ fn apply_run_inputs(
                 ));
             }
         }
+        let endpoint = &mut recipe["routes"][body_mcu.channel as usize]["endpoint"];
+        endpoint["kind"] = json!("wake-registers");
+        endpoint["clock"] = json!("clocks");
+        endpoint["ticks_per_second"] = json!(rtc.ticks_per_second);
     }
     if name == "usb_cable" {
         // The typed wire is updated in assemble after all recipes are built.
@@ -2064,7 +2068,10 @@ pub(super) fn assemble(
     for rule in rules {
         let mut recipe = match (rule.name, browser) {
             ("sd", Some(browser)) => {
-                card_recipe(selection, browser, dram_address_space_limit_bytes)?
+                card_recipe(selection, browser, dram_address_space_limit_bytes,
+                    configuration.preset.as_ref().is_some_and(|p|
+                        p.factory_options.sd_card_profile == Some(
+                            fujimod_catalog_run_inputs::RunSdCardProfile::DeclaredBlankSdhcHighSpeedUnmeasured)))?
             }
             _ => model_recipe(rule.name)?,
         };
@@ -2076,17 +2083,16 @@ pub(super) fn assemble(
                     "ticks_per_byte":64, "minimum_ticks":1000}, "sinks":[true,true]},
                 "routes":"imaging_routes"});
         }
-        if rule.name == "image_input" {
-            if let Some(ticks) = configuration
+        if rule.name == "image_input"
+            && let Some(ticks) = configuration
                 .preset
                 .as_ref()
                 .and_then(|p| p.factory_options.raw_readback_ticks)
-            {
-                if ticks == 0 {
-                    return Err("RAW readback requires positive virtual transfer ticks".into());
-                }
-                recipe["options"]["readback_ticks"] = json!(ticks);
+        {
+            if ticks == 0 {
+                return Err("RAW readback requires positive virtual transfer ticks".into());
             }
+            recipe["options"]["readback_ticks"] = json!(ticks);
         }
         if rule.name == "avc_codec" {
             use fujimod_catalog_construction::VideoEncoderBackend;
@@ -2125,23 +2131,21 @@ pub(super) fn assemble(
             scene_input,
             browser.is_some(),
         )?;
-        if rule.name == "statistics" {
-            if let Some(ticks) = configuration
+        if rule.name == "statistics"
+            && let Some(ticks) = configuration
                 .preset
                 .as_ref()
                 .and_then(|p| p.factory_options.producer_data_ticks)
-            {
-                recipe["options"]["clock"]["ticks"] = json!(ticks);
-            }
+        {
+            recipe["options"]["clock"]["ticks"] = json!(ticks);
         }
-        if matches!(rule.name, "image_output_0" | "image_output_1") {
-            if let Some(ticks) = configuration
+        if matches!(rule.name, "image_output_0" | "image_output_1")
+            && let Some(ticks) = configuration
                 .preset
                 .as_ref()
                 .and_then(|p| p.factory_options.image_work_data_ticks)
-            {
-                recipe["options"]["clock"]["ticks"] = json!(ticks);
-            }
+        {
+            recipe["options"]["clock"]["ticks"] = json!(ticks);
         }
         let model: Model = serde_json::from_value(recipe.clone())
             .map_err(|error| format!("X70 node {}: {error}", rule.name))?;
@@ -2203,7 +2207,6 @@ pub(super) fn assemble(
             "lens_aperture":"aperture",
             "lens_focus":"focus",
             "usb_cable":{"logic-level":inputs.usb.connected},
-            "display_output_hold":{"logic-level":false},
             "imaging_routes":"irq-routes",
             "image_outputs":"output-channels",
             "memory_outputs":"memory-outputs",

@@ -162,7 +162,7 @@ pub struct RunDramAddressSpace {
 impl RunDramAddressSpace {
     fn validate(&self) -> Result<(), String> {
         if self.limit_bytes == 0
-            || self.limit_bytes % 4096 != 0
+            || !self.limit_bytes.is_multiple_of(4096)
             || self.basis.trim().is_empty()
         {
             return Err("DRAM address-space limit must be page-aligned with a basis".into());
@@ -188,6 +188,8 @@ pub enum RunStart {
     Loader,
     /// Enter through a removable-card boot entry.
     SdCard,
+    /// Enter the firmware's boot-setup stage from internal flash, in place of the boot ROM.
+    Setup,
 }
 
 /// Intended operation selected by a run configuration.
@@ -253,6 +255,8 @@ impl RunInstructionRate {
     derive(tsify::Tsify),
     tsify(hashmap_as_object, missing_as_null)
 )]
+// Catalog records are few and long-lived, so the variant size difference costs nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum RunInputs {
     /// Reset inputs for an EXR2-based body.
     Exr2(Exr2RunInputs),
@@ -969,6 +973,8 @@ impl RunOverlay {
     derive(tsify::Tsify),
     tsify(hashmap_as_object, missing_as_null)
 )]
+// Catalog records are few and long-lived, so the variant size difference costs nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum RunOverlayChange {
     /// Select a closed set of startup inputs and device policies.
     Preset { preset: RunPreset },
@@ -1239,6 +1245,14 @@ pub enum RunEngine {
     Hypervisor,
 }
 
+impl std::str::FromStr for RunEngine {
+    type Err = serde::de::value::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::deserialize(serde::de::value::StrDeserializer::new(value))
+    }
+}
+
 /// Model-specific scene inputs and the devices that consume them.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -1506,7 +1520,7 @@ mod tests {
 
     #[test]
     fn sd_boot_presets_keep_storage_and_cleared_journals() {
-        let overlay = RunOverlay::bundled("xm1-150-sd-boot-rec").unwrap();
+        let overlay = RunOverlay::bundled("xm1-150-sd-card-boot-rec").unwrap();
         let RunOverlayChange::Preset { preset } = overlay.change else {
             panic!("expected preset");
         };

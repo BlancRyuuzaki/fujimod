@@ -43,6 +43,60 @@
         }
       ]
     },
+    "AdcEncoderCalibration": {
+      "additionalProperties": false,
+      "description": "Configuration-byte offsets used by a calibrated analog phase decoder.",
+      "properties": {
+        "centers": {
+          "description": "Little-endian u16 center offsets, one for each channel.",
+          "items": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        },
+        "direction": {
+          "description": "Byte selecting normal or reversed native direction.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "edges_per_step": {
+          "description": "Byte holding accepted edges per native direction event.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "hysteresis": {
+          "description": "Byte holding the Schmitt half-band width.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "offset": {
+          "description": "Little-endian signed u16 center adjustment offset.",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "centers",
+        "offset",
+        "hysteresis",
+        "edges_per_step",
+        "direction"
+      ],
+      "type": "object"
+    },
     "AdcInterval": {
       "description": "Bounds of one accepted analog interval.",
       "oneOf": [
@@ -104,8 +158,7 @@
             },
             "lower": {
               "description": "Byte offset of the inclusive lower sample value.",
-              "format": "uint16",
-              "maximum": 65535,
+              "format": "uint32",
               "minimum": 0,
               "type": "integer"
             },
@@ -118,8 +171,7 @@
             },
             "upper": {
               "description": "Byte offset of the inclusive upper sample value.",
-              "format": "uint16",
-              "maximum": 65535,
+              "format": "uint32",
               "minimum": 0,
               "type": "integer"
             },
@@ -143,6 +195,25 @@
           "type": "object"
         }
       ]
+    },
+    "AdcTerm": {
+      "additionalProperties": false,
+      "description": "One ADC connection and the band required by a compound callback.",
+      "properties": {
+        "connection_id": {
+          "description": "Body connection carrying this sample.",
+          "type": "string"
+        },
+        "interval": {
+          "$ref": "#/$defs/AdcInterval",
+          "description": "Unconditional interval tested on this sample."
+        }
+      },
+      "required": [
+        "connection_id",
+        "interval"
+      ],
+      "type": "object"
     },
     "AdditionalUiModes": {
       "additionalProperties": false,
@@ -265,6 +336,25 @@
         "physical",
         "size",
         "permissions"
+      ],
+      "type": "object"
+    },
+    "AlarmInterval": {
+      "additionalProperties": false,
+      "description": "Constant alarm values a power-off writes instead of taking a deadline.",
+      "properties": {
+        "seconds": {
+          "description": "Values written to the alarm's seconds registers, least significant first.",
+          "items": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "seconds"
       ],
       "type": "object"
     },
@@ -1329,6 +1419,30 @@
       ],
       "type": "object"
     },
+    "BootFlag": {
+      "additionalProperties": false,
+      "description": "A byte the alarm boot tests for a normal boot. Without the bit, the wake\ntakes a boot that never reaches USB. The restart sets the bit before the\nrequest; the power-off publishes it and the firmware clears it after the\nwake.",
+      "properties": {
+        "address": {
+          "description": "Address of the byte.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mask": {
+          "description": "The single bit the restart ORs into the byte before the request.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "address",
+        "mask"
+      ],
+      "type": "object"
+    },
     "BootHold": {
       "additionalProperties": false,
       "properties": {
@@ -1731,6 +1845,39 @@
       ],
       "type": "object"
     },
+    "CacheSynchronization": {
+      "additionalProperties": false,
+      "description": "Stock CPU0 cache and barrier routines invoked through the borrowed query.",
+      "properties": {
+        "data_barrier": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "data_clean": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "instruction_barrier": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "instruction_invalidate": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "data_clean",
+        "instruction_invalidate",
+        "data_barrier",
+        "instruction_barrier"
+      ],
+      "type": "object"
+    },
     "CaptureScope": {
       "additionalProperties": false,
       "description": "Ranges captured together, such as a quick scope while a control is held\nand a full scope once per session.",
@@ -1939,6 +2086,49 @@
       ],
       "type": "object"
     },
+    "Configuration": {
+      "description": "How the active configuration RAM base is obtained.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "address": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "mechanism": {
+              "const": "pointer",
+              "type": "string"
+            }
+          },
+          "required": [
+            "mechanism",
+            "address"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "address": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "mechanism": {
+              "const": "fixed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "mechanism",
+            "address"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "ConfigurationCheck": {
       "additionalProperties": false,
       "description": "A RAM configuration byte read before any destination is borrowed.",
@@ -2029,7 +2219,7 @@
           "type": "integer"
         },
         "sha256": {
-          "description": "Lowercase hexadecimal SHA-256 of the window.",
+          "description": "Build/cache identity of the window; unused when loading settings.",
           "type": "string"
         }
       },
@@ -2816,6 +3006,13 @@
           "additionalProperties": false,
           "description": "encoder hardware.",
           "properties": {
+            "adc": {
+              "description": "Optional ADC output connection.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "counter": {
               "description": "counter.",
               "type": [
@@ -2824,8 +3021,11 @@
               ]
             },
             "gpio": {
-              "description": "gpio.",
-              "type": "string"
+              "description": "Optional GPIO output connection.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "kind": {
               "const": "encoder",
@@ -2833,8 +3033,7 @@
             }
           },
           "required": [
-            "kind",
-            "gpio"
+            "kind"
           ],
           "type": "object"
         },
@@ -4542,6 +4741,30 @@
       ],
       "type": "object"
     },
+    "ContactCamPosition": {
+      "additionalProperties": false,
+      "description": "A contact cam position along motor run time and its contact states.",
+      "properties": {
+        "contacts": {
+          "description": "Resulting contact states.",
+          "items": {
+            "type": "boolean"
+          },
+          "type": "array"
+        },
+        "run_ticks": {
+          "description": "Motor run time at which these contact states begin.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "run_ticks",
+        "contacts"
+      ],
+      "type": "object"
+    },
     "ContactPosition": {
       "additionalProperties": false,
       "description": "A pin drive position and its resulting contact states.",
@@ -5560,6 +5783,36 @@
       ],
       "type": "object"
     },
+    "DataCacheGeometry": {
+      "additionalProperties": false,
+      "description": "L1 data-cache geometry.",
+      "properties": {
+        "line_bytes": {
+          "description": "Line size in bytes.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sets": {
+          "description": "Number of sets.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ways": {
+          "description": "Associativity.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "line_bytes",
+        "sets",
+        "ways"
+      ],
+      "type": "object"
+    },
     "DebugKey": {
       "additionalProperties": false,
       "description": "One explicitly located command in the firmware's debug transport vocabulary.",
@@ -6011,6 +6264,11 @@
           "type": "string"
         },
         {
+          "const": "SataHost",
+          "description": "SATA host controller register block.",
+          "type": "string"
+        },
+        {
           "const": "StillProcessor",
           "description": "Shared still processor with body-declared CFA.",
           "type": "string"
@@ -6232,9 +6490,373 @@
       ],
       "type": "object"
     },
+    "EarlyBootConstants": {
+      "additionalProperties": false,
+      "description": "Exact register and command values for this firmware's early restart.",
+      "properties": {
+        "exr2_restart_alarm_enable": {
+          "description": "Alarm enable.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_alarm_high": {
+          "description": "Alarm high.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_alarm_low": {
+          "description": "Alarm low.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_gpio_banks": {
+          "description": "Gpio banks.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_gpio_base": {
+          "description": "Gpio base.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_gpio_config": {
+          "description": "Gpio config.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_gpio_inactive_mask": {
+          "description": "Gpio inactive mask.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_gpio_mode1": {
+          "description": "Gpio mode1.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_gpio_mode2": {
+          "description": "Gpio mode2.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_gpio_mode3": {
+          "description": "Gpio mode3.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_gpio_mode4": {
+          "description": "Gpio mode4.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_gpio_output": {
+          "description": "Gpio output.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_gpio_stride": {
+          "description": "Gpio stride.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_packet_bytes": {
+          "description": "Packet bytes.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_packet_register": {
+          "description": "Packet register.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_power_command": {
+          "description": "Power command.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_power_hold": {
+          "description": "Power hold.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_power_hold_mask": {
+          "description": "Power hold mask.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_power_off_value": {
+          "description": "Power off value.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_spi_base": {
+          "description": "Spi base.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_spi_busy": {
+          "description": "Spi busy.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_spi_control": {
+          "description": "Spi control.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_spi_count_mask": {
+          "description": "Spi count mask.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_spi_enable": {
+          "description": "Spi enable.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_spi_fifo_control": {
+          "description": "Spi fifo control.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_spi_fifo_reset": {
+          "description": "Spi fifo reset.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_spi_format": {
+          "description": "Spi format.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_spi_rx": {
+          "description": "Spi rx.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_spi_rx_count": {
+          "description": "Spi rx count.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_spi_rx_ready": {
+          "description": "Spi rx ready.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_spi_status": {
+          "description": "Spi status.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_spi_status_clear": {
+          "description": "Spi status clear.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_spi_tx": {
+          "description": "Spi tx.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_spi_tx_count": {
+          "description": "Spi tx count.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "exr2_restart_write": {
+          "description": "Write.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "restart_gpio_pin": {
+          "description": "Gpio pin.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "restart_panel_gpio_bank": {
+          "description": "Panel gpio bank.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "restart_power_gpio_bank": {
+          "description": "Power gpio bank.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "restart_spi_format_value": {
+          "description": "Spi format value.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "restart_spi_idle_control": {
+          "description": "Spi idle control.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "exr2_restart_alarm_enable",
+        "exr2_restart_alarm_high",
+        "exr2_restart_alarm_low",
+        "exr2_restart_gpio_banks",
+        "exr2_restart_gpio_base",
+        "exr2_restart_gpio_config",
+        "exr2_restart_gpio_inactive_mask",
+        "exr2_restart_gpio_mode1",
+        "exr2_restart_gpio_mode2",
+        "exr2_restart_gpio_mode3",
+        "exr2_restart_gpio_mode4",
+        "exr2_restart_gpio_output",
+        "exr2_restart_gpio_stride",
+        "exr2_restart_packet_bytes",
+        "exr2_restart_packet_register",
+        "exr2_restart_power_command",
+        "exr2_restart_power_hold",
+        "exr2_restart_power_hold_mask",
+        "exr2_restart_power_off_value",
+        "exr2_restart_spi_base",
+        "exr2_restart_spi_busy",
+        "exr2_restart_spi_control",
+        "exr2_restart_spi_count_mask",
+        "exr2_restart_spi_enable",
+        "exr2_restart_spi_fifo_control",
+        "exr2_restart_spi_fifo_reset",
+        "exr2_restart_spi_format",
+        "exr2_restart_spi_rx",
+        "exr2_restart_spi_rx_count",
+        "exr2_restart_spi_rx_ready",
+        "exr2_restart_spi_status",
+        "exr2_restart_spi_status_clear",
+        "exr2_restart_spi_tx",
+        "exr2_restart_spi_tx_count",
+        "exr2_restart_write",
+        "restart_gpio_pin",
+        "restart_panel_gpio_bank",
+        "restart_power_gpio_bank",
+        "restart_spi_format_value",
+        "restart_spi_idle_control"
+      ],
+      "type": "object"
+    },
+    "EarlyBootMechanism": {
+      "description": "A processor-specific freestanding power-controller transport.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Polled EXR II SPI, persistent packet, wake alarm and power-hold release.",
+          "properties": {
+            "code_checks": {
+              "description": "The stock endpoint-table reader and power cut establishing the transport.",
+              "items": {
+                "$ref": "#/$defs/CodeCheck"
+              },
+              "type": "array"
+            },
+            "constants": {
+              "$ref": "#/$defs/EarlyBootConstants",
+              "description": "Exact C constants derived from the endpoint table and power path."
+            },
+            "kind": {
+              "const": "exr2_polled_alarm",
+              "type": "string"
+            },
+            "spi_channel": {
+              "description": "SPI channel of the power controller's serial endpoint.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "spi_channel",
+            "constants",
+            "code_checks"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "ElectricalInput": {
       "description": "Located electrical meaning, separate from scanner table operands.",
       "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "A callback whose Boolean result is the conjunction of several ADC bands.",
+          "properties": {
+            "callback": {
+              "description": "Located callback evaluating all terms.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "expected_result": {
+              "description": "Callback result interpreted as an active input.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "adc_conjunction",
+              "type": "string"
+            },
+            "terms": {
+              "description": "Every term must hold for the callback to return one.",
+              "items": {
+                "$ref": "#/$defs/AdcTerm"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "terms",
+            "callback",
+            "expected_result"
+          ],
+          "type": "object"
+        },
         {
           "additionalProperties": false,
           "description": "Analog input interpreted using located sample bands or calibration offsets.",
@@ -6308,6 +6930,40 @@
             "connection_id",
             "expected_level",
             "scanner"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Conjunction of the ordered digital contacts in one body connection.",
+          "properties": {
+            "callback": {
+              "description": "Firmware callback evaluating the conjunction.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "connection_id": {
+              "description": "Body connection carrying all of the contacts, in predicate order.",
+              "type": "string"
+            },
+            "expected_levels": {
+              "description": "Required logic level of each contact.",
+              "items": {
+                "type": "boolean"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "const": "gpio_contacts",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "connection_id",
+            "expected_levels",
+            "callback"
           ],
           "type": "object"
         },
@@ -6391,6 +7047,129 @@
         },
         {
           "additionalProperties": false,
+          "description": "Physical encoder whose decoder emits each accepted transition without a latch.",
+          "properties": {
+            "connection_id": {
+              "description": "Ordered body connection carrying the two encoder phases.",
+              "type": "string"
+            },
+            "decoder_event": {
+              "description": "Decoder-local direction event, distinct from the UI event.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "guard": {
+              "description": "Located decoder guard address.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "gpio_transition",
+              "type": "string"
+            },
+            "phase_map": {
+              "description": "Decoder phase mapping.",
+              "items": {
+                "format": "uint8",
+                "maximum": 255,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "maxItems": 4,
+              "minItems": 4,
+              "type": "array"
+            },
+            "threshold": {
+              "description": "Located decoder activation threshold.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "transitions": {
+              "description": "Decoder transition values indexed by new phase, then old phase.",
+              "items": {
+                "format": "uint8",
+                "maximum": 255,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "maxItems": 16,
+              "minItems": 16,
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "connection_id",
+            "phase_map",
+            "transitions",
+            "decoder_event",
+            "guard",
+            "threshold"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Calibrated analog phase decoder with a native edge accumulator.",
+          "properties": {
+            "calibration_offsets": {
+              "$ref": "#/$defs/AdcEncoderCalibration",
+              "description": "Configuration offsets for thresholds, edge count, and direction."
+            },
+            "connection_id": {
+              "description": "Ordered body connection carrying the two analog channels.",
+              "type": "string"
+            },
+            "decoder_event": {
+              "description": "Decoder-local direction event, distinct from the UI event.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "adc_transition",
+              "type": "string"
+            },
+            "phase_map": {
+              "description": "Decoder phase mapping.",
+              "items": {
+                "format": "uint8",
+                "maximum": 255,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "maxItems": 4,
+              "minItems": 4,
+              "type": "array"
+            },
+            "transitions": {
+              "description": "Decoder transition values indexed by new phase, then old phase.",
+              "items": {
+                "format": "uint8",
+                "maximum": 255,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "maxItems": 16,
+              "minItems": 16,
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "connection_id",
+            "phase_map",
+            "transitions",
+            "decoder_event",
+            "calibration_offsets"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "Physical encoder whose firmware counts whole phase cycles, one event per cycle.",
           "properties": {
             "connection_id": {
@@ -6465,6 +7244,80 @@
         }
       ]
     },
+    "EncoderLevels": {
+      "additionalProperties": false,
+      "description": "Raw ADC codes for one encoder phase channel.",
+      "properties": {
+        "high": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "low": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "low",
+        "high"
+      ],
+      "type": "object"
+    },
+    "EncoderOutputs": {
+      "description": "Physical encoder output levels; channel order is high phase bit, low phase bit.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "gpio",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "channels": {
+              "items": {
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "maxItems": 2,
+              "minItems": 2,
+              "type": "array"
+            },
+            "kind": {
+              "const": "adc",
+              "type": "string"
+            },
+            "levels": {
+              "items": {
+                "$ref": "#/$defs/EncoderLevels"
+              },
+              "maxItems": 2,
+              "minItems": 2,
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "channels",
+            "levels"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "EventTranslation": {
       "additionalProperties": false,
       "description": "A located table translating scanner physical keys to UI events.",
@@ -6500,6 +7353,39 @@
         "rows"
       ],
       "type": "object"
+    },
+    "ExecutionMechanism": {
+      "description": "A mechanism that owns an allocation and can publish code as a diagnostic\ncallback after synchronizing its instruction view.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "allocation": {
+              "$ref": "#/$defs/HeapAllocation"
+            },
+            "cache": {
+              "$ref": "#/$defs/CacheSynchronization"
+            },
+            "code_checks": {
+              "items": {
+                "$ref": "#/$defs/CodeCheck"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "const": "exr2_query_heap",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "allocation",
+            "cache",
+            "code_checks"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "Firmware": {
       "additionalProperties": false,
@@ -7390,6 +8276,52 @@
           "type": "string"
         }
       ]
+    },
+    "FirmwareExecution": {
+      "additionalProperties": false,
+      "description": "Located runtime-execution mechanism for one firmware.",
+      "properties": {
+        "$schema": {
+          "type": "string"
+        },
+        "code_alias": {
+          "description": "Uncached RAM alias for the runtime allocation and code checks.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "firmware_id": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "internal_version": {
+          "type": "string"
+        },
+        "mechanism": {
+          "$ref": "#/$defs/ExecutionMechanism"
+        },
+        "product": {
+          "type": "string"
+        },
+        "schema": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "$schema",
+        "schema",
+        "id",
+        "firmware_id",
+        "product",
+        "internal_version",
+        "code_alias",
+        "mechanism"
+      ],
+      "type": "object"
     },
     "FirmwareFacts": {
       "additionalProperties": false,
@@ -10120,6 +11052,15 @@
       "additionalProperties": false,
       "description": "Declared windows options facts.",
       "properties": {
+        "byte_ns": {
+          "description": "Declared virtual time from an I2C byte command to its completion.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "command_latency_us": {
           "description": "Declared command latency us.",
           "format": "uint64",
@@ -10149,6 +11090,15 @@
         },
         "configuration_word": {
           "description": "Declared read-only clock configuration input.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "interrupt": {
+          "description": "Declared interrupt line of the block.",
           "format": "uint32",
           "minimum": 0,
           "type": [
@@ -10804,6 +11754,35 @@
       ],
       "type": "object"
     },
+    "HardwareCurtains": {
+      "additionalProperties": false,
+      "description": "Declared focal-plane curtain facts.",
+      "properties": {
+        "first_output": {
+          "description": "Image-input comparator output that releases the first curtain.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "light_offset_seconds": {
+          "description": "Light added to the interval between the two comparator edges, seconds.",
+          "format": "double",
+          "type": "number"
+        },
+        "second_output": {
+          "description": "Image-input comparator output that releases the second curtain.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "first_output",
+        "second_output",
+        "light_offset_seconds"
+      ],
+      "type": "object"
+    },
     "HardwareDecompressor": {
       "additionalProperties": false,
       "description": "Declared decompressor facts.",
@@ -11337,6 +12316,13 @@
       "additionalProperties": false,
       "description": "Declared encoders facts.",
       "properties": {
+        "adc": {
+          "description": "ADC connection for an analog encoder.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "counter": {
           "description": "Declared counter.",
           "type": [
@@ -11363,6 +12349,17 @@
       "additionalProperties": false,
       "description": "Declared encoders options facts.",
       "properties": {
+        "outputs": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EncoderOutputs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Explicit output choice; absent means GPIO for existing bodies."
+        },
         "phase_ticks": {
           "description": "Declared phase ticks.",
           "format": "uint64",
@@ -11374,7 +12371,10 @@
           "items": {
             "$ref": "#/$defs/PartAssemblyPin"
           },
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "rest_phase": {
           "description": "Declared rest phase.",
@@ -11385,7 +12385,6 @@
       },
       "required": [
         "phase_ticks",
-        "pins",
         "rest_phase"
       ],
       "type": "object"
@@ -11865,6 +12864,48 @@
       ],
       "type": "object"
     },
+    "HardwareH264Encoder": {
+      "additionalProperties": false,
+      "description": "X-Processor Pro movie H.264 encoder.",
+      "properties": {
+        "base": {
+          "description": "Declared base.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "basis": {
+          "description": "Declared basis.",
+          "type": "string"
+        },
+        "irq_route": {
+          "description": "Interrupt line of the completion status.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "run_ticks": {
+          "description": "Time from a start to the completion of its run, in device ticks.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "size": {
+          "description": "Declared size.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "base",
+        "basis",
+        "irq_route",
+        "run_ticks",
+        "size"
+      ],
+      "type": "object"
+    },
     "HardwareHdmiTransmitter": {
       "additionalProperties": false,
       "description": "DesignWare HDMI TX controller with no sink attached.",
@@ -11974,6 +13015,17 @@
           ],
           "description": "Declared iris optics."
         },
+        "nd_filter": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HardwareNdFilter"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Declared neutral-density filter."
+        },
         "sensor_capture": {
           "anyOf": [
             {
@@ -12068,6 +13120,18 @@
             "type": "integer"
           },
           "type": "array"
+        },
+        "raw_dma_irqs": {
+          "description": "Completion interrupt lines of the two RAW read-out DMA channels\n(command window +0x40 and +0xc0). Left out, the channels refuse.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "receiver_base": {
           "description": "Declared receiver base.",
@@ -12353,8 +13417,7 @@
         "travel_limits": {
           "description": "Declared travel limits.",
           "items": {
-            "format": "uint64",
-            "minimum": 0,
+            "format": "int64",
             "type": "integer"
           },
           "type": "array"
@@ -12370,6 +13433,13 @@
       "additionalProperties": false,
       "description": "Declared iris optics facts.",
       "properties": {
+        "actuator": {
+          "description": "What moves the iris: `lens` (the lens unit's second motor, the default)\nor `bridge` (the stepper behind the bus1 motor bridge).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "output": {
           "description": "Declared output.",
           "type": "string"
@@ -12567,6 +13637,52 @@
       ],
       "type": "object"
     },
+    "HardwareNdFilter": {
+      "additionalProperties": false,
+      "description": "A neutral-density filter swung in by a lens-unit output register.",
+      "properties": {
+        "basis": {
+          "description": "Why the actuator and its factor are believed.",
+          "type": "string"
+        },
+        "factor": {
+          "description": "Light reduction while the filter is in (8 = 3 EV).",
+          "format": "double",
+          "type": "number"
+        },
+        "insert_mask": {
+          "description": "Coil bit that swings the filter in.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output": {
+          "description": "Wire that publishes the current transmission factor.",
+          "type": "string"
+        },
+        "register": {
+          "description": "Lens-unit output register that drives the actuator.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remove_mask": {
+          "description": "Coil bit that swings the filter out.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "basis",
+        "factor",
+        "insert_mask",
+        "output",
+        "register",
+        "remove_mask"
+      ],
+      "type": "object"
+    },
     "HardwareOptics": {
       "additionalProperties": false,
       "description": "Declared optics facts.",
@@ -12603,6 +13719,16 @@
       "properties": {
         "contact_actuators": {
           "description": "Declared contact actuators.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "contact_cams": {
+          "description": "Declared motor-driven contact cams.",
           "items": {
             "type": "string"
           },
@@ -12926,10 +14052,57 @@
       ],
       "type": "object"
     },
+    "HardwareRadiometricCalibration": {
+      "additionalProperties": false,
+      "description": "Declared calibration of one radiometric path.",
+      "properties": {
+        "reference_white": {
+          "description": "Raw response to the reference white, per colour.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "saturation_lux_seconds": {
+          "description": "Exposure that saturates the reference white.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "reference_white",
+        "saturation_lux_seconds"
+      ],
+      "type": "object"
+    },
     "HardwareRadiometry": {
       "additionalProperties": false,
       "description": "Declared radiometry facts.",
       "properties": {
+        "curtains": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HardwareCurtains"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Declared focal-plane curtains; absent for a leaf-shutter body."
+        },
+        "live_view": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HardwareRadiometricCalibration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Live-view calibration declared separately from the still readout."
+        },
         "mode_change_frames": {
           "description": "Invalid readouts while a sensor drive-mode change acquires sync.",
           "format": "uint8",
@@ -12944,8 +14117,15 @@
           "type": "integer"
         },
         "projection": {
-          "$ref": "#/$defs/HardwareProjection",
-          "description": "Declared projection."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HardwareProjection"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Declared lens projection; absent when no lens is mounted."
         },
         "rolling_references": {
           "description": "Declared rolling references.",
@@ -12960,8 +14140,15 @@
           "type": "number"
         },
         "shutter": {
-          "$ref": "#/$defs/HardwareShutter",
-          "description": "Declared shutter."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HardwareShutter"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Declared leaf shutter; absent for a focal-plane body."
         },
         "shutter_output": {
           "description": "Declared shutter output.",
@@ -12983,11 +14170,9 @@
       },
       "required": [
         "pixel_clock_hz",
-        "projection",
         "rolling_references",
         "mode_change_frames",
         "saturation_lux_seconds",
-        "shutter",
         "shutter_output",
         "ticks_per_second",
         "white_luminance"
@@ -13448,6 +14633,17 @@
           ],
           "description": "Declared gpio."
         },
+        "h264_encoder": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HardwareH264Encoder"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Declared X-Processor Pro movie H.264 encoder."
+        },
         "hdmi_tx": {
           "anyOf": [
             {
@@ -13651,6 +14847,13 @@
           ],
           "description": "Declared sd host clocks."
         },
+        "sd_hosts": {
+          "description": "Declared X-Processor 4 SD hosts.",
+          "items": {
+            "$ref": "#/$defs/HardwareSdHost"
+          },
+          "type": "array"
+        },
         "serial_flash": {
           "anyOf": [
             {
@@ -13704,6 +14907,17 @@
             }
           ],
           "description": "Declared usb."
+        },
+        "usb_phy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HardwareUsbPhy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Declared XP4 USB PHY programming port."
         },
         "xpp_i2c": {
           "anyOf": [
@@ -13934,6 +15148,87 @@
       ],
       "type": "object"
     },
+    "HardwareSdHost": {
+      "additionalProperties": false,
+      "description": "X-Processor 4 SD host: one standard SDHCI register bank at the window base.",
+      "properties": {
+        "base": {
+          "description": "Declared base.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "basis": {
+          "description": "Declared basis.",
+          "type": "string"
+        },
+        "capabilities": {
+          "description": "Capabilities register (+0x40).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "capabilities_2": {
+          "description": "Capabilities 2 register (+0x44).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "clock_ticks": {
+          "description": "Ticks for the internal clock to report stable.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "irq_route": {
+          "description": "Interrupt line of the SDHCI status, when it is known.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "size": {
+          "description": "Declared size.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "slot_and_version": {
+          "description": "Slot status halfword (+0xfc) and host controller version (+0xfe).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "transfer_ticks": {
+          "description": "Ticks of one command or data transfer.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "vendor_offsets": {
+          "description": "Offsets of vendor words beyond the standard bank that read back their\nlast write.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "base",
+        "basis",
+        "capabilities",
+        "capabilities_2",
+        "clock_ticks",
+        "size",
+        "slot_and_version",
+        "transfer_ticks"
+      ],
+      "type": "object"
+    },
     "HardwareSdHostClocks": {
       "additionalProperties": false,
       "description": "Declared sd host clocks facts.",
@@ -13965,10 +15260,77 @@
       ],
       "type": "object"
     },
+    "HardwareSecondaryBusRegisterChip": {
+      "additionalProperties": false,
+      "description": "One further register chip on the secondary bus.",
+      "properties": {
+        "address": {
+          "description": "Seven-bit chip address.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "basis": {
+          "description": "Why this chip and its registers are believed.",
+          "type": "string"
+        },
+        "modes": {
+          "description": "Bus modes in which the chip answers.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "values": {
+          "description": "Initial register values, each `[register, value]`.",
+          "items": {
+            "items": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "write_masks": {
+          "description": "Writable bits, each `[register, mask]`.",
+          "items": {
+            "items": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "address",
+        "basis",
+        "modes",
+        "values",
+        "write_masks"
+      ],
+      "type": "object"
+    },
     "HardwareSecondaryBusRegisters": {
       "additionalProperties": false,
       "description": "Declared control bus1 replies facts.",
       "properties": {
+        "extra_registers": {
+          "description": "Further register chips on the bus, each with its own register map.",
+          "items": {
+            "$ref": "#/$defs/HardwareSecondaryBusRegisterChip"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "pwic_address": {
           "description": "Declared pwic address.",
           "format": "uint64",
@@ -14668,6 +16030,34 @@
       ],
       "type": "object"
     },
+    "HardwareUsbPhy": {
+      "additionalProperties": false,
+      "description": "XP4 USB PHY programming port, separate from the device controller.",
+      "properties": {
+        "base": {
+          "description": "Declared base of the indexed control, parallel and readback words.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "basis": {
+          "description": "Declared basis.",
+          "type": "string"
+        },
+        "size": {
+          "description": "Declared size.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "base",
+        "basis",
+        "size"
+      ],
+      "type": "object"
+    },
     "HardwareUsbRegisters": {
       "additionalProperties": false,
       "description": "Declared register maps usb facts.",
@@ -14921,6 +16311,31 @@
       ],
       "type": "object"
     },
+    "HeapAllocation": {
+      "additionalProperties": false,
+      "description": "The stock allocator/release pair and its configuration-owned bootstrap\nscratch. The bootstrap is borrowed only while allocating or releasing.",
+      "properties": {
+        "allocate": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "configuration": {
+          "$ref": "#/$defs/Configuration"
+        },
+        "release": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "allocate",
+        "release",
+        "configuration"
+      ],
+      "type": "object"
+    },
     "HomeSwitch": {
       "additionalProperties": false,
       "description": "A lens home-switch input.",
@@ -14963,7 +16378,7 @@
       ]
     },
     "InputBinding": {
-      "description": "An explicit binding in one of two distinct firmware input vocabularies.",
+      "description": "A debug key, native input name, or exact located scanner-row identity.",
       "oneOf": [
         {
           "additionalProperties": false,
@@ -15000,6 +16415,25 @@
           "required": [
             "kind",
             "name"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Stable identity of a located scanner row, even when it has no command name.",
+          "properties": {
+            "kind": {
+              "const": "scanner_row",
+              "type": "string"
+            },
+            "row": {
+              "description": "Generated scanner row identity, such as `row-69`.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "row"
           ],
           "type": "object"
         }
@@ -17646,6 +19080,69 @@
             "interface"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A motor-driven contact cam with a release latch. The attachment's\ninitial position is its run time at reset.",
+          "properties": {
+            "hold_drives": {
+              "description": "Drive values that hold the cam still.",
+              "items": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "const": "contact-cam",
+              "type": "string"
+            },
+            "latch_overrun_ticks": {
+              "description": "Run time past the latch tolerated before the drive stops.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "positions": {
+              "description": "Contact states along motor run time, ascending from 0; the last\nis the release latch.",
+              "items": {
+                "$ref": "#/$defs/ContactCamPosition"
+              },
+              "type": "array"
+            },
+            "release_drives": {
+              "description": "Hold drives under which a release input edge releases the latch.",
+              "items": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "release_ticks": {
+              "description": "Release input edge to the return to run time 0.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "run_drive": {
+              "description": "Drive value that runs the motor.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "run_drive",
+            "hold_drives",
+            "release_drives",
+            "positions",
+            "latch_overrun_ticks",
+            "release_ticks"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -17945,6 +19442,60 @@
             "kind"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Serial NAND flash geometry and device identification, when declared.",
+          "properties": {
+            "jedec_id": {
+              "default": null,
+              "description": "JEDEC identification value, when supplied by the part definition.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "const": "serial-nand-flash",
+              "type": "string"
+            },
+            "page_bytes": {
+              "default": null,
+              "description": "Program-page capacity in bytes, when declared.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "pages_per_block": {
+              "default": null,
+              "description": "Pages per erase block, when declared.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "spare_bytes": {
+              "default": null,
+              "description": "Spare bytes per page, when declared.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -18039,7 +19590,7 @@
         },
         {
           "additionalProperties": false,
-          "description": "Packet extracted from an identity-checked asset.",
+          "description": "Packet extracted from a bounded asset.",
           "properties": {
             "asset": {
               "description": "Asset identity.",
@@ -18384,8 +19935,8 @@
       "description": "Picture-plane pixel packing declared by a display controller.",
       "oneOf": [
         {
-          "const": "bgra8888-straight",
-          "description": "Blue, green, red and straight-alpha bytes.",
+          "const": "abgr8888-straight",
+          "description": "Straight-alpha, blue, green and red bytes, in memory order.",
           "type": "string"
         }
       ]
@@ -18442,6 +19993,17 @@
           "$ref": "#/$defs/AlarmRegisters",
           "description": "Power-controller registers for the alarm."
         },
+        "boot_flag": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BootFlag"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Wake header bit the alarm boot tests before a normal boot, where the\npower-off tests one."
+        },
         "deadline_parameter": {
           "description": "Persistent power-controller parameter offset of the saved deadline\nword, where the power-off saves it.",
           "format": "uint32",
@@ -18456,6 +20018,17 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "fixed_interval": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AlarmInterval"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The interval the power-off arms instead of a request deadline."
         },
         "halt": {
           "description": "Its final self-branch, reached after the power cut.",
@@ -18473,22 +20046,26 @@
           "description": "Byte offset of the deadline in the request the power-off receives.",
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "rollover_parameter": {
           "description": "Persistent parameter offset of the alarm's rollover byte.",
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "required": [
         "entry",
         "halt",
         "power_cut",
-        "request_deadline_offset",
-        "alarm",
-        "rollover_parameter"
+        "alarm"
       ],
       "type": "object"
     },
@@ -18795,6 +20372,16 @@
           "minimum": 0,
           "type": "integer"
         },
+        "copies": {
+          "description": "Sealed copies the stock formatter writes back to back from the start\nof the block, each with its copy number in its first four bytes\n(little-endian). Absent for a single copy.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "defaults": {
           "$ref": "#/$defs/UpdateRange",
           "description": "Stock defaults copied into the record."
@@ -19012,6 +20599,17 @@
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
+        },
+        "data_cache": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DataCacheGeometry"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Private, non-coherent write-back L1 data cache, as CCSIDR reports it."
         }
       },
       "required": [
@@ -19481,7 +21079,10 @@
           "description": "Byte offset of the wake deadline in the sender's parameters.",
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "deferred_timer": {
           "anyOf": [
@@ -19494,11 +21095,25 @@
           ],
           "description": "Optional stock timer ABI for an autonomous deferred restart. This is\npresent only when its locator qualified a callback timer on the same\nfirmware; delivery and callback placement remain separate mechanisms."
         },
+        "early_boot": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EarlyBootMechanism"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Freestanding restart before the operating system, when located."
+        },
         "parameter_bytes": {
           "description": "Bytes of sender parameters.",
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "power_off": {
           "$ref": "#/$defs/PowerOff",
@@ -19508,23 +21123,39 @@
           "description": "Request word that selects power-off with a wake.",
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "request_offset": {
           "description": "Byte offset of the request word in the sender's parameters.",
           "format": "uint32",
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "sender": {
           "description": "Stock routine that sends the power-off request; its first argument is\nthe address of the request parameters.",
           "format": "uint64",
           "minimum": 0,
-          "type": "integer"
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "transport": {
-          "$ref": "#/$defs/RequestTransport",
-          "description": "How the host reaches the sender."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RequestTransport"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How the host reaches the sender, where the firmware takes a request.\nA firmware whose power-off arms a fixed-interval alarm instead carries\nnone of the request fields, and `power_off.fixed_interval` says so."
         },
         "ui": {
           "$ref": "#/$defs/RecIdle",
@@ -19532,12 +21163,6 @@
         }
       },
       "required": [
-        "transport",
-        "sender",
-        "request",
-        "request_offset",
-        "deadline_offset",
-        "parameter_bytes",
         "ui",
         "power_off"
       ],
@@ -20393,7 +22018,7 @@
     },
     "SettingsProfile": {
       "additionalProperties": false,
-      "description": "The stock user profile: a sixteen-byte header kept by the power controller\nand journal records in managed flash blocks. Firmware that finds no valid\nheader and records resets the profile to its defaults at startup.",
+      "description": "The stock user profile: a header kept by the power controller\nand journal records in managed flash blocks. Firmware that finds no valid\nheader and records resets the profile to its defaults at startup.",
       "properties": {
         "derived_fields": {
           "default": [],
@@ -20405,7 +22030,27 @@
         },
         "header": {
           "$ref": "#/$defs/UpdateRange",
-          "description": "Stock header defaults. Byte 14 is the marker `0xaa`; byte 15 holds the\nchecksum that makes the sixteen bytes sum to zero."
+          "description": "Stock eight- or sixteen-byte header. The last two bytes hold marker\n`0xaa` and the checksum that makes the header sum to zero."
+        },
+        "loader_offset": {
+          "default": null,
+          "description": "X-Processor 4 only: the header's offset in the boot loader's handoff\nblock. Absent for X-Processor Pro, whose header goes to sub-CPU\nregisters.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "power_register": {
+          "description": "First 16-bit register of the header on a checksum SPI power controller.\nThe header fills one register per two bytes: four registers for an\neight-byte header, eight for a sixteen-byte one.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "records": {
           "additionalProperties": {
@@ -20469,7 +22114,7 @@
           "type": "integer"
         },
         "sha256": {
-          "description": "Lowercase hexadecimal SHA-256 of the decoded section.",
+          "description": "Build/cache identity of the decoded section; unused when loading settings.",
           "type": "string"
         },
         "size": {
@@ -20792,6 +22437,16 @@
             "$ref": "#/$defs/ControllerInterruptInput"
           },
           "type": "array"
+        },
+        "power_on_ram_fill": {
+          "description": "The byte every RAM cell holds at power-on, as read on a camera. Absent\nwhen unmeasured; the emulator then starts RAM zeroed.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "profiles": {
           "additionalProperties": {
@@ -21332,7 +22987,7 @@
     },
     "UpdateRange": {
       "additionalProperties": false,
-      "description": "Bytes at a firmware address in the decoded update, identified by SHA-256.",
+      "description": "A bounded range at a firmware address in the decoded update.",
       "properties": {
         "address": {
           "description": "Firmware address.",
@@ -21341,7 +22996,7 @@
           "type": "integer"
         },
         "sha256": {
-          "description": "Lowercase hexadecimal SHA-256 of the stock bytes.",
+          "description": "Build/cache identity of the stock bytes; unused when loading settings.",
           "type": "string"
         },
         "size": {
@@ -21616,6 +23271,18 @@
       ],
       "default": null,
       "description": "The firmware's generated located inputs, when generated."
+    },
+    "execution": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/FirmwareExecution"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Stock runtime allocation, cache and callback mechanisms."
     },
     "firmware": {
       "$ref": "#/$defs/Firmware",

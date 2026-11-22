@@ -135,6 +135,26 @@ impl<L: Lookup> Locator<'_, L> {
     ) -> Result<Routine> {
         one(self.small_routines(limit, verify), name)
     }
+    /// The routine nominated by `name`, or, when no function in this unit
+    /// carries that name, the unique small routine accepted by `verify`. A
+    /// nominated routine that fails `verify` is an error, not a reason to
+    /// search by shape.
+    fn named_or_small(
+        &self,
+        name: &str,
+        limit: u64,
+        verify: impl Fn(&Routine) -> bool,
+    ) -> Result<Routine> {
+        let nominated = self
+            .index
+            .find(Some(name), None, Some(self.firmware), Some(&self.unit))
+            .map_err(|e| e.to_string())?;
+        if nominated.is_empty() {
+            self.small_routine(limit, verify, name)
+        } else {
+            self.named(name, verify)
+        }
+    }
 }
 pub(super) fn number(text: &str) -> Result<u64> {
     if let Some(hex) = text.strip_prefix("0x") {
@@ -286,17 +306,7 @@ fn flash_with_route<L: Lookup>(
         unnamed_reader(&locator, is_reader)?
     };
     let request = one(locator.calls(&reader)?, "read request")?;
-    let is_window = |r: &Routine| {
-        r.code.len() == 3
-            && r.has("mov", "x1, #0xf0000000")
-            && r.has("add", "x0, x0, x1")
-            && r.has("ret", "")
-    };
-    if firmware_names_flash_read(index, firmware)? {
-        locator.named("flash_window_address", is_window)?;
-    } else {
-        locator.small_routine(0xc, is_window, "flash_window_address")?;
-    }
+    flash_window_address(&locator)?;
     if !request.has("mov", "x0, #0xf8000000")
         || !request.has("mov", "w0, #0x7ffffff")
         || !request.has("movk", "w0, #0x7766, lsl #16")
@@ -447,19 +457,10 @@ fn flash_with_route<L: Lookup>(
     } else {
         let id = jedec_id.ok_or("NOR installed JEDEC identity is not established")?;
         let is_selector = |r: &Routine| r.has("add", "x3, x3, #0x20") && r.has("cmp", "w2, #5");
-        let named_selector = index
-            .find(
-                Some("flash_select_supported_jedec_id"),
-                None,
-                Some(firmware),
-                Some("main"),
-            )
-            .map_err(|error| error.to_string())?;
-        let selector = if named_selector.is_empty() {
-            locator.small_routine(0x60, is_selector, "flash_select_supported_jedec_id")?
-        } else {
-            locator.named("flash_select_supported_jedec_id", is_selector)?
-        };
+        // A firmware can carry a borrowed `flash_read` name without one for
+        // the selector, so the selector's own name decides the search.
+        let selector =
+            locator.named_or_small("flash_select_supported_jedec_id", 0x60, is_selector)?;
         let hits = index
             .select(
                 Some(firmware),
@@ -645,8 +646,10 @@ fn xpp_flash<L: Lookup>(index: &L, firmware: &str, image_origin: u64) -> Result<
                 .step_by(4)
             {
                 if bytes
-                    .chunks_exact(4)
-                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| u32::from_le_bytes(*b))
                     .ne(PREFIX)
                 {
                     continue;
@@ -708,8 +711,10 @@ fn xpp_flash<L: Lookup>(index: &L, firmware: &str, image_origin: u64) -> Result<
                 .step_by(4)
             {
                 let words: Vec<_> = bytes
-                    .chunks_exact(4)
-                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| u32::from_le_bytes(*b))
                     .collect();
                 if words[..WAIT_PREFIX.len()] != WAIT_PREFIX
                     || words[WAIT_PREFIX.len()] & 0x0f00_0000 != 0x0b00_0000
@@ -1003,7 +1008,7 @@ fn xpp_initialized_marker(reader: &Routine) -> Result<u64> {
 /// capture. The first checked firmware establishes the instruction grammar;
 /// each address and state input is recovered from its indexed routines.
 fn xp4_flash<L: Lookup>(index: &L, firmware: &str, image_origin: u64) -> Result<Value> {
-    if matches!(firmware, "xt3-511" | "xt30-201") {
+    if matches!(firmware, "xt3-511" | "xt30-201" | "xe4-201") {
         return xp4_packet_flash(index, firmware, image_origin);
     }
     if firmware != "xs10-311" {
@@ -1068,8 +1073,10 @@ fn xp4_flash<L: Lookup>(index: &L, firmware: &str, image_origin: u64) -> Result<
                 .step_by(4)
             {
                 if bytes
-                    .chunks_exact(4)
-                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| u32::from_le_bytes(*b))
                     .ne(PREFIX)
                 {
                     continue;
@@ -1096,8 +1103,10 @@ fn xp4_flash<L: Lookup>(index: &L, firmware: &str, image_origin: u64) -> Result<
                     continue;
                 };
                 let words: Vec<_> = code
-                    .chunks_exact(4)
-                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| u32::from_le_bytes(*b))
                     .collect();
                 if !CHECKED.iter().all(|&(i, expected)| {
                     let actual = words[i];
@@ -1130,8 +1139,10 @@ fn xp4_flash<L: Lookup>(index: &L, firmware: &str, image_origin: u64) -> Result<
                     .map_err(|e| e.to_string())?
                     .ok_or("unmapped XP4 flash address translator")?;
                 let translated: Vec<u32> = translated
-                    .chunks_exact(4)
-                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| u32::from_le_bytes(*b))
                     .collect();
                 if translated
                     != [
@@ -1162,8 +1173,10 @@ fn xp4_flash<L: Lookup>(index: &L, firmware: &str, image_origin: u64) -> Result<
                     .map_err(|e| e.to_string())?
                     .ok_or("unmapped XP4 stock flash reader")?;
                 let reader_words: Vec<u32> = reader_bytes
-                    .chunks_exact(4)
-                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| u32::from_le_bytes(*b))
                     .collect();
                 let initialized = reader_words
                     .windows(4)
@@ -1201,7 +1214,7 @@ fn xp4_flash<L: Lookup>(index: &L, firmware: &str, image_origin: u64) -> Result<
     }
     let (enabled, indexed_routine, translator_routine, reader_routine, cache_routine, byte_reader) =
         matches.pop().unwrap();
-    let origin = u64::from(image_origin);
+    let origin = image_origin;
     if origin != 0x274 {
         return Err("XP4 update origin differs from its registered DAT bias".into());
     }
@@ -1235,14 +1248,18 @@ fn xp4_packet_flash<L: Lookup>(index: &L, firmware: &str, image_origin: u64) -> 
         transfer_address,
         initializer_address,
         prepare_address,
+        prepare_word,
         state_address,
         initializer_bytes,
     ) = match firmware {
         "xt3-511" => (
-            0x01074fb8, 0x0107536c, 0x01074df8, 0x01075808, 0x010763cc, 0x0155a69c, 0x128,
+            0x01074fb8, 0x0107536c, 0x01074df8, 0x01075808, 0x010763cc, 68, 0x0155a69c, 0x128,
         ),
         "xt30-201" => (
-            0x0106f1ec, 0x0106f5a0, 0x0106f02c, 0x0106fa3c, 0x010706fc, 0x01503894, 0x138,
+            0x0106f1ec, 0x0106f5a0, 0x0106f02c, 0x0106fa3c, 0x010706fc, 68, 0x01503894, 0x138,
+        ),
+        "xe4-201" => (
+            0x011c79d0, 0x011c7d84, 0x011c7810, 0x011c8220, 0x011c8bc0, 61, 0x01711a1c, 0x138,
         ),
         _ => return Err("unsupported XP4 packet flash layout".into()),
     };
@@ -1276,8 +1293,10 @@ fn xp4_packet_flash<L: Lookup>(index: &L, firmware: &str, image_origin: u64) -> 
         .map_err(|error| error.to_string())?
         .ok_or("unmapped XP4 packet flash reader")?;
     let words: Vec<u32> = reader_bytes
-        .chunks_exact(4)
-        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| u32::from_le_bytes(*bytes))
         .collect();
     verify_xp4_packet_reader(
         &words,
@@ -1285,6 +1304,7 @@ fn xp4_packet_flash<L: Lookup>(index: &L, firmware: &str, image_origin: u64) -> 
         state_address,
         transfer_address,
         prepare_address,
+        prepare_word,
     )?;
     let references = index
         .referrers(firmware, Some("main"), state_address)
@@ -1337,6 +1357,7 @@ fn verify_xp4_packet_reader(
     state_address: u64,
     transfer_address: u64,
     prepare_address: u64,
+    prepare_word: usize,
 ) -> Result<()> {
     if words.len() != 193
         || words[..8]
@@ -1348,7 +1369,7 @@ fn verify_xp4_packet_reader(
         || arm_mov_pair_for(words[26], words[27], 3)? != state_address
         || arm_mov_pair_for(words[28], words[29], 2)? != 0x7766_6555
         || arm_branch_target(reader_address + 0x170, words[92])? != transfer_address
-        || arm_branch_target(reader_address + 0x110, words[68])? != prepare_address
+        || arm_branch_target(reader_address + (prepare_word * 4) as u64, words[prepare_word])? != prepare_address
     {
         return Err("XP4 flash packet, state or transfer path changed".into());
     }
@@ -1405,8 +1426,10 @@ fn locate_xp4_byte_reader<L: Lookup>(
                     continue;
                 }
                 if bytes
-                    .chunks_exact(4)
-                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| u32::from_le_bytes(*b))
                     .ne(prefix)
                 {
                     continue;
@@ -1433,8 +1456,10 @@ fn locate_xp4_byte_reader<L: Lookup>(
                     continue;
                 };
                 let words: Vec<_> = code
-                    .chunks_exact(4)
-                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| u32::from_le_bytes(*b))
                     .collect();
                 if words[2] != 0xe150_0003
                     || words[9..13] != [0xe3a0_3001, 0xe1a0_2005, 0xe1a0_1000, 0xe1a0_0004]
@@ -1475,6 +1500,18 @@ fn firmware_names_flash_read<L: Lookup>(index: &L, firmware: &str) -> Result<boo
         .find(Some("flash_read"), None, Some(firmware), Some("main"))
         .map_err(|e| e.to_string())?
         .is_empty())
+}
+
+/// The helper that maps a flash offset into the 128 MiB read window. A symbol
+/// ledger that names `flash_read` need not also name this helper, so an
+/// absent name falls back to the unique routine with this shape.
+fn flash_window_address<L: Lookup>(locator: &Locator<'_, L>) -> Result<Routine> {
+    locator.named_or_small("flash_window_address", 0xc, |r| {
+        r.code.len() == 3
+            && r.has("mov", "x1, #0xf0000000")
+            && r.has("add", "x0, x0, x1")
+            && r.has("ret", "")
+    })
 }
 
 /// Find the reader in a firmware whose symbols are not recovered: a small
@@ -1570,7 +1607,7 @@ mod tests {
         words[68] = branch(0x1110, 0x3000);
         words[92] = branch(0x1170, 0x4000);
         let verify =
-            |words: &[u32]| verify_xp4_packet_reader(words, 0x1000, 0x20000, 0x4000, 0x3000);
+            |words: &[u32]| verify_xp4_packet_reader(words, 0x1000, 0x20000, 0x4000, 0x3000, 68);
         assert!(verify(&words).is_ok());
         for (offset, value) in [
             (3, 0xe5905004),
@@ -1588,10 +1625,13 @@ mod tests {
             assert!(verify(&changed).is_err(), "accepted changed word {offset}");
         }
         assert!(verify(&words[..192]).is_err());
-        assert!(verify_xp4_packet_reader(&words, 0x1004, 0x20000, 0x4000, 0x3000).is_err());
+        assert!(verify_xp4_packet_reader(&words, 0x1004, 0x20000, 0x4000, 0x3000, 68).is_err());
     }
 
     fn candidates(second: u32) -> Index {
+        routines(second, &["candidate"])
+    }
+    fn routines(second: u32, names: &[&str]) -> Index {
         let mut index = Index::new();
         // Two self-authored MOV-immediate/RET routines with the same nominated
         // name. Only decoded semantics, not the name count, selects a result.
@@ -1616,7 +1656,7 @@ mod tests {
                         .map(|address| Boundary {
                             address,
                             ranges: vec![(address, address + 8)],
-                            names: vec!["candidate".into()],
+                            names: names.iter().map(|name| (*name).into()).collect(),
                             annotations: vec![],
                             references: vec![],
                         })
@@ -1694,6 +1734,95 @@ mod tests {
             0x1000,
             0x100
         ));
+    }
+
+    #[test]
+    fn an_absent_name_falls_back_to_the_shape_but_a_wrong_nomination_does_not() {
+        // No function carries the name: the unique accepted shape is used.
+        let index = routines(2, &[]);
+        let locator = Locator {
+            index: &index,
+            firmware: "test",
+            unit: "main".into(),
+        };
+        let routine = locator
+            .named_or_small("selector", 8, |r| r.has("mov", "x0, #2"))
+            .unwrap();
+        assert_eq!(routine.header.key.address, 0x1008);
+        // Two accepted shapes stay ambiguous.
+        let index = routines(1, &[]);
+        let locator = Locator {
+            index: &index,
+            firmware: "test",
+            unit: "main".into(),
+        };
+        assert!(
+            locator
+                .named_or_small("selector", 8, |r| r.has("mov", "x0, #1"))
+                .is_err()
+        );
+        // A nomination that fails verification is not replaced by a shape search.
+        let index = routines(2, &["selector"]);
+        let locator = Locator {
+            index: &index,
+            firmware: "test",
+            unit: "main".into(),
+        };
+        assert!(
+            locator
+                .named_or_small("selector", 8, |r| r.has("mov", "x0, #3"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_named_reader_does_not_require_a_named_window_helper() {
+        // Self-authored words: a RET named flash_read at 0x1000 and an
+        // unnamed MOVZ x1, #0xf000, lsl #16; ADD x0, x0, x1; RET at 0x1010.
+        let words = [0xd65f03c0u32, 0, 0, 0, 0xd2be0001, 0x8b010000, 0xd65f03c0];
+        let function = |address: u64, size: u64, names: &[&str]| Boundary {
+            address,
+            ranges: vec![(address, address + size)],
+            names: names.iter().map(|name| (*name).into()).collect(),
+            annotations: vec![],
+            references: vec![],
+        };
+        let index = |window_names: &[&str]| {
+            let mut index = Index::new();
+            index
+                .add_unit(
+                    UnitInput {
+                        layout: UnitLayout {
+                            firmware: "test".into(),
+                            unit: "main".into(),
+                            architecture: Architecture::Aarch64,
+                            address_ranges: vec![(0x1000, 0x2000)],
+                            address_aliases: vec![],
+                        },
+                        functions: vec![
+                            function(0x1000, 4, &["flash_read"]),
+                            function(0x1010, 12, window_names),
+                        ],
+                    },
+                    vec![Region {
+                        address: 0x1000,
+                        bytes: words.iter().flat_map(|word| word.to_le_bytes()).collect(),
+                    }],
+                )
+                .unwrap();
+            index
+        };
+        for window_names in [&[][..], &["flash_window_address"][..]] {
+            let index = index(window_names);
+            assert!(firmware_names_flash_read(&index, "test").unwrap());
+            let locator = Locator {
+                index: &index,
+                firmware: "test",
+                unit: "main".into(),
+            };
+            let window = flash_window_address(&locator).unwrap();
+            assert_eq!(window.header.key.address, 0x1010, "names {window_names:?}");
+        }
     }
 
     #[test]

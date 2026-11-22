@@ -2,6 +2,7 @@
 //! data. Full-field nearest sampling is a declared spatial approximation,
 //! separate from the measured integer film arithmetic.
 use fujimod_emulator_imaging::film::{Film, FilmPixels};
+use fujimod_perf::{DeviceWorkCounter, add_work};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -37,15 +38,16 @@ impl RawView<'_> {
         }
         Ok(())
     }
-    /// PDAF transport restores packed12 to the U14 domain; still color
-    /// consumes the stored U12 value directly through `sample`.
+    /// Packed12 transport restores the stored U12 value to the U14 domain
+    /// for PDAF and still color alike. X30 1.03 programs still black 0x400
+    /// on every CFA slot (0xfff38004..0x10) for packed12 RAW whose stored
+    /// black is 256 (its RAF and LibRaw), and still color clamps at 16383.
     pub fn phase_sample(&self, x: usize, y: usize) -> u16 {
-        let v = self.sample(x, y);
-        if self.packing == Packing::Packed12 {
-            v << 2
-        } else {
-            v
-        }
+        Self::u14(self.packing == Packing::Packed12, self.sample(x, y))
+    }
+    #[inline(always)]
+    fn u14(packed12: bool, v: u16) -> u16 {
+        if packed12 { v << 2 } else { v }
     }
     #[inline]
     pub fn sample(&self, x: usize, y: usize) -> u16 {
@@ -65,6 +67,27 @@ impl RawView<'_> {
     #[inline(always)]
     fn sample_from_offset<const PACKED12: bool>(&self, i: usize, x: usize) -> u16 {
         let v = u16::from_le_bytes([self.bytes[i], self.bytes[i + 1]]);
+        if !PACKED12 {
+            v
+        } else if x & 1 == 0 {
+            v & 4095
+        } else {
+            v >> 4
+        }
+    }
+    /// Interior CFA positions are wrapped into the validated raster before
+    /// their byte offsets are formed, so the pair lies inside `bytes`.
+    #[inline(always)]
+    unsafe fn sample_from_offset_unchecked<const PACKED12: bool>(
+        &self,
+        i: usize,
+        x: usize,
+    ) -> u16 {
+        // SAFETY: the caller passes an offset derived from a validated raster
+        // column and row. Both bytes belong to that sample.
+        let v = u16::from_le_bytes(unsafe {
+            [*self.bytes.get_unchecked(i), *self.bytes.get_unchecked(i + 1)]
+        });
         if !PACKED12 {
             v
         } else if x & 1 == 0 {
@@ -244,6 +267,12 @@ impl Cfa {
         rows: std::ops::Range<usize>,
         out: &mut [u8],
     ) {
+        let row_count = rows.end.saturating_sub(rows.start);
+        add_work(DeviceWorkCounter::RawRows, row_count as u64);
+        add_work(
+            DeviceWorkCounter::RawPixels,
+            width.saturating_mul(row_count) as u64,
+        );
         let [left, top, crop_width, crop_height] = crop;
         let interior = left >= 3
             && top >= 3
@@ -413,9 +442,18 @@ impl Cfa {
                         let sx = usize::from(sample.x);
                         let sy = row_sample.y;
                         let value = (u64::from(
-                            raw.sample_from_offset::<PACKED12>(
-                                row_sample.byte_offset + usize::from(sample.byte_offset),
-                                sx,
+                            RawView::u14(
+                                PACKED12,
+                                // SAFETY: `render_rows_inner` selects this
+                                // path only with three samples of margin on
+                                // every side. Column and row wrapping above
+                                // therefore address samples inside `raw`.
+                                unsafe {
+                                    raw.sample_from_offset_unchecked::<PACKED12>(
+                                        row_sample.byte_offset + usize::from(sample.byte_offset),
+                                        sx,
+                                    )
+                                },
                             )
                             .saturating_sub(black),
                         ) * exposure_gains[c])
@@ -456,7 +494,7 @@ impl Cfa {
                     let w = std::array::from_fn(|c| {
                         let (sx, sy) = positions[c];
                         let value =
-                            (u64::from(raw.sample_as::<PACKED12>(sx, sy).saturating_sub(black))
+                            (u64::from(RawView::u14(PACKED12, raw.sample_as::<PACKED12>(sx, sy)).saturating_sub(black))
                                 * exposure_gains[c])
                                 >> 16;
                         ((value * u64::from(spatial_gain(sx, sy))) >> 11).min(16383) as u16
@@ -526,7 +564,7 @@ mod tests {
                         crop[0] + x * crop[2] / width,
                         crop[1] + y * crop[3] / height,
                     );
-                    let rgb = positions.map(|(x, y)| raw.sample(x, y));
+                    let rgb = positions.map(|(x, y)| raw.phase_sample(x, y));
                     film.develop(std::array::from_fn(|c| {
                         expected_gain_calls
                             .borrow_mut()
@@ -644,7 +682,7 @@ mod tests {
                     crop[0] + x * crop[2] / out_width,
                     crop[1] + y * crop[3] / out_height,
                 );
-                let rgb = positions.map(|(x, y)| raw.sample(x, y));
+                let rgb = positions.map(|(x, y)| raw.phase_sample(x, y));
                 film.develop(std::array::from_fn(|c| {
                     let (sx, sy) = positions[c];
                     expected_gain_calls.borrow_mut().push((sx, sy));
@@ -732,11 +770,16 @@ mod tests {
                             source[i + 1] = (value >> 4) as u8;
                         }
                     }
-                    let v = ((u64::from(value.saturating_sub(127))
+                    let stored = if packing == Packing::Packed12 {
+                        value << 2
+                    } else {
+                        value
+                    };
+                    let v = (((u64::from(stored.saturating_sub(127))
                         * gains[cfa.color(x, y)]
                         * exposure)
                         >> 16)
-                        * u64::from(gain(x, y))
+                        * u64::from(gain(x, y)))
                         >> 11;
                     let i = y * (24 * 2 + 8) + x * 2;
                     calibrated[i..i + 2].copy_from_slice(&(v.min(16383) as u16).to_le_bytes());
@@ -823,7 +866,12 @@ mod tests {
             &mut out,
         )
         .unwrap();
-        assert!(out.chunks_exact(4).all(|p| p == [64, 64, 128, 128]));
+        assert!(
+            out.as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| *p == [64, 64, 128, 128])
+        );
         cfa.render(
             &raw,
             &film,

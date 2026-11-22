@@ -47,7 +47,7 @@ try {
   context.on('request', (request) => {
     if (!['GET', 'HEAD'].includes(request.method())) sent.push(request.url());
   });
-  await context.route('https://share.fujimod.com/issue-reports', async (route) => {
+  await context.route(`${new URL(base).origin}/issue-reports`, async (route) => {
     const request = route.request();
     console.log(engine.name(), 'intercepted explicit upload');
     if (engine === chromium) {
@@ -61,7 +61,7 @@ try {
         await readFile(`${directory}/report.tar`),
       );
       assert.equal(form.get('description'), 'The menu stopped responding after a mod callback.');
-      const metadata = JSON.parse(String(form.get('metadata')));
+      const metadata = JSON.parse(form.get('metadata') as string);
       assert.equal(metadata.bytes, guide.bug_report.bytes);
       assert.equal(metadata.archive, undefined);
     }
@@ -87,7 +87,7 @@ try {
         window.__reportUpload = {
           digest: [...new Uint8Array(digest)].map((n) => n.toString(16).padStart(2, '0')).join(''),
           description: body.get('description'),
-          metadata: JSON.parse(String(body.get('metadata'))),
+          metadata: JSON.parse(body.get('metadata') as string),
         };
       }
       return send(...args);
@@ -157,7 +157,7 @@ try {
   assert.equal(captured.description, 'The menu stopped responding after a mod callback.');
   assert.equal(captured.metadata.archive, undefined);
   assert.equal(issues.length, 1);
-  assert.deepEqual(sent, ['https://share.fujimod.com/issue-reports']);
+  assert.deepEqual(sent, [`${new URL(base).origin}/issue-reports`]);
   assert.deepEqual(errors, []);
   await page.screenshot({ path: `${output}/browser-ready-phone.png`, fullPage: true });
   await page.setViewportSize({ width: 1280, height: 960 });

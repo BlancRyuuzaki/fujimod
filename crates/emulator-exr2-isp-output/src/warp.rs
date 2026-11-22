@@ -105,10 +105,15 @@ impl Warp {
             src.width, src.height, src.pitch, w, h, last, scale, mode,
         )?;
         fujimod_emulator_imaging::exr2_isp::dma::physical(src.address, source_bytes)?;
+        // X30 1.03 also programs 0x30, 0x40/0x44 (Q12, e.g. 0xfb9), 0x48 and
+        // a monotonic Q16 table from 0x60 (0x10000, 0x10044, ...), which
+        // reads as a radial distortion remap. Its indexing and use are not
+        // derivable from the firmware that copies those words: X30 lens
+        // correction not modeled. The registers stay latched and the remap
+        // is an identity pass-through; the base centered scale still applies.
+        // X70 1.10 leaves 0x30/0x48 zero and 0x40/0x44 at 4096.
         if mode > 2
-            || [0x24, 0x30, 0x48].iter().any(|&o| r[o / 4] != 0)
-            || r[0x40 / 4] != 4096
-            || r[0x44 / 4] != 4096
+            || r[0x24 / 4] != 0
             || r[0x4c / 4] != 0x10001
             || !src.width.is_multiple_of(2)
             || !dst.width.is_multiple_of(2)
@@ -199,9 +204,13 @@ impl Device for Warp {
         ; blobs: [source]
     );
     fn fingerprint(&self) -> std::result::Result<serde_json::Value, String> {
+        let stream = self.stream.lock().unwrap();
+        let stream_state = serde_json::json!({"state":stream.state,"width":stream.width,
+            "height":stream.height,
+            "pixels":fujimod_emulator_devices::state::bytes(&stream.pixels)});
         Ok(
             serde_json::json!({"r":self.r,"dma":self.dma.fingerprint(),"stop":self.stop,
-            "source":fujimod_emulator_devices::fingerprint::bytes(&self.source),"stream":*self.stream.lock().unwrap()}),
+            "source":fujimod_emulator_devices::state::bytes(&self.source),"stream":stream_state}),
         )
     }
 
@@ -308,7 +317,7 @@ impl Device for Warp {
         let stream = self.stream.lock().unwrap();
         let summary = serde_json::json!({"state":stream.state,"width":stream.width,
             "height":stream.height,
-            "pixels":fujimod_emulator_devices::fingerprint::bytes(&stream.pixels)});
+            "pixels":fujimod_emulator_devices::state::bytes(&stream.pixels)});
         serde_json::json!((&self.r, self.dma.fingerprint(), self.stop, summary))
     }
     fn diagnostic_buffer(&self, name: &str) -> Result<&[u8], String> {

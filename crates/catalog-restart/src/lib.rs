@@ -53,19 +53,21 @@ pub struct FirmwareRestart {
     tsify(missing_as_null)
 )]
 pub struct RestartMechanism {
-    /// How the host reaches the sender.
-    pub transport: RequestTransport,
+    /// How the host reaches the sender, where the firmware takes a request.
+    /// A firmware whose power-off arms a fixed-interval alarm instead carries
+    /// none of the request fields, and `power_off.fixed_interval` says so.
+    pub transport: Option<RequestTransport>,
     /// Stock routine that sends the power-off request; its first argument is
     /// the address of the request parameters.
-    pub sender: u64,
+    pub sender: Option<u64>,
     /// Request word that selects power-off with a wake.
-    pub request: u32,
+    pub request: Option<u32>,
     /// Byte offset of the request word in the sender's parameters.
-    pub request_offset: u32,
+    pub request_offset: Option<u32>,
     /// Byte offset of the wake deadline in the sender's parameters.
-    pub deadline_offset: u32,
+    pub deadline_offset: Option<u32>,
     /// Bytes of sender parameters.
-    pub parameter_bytes: u32,
+    pub parameter_bytes: Option<u32>,
     /// Where REC idle is observed.
     pub ui: RecIdle,
     /// What the stock power-off does with the request.
@@ -74,6 +76,120 @@ pub struct RestartMechanism {
     /// present only when its locator qualified a callback timer on the same
     /// firmware; delivery and callback placement remain separate mechanisms.
     pub deferred_timer: Option<DeferredTimer>,
+    /// Freestanding restart before the operating system, when located.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub early_boot: Option<EarlyBootMechanism>,
+}
+
+/// A processor-specific freestanding power-controller transport.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[cfg_attr(
+    all(target_arch = "wasm32", not(target_os = "emscripten")),
+    derive(tsify::Tsify)
+)]
+pub enum EarlyBootMechanism {
+    /// Polled EXR II SPI, persistent packet, wake alarm and power-hold release.
+    Exr2PolledAlarm {
+        /// SPI channel of the power controller's serial endpoint.
+        spi_channel: u32,
+        /// Exact C constants derived from the endpoint table and power path.
+        constants: EarlyBootConstants,
+        /// The stock endpoint-table reader and power cut establishing the transport.
+        code_checks: Vec<CodeCheck>,
+    },
+}
+
+/// Exact register and command values for this firmware's early restart.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(
+    all(target_arch = "wasm32", not(target_os = "emscripten")),
+    derive(tsify::Tsify)
+)]
+pub struct EarlyBootConstants {
+    /// Alarm enable.
+    pub exr2_restart_alarm_enable: u32,
+    /// Alarm high.
+    pub exr2_restart_alarm_high: u32,
+    /// Alarm low.
+    pub exr2_restart_alarm_low: u32,
+    /// Gpio banks.
+    pub exr2_restart_gpio_banks: u32,
+    /// Gpio base.
+    pub exr2_restart_gpio_base: u32,
+    /// Gpio config.
+    pub exr2_restart_gpio_config: u32,
+    /// Gpio inactive mask.
+    pub exr2_restart_gpio_inactive_mask: u32,
+    /// Gpio mode1.
+    pub exr2_restart_gpio_mode1: u32,
+    /// Gpio mode2.
+    pub exr2_restart_gpio_mode2: u32,
+    /// Gpio mode3.
+    pub exr2_restart_gpio_mode3: u32,
+    /// Gpio mode4.
+    pub exr2_restart_gpio_mode4: u32,
+    /// Gpio output.
+    pub exr2_restart_gpio_output: u32,
+    /// Gpio stride.
+    pub exr2_restart_gpio_stride: u32,
+    /// Packet bytes.
+    pub exr2_restart_packet_bytes: u32,
+    /// Packet register.
+    pub exr2_restart_packet_register: u32,
+    /// Power command.
+    pub exr2_restart_power_command: u32,
+    /// Power hold.
+    pub exr2_restart_power_hold: u32,
+    /// Power hold mask.
+    pub exr2_restart_power_hold_mask: u32,
+    /// Power off value.
+    pub exr2_restart_power_off_value: u32,
+    /// Spi base.
+    pub exr2_restart_spi_base: u32,
+    /// Spi busy.
+    pub exr2_restart_spi_busy: u32,
+    /// Spi control.
+    pub exr2_restart_spi_control: u32,
+    /// Spi count mask.
+    pub exr2_restart_spi_count_mask: u32,
+    /// Spi enable.
+    pub exr2_restart_spi_enable: u32,
+    /// Spi fifo control.
+    pub exr2_restart_spi_fifo_control: u32,
+    /// Spi fifo reset.
+    pub exr2_restart_spi_fifo_reset: u32,
+    /// Spi format.
+    pub exr2_restart_spi_format: u32,
+    /// Spi rx.
+    pub exr2_restart_spi_rx: u32,
+    /// Spi rx count.
+    pub exr2_restart_spi_rx_count: u32,
+    /// Spi rx ready.
+    pub exr2_restart_spi_rx_ready: u32,
+    /// Spi status.
+    pub exr2_restart_spi_status: u32,
+    /// Spi status clear.
+    pub exr2_restart_spi_status_clear: u32,
+    /// Spi tx.
+    pub exr2_restart_spi_tx: u32,
+    /// Spi tx count.
+    pub exr2_restart_spi_tx_count: u32,
+    /// Write.
+    pub exr2_restart_write: u32,
+    /// Gpio pin.
+    pub restart_gpio_pin: u32,
+    /// Panel gpio bank.
+    pub restart_panel_gpio_bank: u32,
+    /// Power gpio bank.
+    pub restart_power_gpio_bank: u32,
+    /// Spi format value.
+    pub restart_spi_format_value: u32,
+    /// Spi idle control.
+    pub restart_spi_idle_control: u32,
 }
 
 /// A stock timer that calls a no-argument callback after a millisecond delay.
@@ -219,14 +335,51 @@ pub struct PowerOff {
     /// Stock routine that cuts power.
     pub power_cut: u64,
     /// Byte offset of the deadline in the request the power-off receives.
-    pub request_deadline_offset: u32,
+    pub request_deadline_offset: Option<u32>,
     /// Power-controller registers for the alarm.
     pub alarm: AlarmRegisters,
     /// Persistent power-controller parameter offset of the saved deadline
     /// word, where the power-off saves it.
     pub deadline_parameter: Option<u32>,
     /// Persistent parameter offset of the alarm's rollover byte.
-    pub rollover_parameter: u32,
+    pub rollover_parameter: Option<u32>,
+    /// The interval the power-off arms instead of a request deadline.
+    pub fixed_interval: Option<AlarmInterval>,
+    /// Wake header bit the alarm boot tests before a normal boot, where the
+    /// power-off tests one.
+    pub boot_flag: Option<BootFlag>,
+}
+
+/// A byte the alarm boot tests for a normal boot. Without the bit, the wake
+/// takes a boot that never reaches USB. The restart sets the bit before the
+/// request; the power-off publishes it and the firmware clears it after the
+/// wake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(
+    all(target_arch = "wasm32", not(target_os = "emscripten")),
+    derive(tsify::Tsify)
+)]
+pub struct BootFlag {
+    /// Address of the byte.
+    pub address: u64,
+    /// The single bit the restart ORs into the byte before the request.
+    pub mask: u8,
+}
+
+/// Constant alarm values a power-off writes instead of taking a deadline.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(
+    all(target_arch = "wasm32", not(target_os = "emscripten")),
+    derive(tsify::Tsify),
+    tsify(missing_as_null)
+)]
+pub struct AlarmInterval {
+    /// Values written to the alarm's seconds registers, least significant first.
+    pub seconds: Vec<u32>,
 }
 
 /// Power-controller registers the power-off writes for the wake alarm.
@@ -267,49 +420,51 @@ impl FirmwareRestart {
             return fail("stock code checks are required");
         }
         let m = &self.mechanism;
-        let fits = |offset: u32| offset.is_multiple_of(4) && offset + 4 <= m.parameter_bytes;
-        if !fits(m.request_offset)
-            || !fits(m.deadline_offset)
-            || m.request_offset == m.deadline_offset
-        {
-            return fail("request and deadline must be distinct parameter words");
-        }
-        match &m.transport {
-            RequestTransport::BorrowedQuery {
-                callback_offset,
-                stock_callback,
-                output_bytes,
-                ..
-            } => {
-                if !callback_offset.is_multiple_of(4) || *stock_callback == 0 {
-                    return fail("invalid query callback slot");
+        let request = (
+            m.sender,
+            m.request,
+            m.request_offset,
+            m.deadline_offset,
+            m.parameter_bytes,
+        );
+        match (&m.transport, m.power_off.fixed_interval.as_ref()) {
+            (Some(_), Some(_)) => {
+                return fail("a fixed-interval wake takes no request");
+            }
+            (None, None) => {
+                return fail(
+                    "a restart needs either a request transport or a fixed-interval wake",
+                );
+            }
+            (None, Some(interval)) => {
+                if request != (None, None, None, None, None)
+                    || m.power_off.request_deadline_offset.is_some()
+                    || m.power_off.deadline_parameter.is_some()
+                    || m.power_off.rollover_parameter.is_some()
+                {
+                    return fail("a fixed-interval wake carries no request fields");
                 }
-                if m.parameter_bytes > *output_bytes {
-                    return fail("parameters exceed the query output fields");
+                if interval.seconds.len() != m.power_off.alarm.seconds.len()
+                    || interval.seconds.iter().all(|seconds| *seconds == 0)
+                {
+                    return fail("a fixed-interval wake needs a nonzero alarm interval");
                 }
             }
-            RequestTransport::ConsoleCallback {
-                slot,
-                stock_callback,
-                stub_area,
-                stub_bytes,
-                translation,
-                ready_words,
-                ..
-            } => {
-                if !slot.is_multiple_of(8) || *stock_callback == 0 {
-                    return fail("invalid console callback slot");
-                }
-                if !stub_area.is_multiple_of(16) || *stub_bytes < 16 + m.parameter_bytes {
-                    return fail("stub area cannot hold the stub and its parameters");
-                }
-                if translation.is_empty()
-                    || translation
-                        .iter()
-                        .chain(ready_words)
-                        .any(|w| !matches!(w.size, 4 | 8))
+            (Some(transport), None) => {
+                let (Some(_), Some(_), Some(request_offset), Some(deadline_offset), Some(bytes)) =
+                    request
+                else {
+                    return fail("a request restart needs every request field");
+                };
+                if m.power_off.request_deadline_offset.is_none()
+                    || m.power_off.rollover_parameter.is_none()
                 {
-                    return fail("translation and ready words must be 4 or 8 bytes");
+                    return fail("a request restart saves the deadline and its rollover byte");
+                }
+                if let Err(reason) =
+                    validate_transport(transport, bytes, request_offset, deadline_offset)
+                {
+                    return fail(reason);
                 }
             }
         }
@@ -318,6 +473,37 @@ impl FirmwareRestart {
         }
         if m.power_off.alarm.seconds.is_empty() {
             return fail("alarm seconds registers are required");
+        }
+        if let Some(flag) = &m.power_off.boot_flag {
+            if m.transport.is_none() {
+                return fail("a boot flag is set only before a request");
+            }
+            if !flag.mask.is_power_of_two() {
+                return fail("a boot flag is a single bit");
+            }
+        }
+        if let Some(EarlyBootMechanism::Exr2PolledAlarm {
+            spi_channel,
+            constants,
+            code_checks,
+        }) = &m.early_boot
+            && (*spi_channel > 3
+                || code_checks.len() != 2
+                || code_checks
+                    .iter()
+                    .any(|check| check.size == 0 || check.sha256.len() != 64)
+                || constants.exr2_restart_spi_base != 0xfff84000 + spi_channel * 0x40
+                || constants.exr2_restart_packet_bytes != 16
+                || Some(constants.exr2_restart_alarm_low)
+                    != m.power_off.alarm.seconds.first().copied()
+                || Some(constants.exr2_restart_alarm_high)
+                    != m.power_off.alarm.seconds.get(1).copied()
+                || constants.exr2_restart_alarm_enable != m.power_off.alarm.enable
+                || constants.restart_gpio_pin >= 16
+                || constants.restart_power_gpio_bank >= 16
+                || constants.restart_panel_gpio_bank >= 16)
+        {
+            return fail("invalid early-boot restart mechanism");
         }
         if let Some(timer) = &m.deferred_timer {
             if timer.kind != "software-timer-callback-v1"
@@ -342,4 +528,57 @@ impl FirmwareRestart {
         }
         Ok(())
     }
+}
+
+/// The request transport's own consistency, once the request fields are present.
+fn validate_transport(
+    transport: &RequestTransport,
+    parameter_bytes: u32,
+    request_offset: u32,
+    deadline_offset: u32,
+) -> Result<(), &'static str> {
+    let fits = |offset: u32| offset.is_multiple_of(4) && offset + 4 <= parameter_bytes;
+    if !fits(request_offset) || !fits(deadline_offset) || request_offset == deadline_offset {
+        return Err("request and deadline must be distinct parameter words");
+    }
+    match transport {
+        RequestTransport::BorrowedQuery {
+            callback_offset,
+            stock_callback,
+            output_bytes,
+            ..
+        } => {
+            if !callback_offset.is_multiple_of(4) || *stock_callback == 0 {
+                return Err("invalid query callback slot");
+            }
+            if parameter_bytes > *output_bytes {
+                return Err("parameters exceed the query output fields");
+            }
+        }
+        RequestTransport::ConsoleCallback {
+            slot,
+            stock_callback,
+            stub_area,
+            stub_bytes,
+            translation,
+            ready_words,
+            ..
+        } => {
+            if !slot.is_multiple_of(8) || *stock_callback == 0 {
+                return Err("invalid console callback slot");
+            }
+            if !stub_area.is_multiple_of(16) || *stub_bytes < 16 + parameter_bytes {
+                return Err("stub area cannot hold the stub and its parameters");
+            }
+            if translation.is_empty()
+                || translation
+                    .iter()
+                    .chain(ready_words)
+                    .any(|word| !matches!(word.size, 4 | 8))
+            {
+                return Err("translation and ready words must be 4 or 8 bytes");
+            }
+        }
+    }
+    Ok(())
 }

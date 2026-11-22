@@ -1,8 +1,8 @@
 //! NAND controller (EXR II at FFF52000 by default; the register base is an option). Register-selected PIO/DMA and completion IRQ80 only.
 //! Data/OOB placement, clean ECC and virtual latency are declared inputs;
 //! opaque update bytes never select commands or authorize completion.
-use fujimod_emulator_devices::{Cx, Device};
 use fujimod_emulator_devices::parts::nand::Nand;
+use fujimod_emulator_devices::{Cx, Device};
 use serde::{Deserialize, Serialize};
 
 const OFFSETS: &[usize] = &[
@@ -184,7 +184,10 @@ impl NandController {
             || config & 0x10000000 != 0
             || app && !matches!((config >> 20) & 7, 3 | 4)
             || verify && !app
-            || rom && (count != 2048 || config != 0x401000)
+            || rom
+                && (!(512..=2048).contains(&count)
+                    || !count.is_multiple_of(512)
+                    || config != 0x401000)
             || !rom && self.get(0x8a8) != 0x100000
         {
             return Err("unsupported NAND receive DMA setup or interrupt mode".into());
@@ -201,7 +204,7 @@ impl NandController {
         let page = self.medium.options().page_bytes;
         if count == 0
             || count > self.scratch.len()
-            || count % page != 0
+            || !count.is_multiple_of(page)
             || (row as u64) * page as u64 + count as u64 > self.medium.options().bytes
         {
             return Err("NAND program extent exceeds medium".into());
@@ -214,7 +217,7 @@ impl NandController {
             if !matches!(config, 0x80301000 | 0x80401000)
                 || self.get(0x804) != 0x10001
                 || self.get(0x828) != 0x100000
-                || source % if config == 0x80401000 { 64 } else { 32 } != 0
+                || !source.is_multiple_of(if config == 0x80401000 { 64 } else { 32 })
             {
                 return Err("unsupported NAND transmit DMA setup".into());
             }
@@ -244,7 +247,7 @@ impl NandController {
             (0x802064, 0x00107001),
         ];
         if sector > 3
-            || column % 0x210 != 0
+            || !column.is_multiple_of(0x210)
             || setups[sector] != (command, self.get(0x1c))
             || self.get(0x5c) != 0x1010
             || self.get(0x18) != 0x8093
@@ -356,7 +359,7 @@ impl NandController {
                         || (row % 32) as usize + units > 32
                         || self.get(0x20) != ((row << 8) & 0xffff00)
                         || self.get(0x24) != (row >> 16) & 255)
-                || !small && (units % 4 != 0 || self.get(0x20) != 0)
+                || !small && (!units.is_multiple_of(4) || self.get(0x20) != 0)
             {
                 return Err("unsupported NAND program setup".into());
             }
@@ -556,10 +559,14 @@ impl NandController {
     }
 }
 impl Device for NandController {
-    fn nand_store(&self) -> Option<&(dyn fujimod_emulator_devices::capability::NandStore + 'static)> {
+    fn nand_store(
+        &self,
+    ) -> Option<&(dyn fujimod_emulator_devices::capability::NandStore + 'static)> {
         Some(self)
     }
-    fn nand_store_mut(&mut self) -> Option<&mut (dyn fujimod_emulator_devices::capability::NandStore + 'static)> {
+    fn nand_store_mut(
+        &mut self,
+    ) -> Option<&mut (dyn fujimod_emulator_devices::capability::NandStore + 'static)> {
         Some(self)
     }
     fn checkpoint(&self) -> Result<fujimod_emulator_devices::checkpoint::Checkpoint, String> {
@@ -577,7 +584,10 @@ impl Device for NandController {
         )?
         .with_children(vec![self.medium.checkpoint()?]))
     }
-    fn validate_checkpoint(&self, saved: &fujimod_emulator_devices::checkpoint::Checkpoint) -> Result<(), String> {
+    fn validate_checkpoint(
+        &self,
+        saved: &fujimod_emulator_devices::checkpoint::Checkpoint,
+    ) -> Result<(), String> {
         let state: (
             Box<[u32]>,
             Vec<u8>,
@@ -599,7 +609,10 @@ impl Device for NandController {
         }
         Ok(())
     }
-    fn restore_checkpoint(&mut self, saved: &fujimod_emulator_devices::checkpoint::Checkpoint) -> Result<(), String> {
+    fn restore_checkpoint(
+        &mut self,
+        saved: &fujimod_emulator_devices::checkpoint::Checkpoint,
+    ) -> Result<(), String> {
         self.validate_checkpoint(saved)?;
         let (regs, aperture, scratch, pending, jobs_started, staged, cache): (
             Box<[u32]>,
@@ -623,10 +636,10 @@ impl Device for NandController {
 
     fn fingerprint(&self) -> Result<serde_json::Value, String> {
         Ok(
-            serde_json::json!({"medium":self.medium.fingerprint(),"registers":&*self.regs,
-            "aperture":fujimod_emulator_devices::fingerprint::bytes(&self.aperture),"scratch":fujimod_emulator_devices::fingerprint::bytes(&self.scratch),
+            serde_json::json!({"medium":self.medium.state(),"registers":&*self.regs,
+            "aperture":fujimod_emulator_devices::state::bytes(&self.aperture),"scratch":fujimod_emulator_devices::state::bytes(&self.scratch),
             "pending":self.pending,"jobs_started":self.jobs_started,"staged":self.staged,"cache":self.cache.as_ref().map(|c|
-                serde_json::json!({"row":c.row,"sector":c.sector,"metadata":c.metadata,"data":fujimod_emulator_devices::fingerprint::bytes(&c.data)}))}),
+                serde_json::json!({"row":c.row,"sector":c.sector,"metadata":c.metadata,"data":fujimod_emulator_devices::state::bytes(&c.data)}))}),
         )
     }
     fn name(&self) -> &'static str {
@@ -709,10 +722,10 @@ impl Device for NandController {
                         self.set(4, self.get(4) & !4);
                         self.set(0x810, 0);
                         self.set(0x890, 0);
-                    } else if value & 0x800000 != 0 {
-                        if let Err(error) = self.start(cx, value) {
-                            cx.fail(error);
-                        }
+                    } else if value & 0x800000 != 0
+                        && let Err(error) = self.start(cx, value)
+                    {
+                        cx.fail(error);
                     }
                 }
             }
@@ -722,12 +735,11 @@ impl Device for NandController {
         self.pending.map(|p| p.due)
     }
     fn advance(&mut self, cx: &mut Cx<'_>) {
-        if let Some(p) = self.pending {
-            if p.due <= cx.now() {
-                if let Err(error) = self.complete(cx, p) {
-                    cx.fail(error);
-                }
-            }
+        if let Some(p) = self.pending
+            && p.due <= cx.now()
+            && let Err(error) = self.complete(cx, p)
+        {
+            cx.fail(error);
         }
     }
     fn pollable(&self, address: u64, size: u8) -> bool {
@@ -744,7 +756,10 @@ impl fujimod_emulator_devices::capability::NandStore for NandController {
     fn medium(&self) -> &fujimod_emulator_devices::parts::nand::Nand {
         NandController::medium(self)
     }
-    fn retain(&mut self, medium: fujimod_emulator_devices::parts::nand::Nand) -> std::result::Result<(), String> {
+    fn retain(
+        &mut self,
+        medium: fujimod_emulator_devices::parts::nand::Nand,
+    ) -> std::result::Result<(), String> {
         NandController::retain(self, medium)
     }
 }

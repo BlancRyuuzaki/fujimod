@@ -1,7 +1,8 @@
-//! An external SDHC medium. Capacity and identity are declared inputs;
+//! An external block-addressed SDHC or SDXC medium. Capacity is a declared input;
 //! missing sectors contain zeros. Media outlives controller resets.
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub mod faults;
 
@@ -12,24 +13,36 @@ pub struct Options {
     pub sectors: u32,
     pub max_dirty_sectors: usize,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Card {
     sectors: u32,
     max_dirty: usize,
     #[serde(with = "sector_bytes")]
-    data: BTreeMap<u32, Vec<u8>>,
+    data: BTreeMap<u32, Arc<[u8]>>,
     revision: u64,
 }
 
 mod sector_bytes {
     use super::*;
+    use serde::de::{MapAccess, Visitor};
+    use serde::ser::SerializeMap;
+
+    struct Bytes<'a>(&'a [u8]);
+    impl serde::Serialize for Bytes<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.serialize_bytes(self.0)
+        }
+    }
+    struct Sector(Arc<[u8]>);
+    impl<'de> serde::Deserialize<'de> for Sector {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            crate::checkpoint::shared_bytes::deserialize(deserializer).map(Self)
+        }
+    }
     pub fn serialize<S: serde::Serializer>(
-        sectors: &BTreeMap<u32, Vec<u8>>,
+        sectors: &BTreeMap<u32, Arc<[u8]>>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        #[derive(Serialize)]
-        struct Bytes<'a>(#[serde(with = "crate::checkpoint::bytes")] &'a [u8]);
         let mut map = serializer.serialize_map(Some(sectors.len()))?;
         for (address, bytes) in sectors {
             map.serialize_entry(address, &Bytes(bytes))?;
@@ -38,37 +51,43 @@ mod sector_bytes {
     }
     pub fn deserialize<'de, D: serde::Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<BTreeMap<u32, Vec<u8>>, D::Error> {
-        BTreeMap::deserialize(deserializer)
+    ) -> Result<BTreeMap<u32, Arc<[u8]>>, D::Error> {
+        struct Sectors;
+        impl<'de> Visitor<'de> for Sectors {
+            type Value = BTreeMap<u32, Arc<[u8]>>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("SD sector map")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut sectors = BTreeMap::new();
+                while let Some((address, Sector(bytes))) = map.next_entry::<u32, Sector>()? {
+                    sectors.insert(address, bytes);
+                }
+                Ok(sectors)
+            }
+        }
+        deserializer.deserialize_map(Sectors)
     }
 }
 impl Card {
-    pub fn fingerprint(&self) -> serde_json::Value {
-        use sha2::{Digest, Sha256};
+    pub fn state(&self) -> serde_json::Value {
         let Self {
             sectors,
             max_dirty,
             data,
             revision,
         } = self;
-        let mut hash = Sha256::new();
-        hash.update(b"sd-card-sectors-le-v1\0");
-        hash.update((data.len() as u64).to_le_bytes());
-        for (lba, bytes) in data {
-            hash.update(lba.to_le_bytes());
-            hash.update((bytes.len() as u64).to_le_bytes());
-            hash.update(bytes);
-        }
         serde_json::json!({"sectors":sectors,"max_dirty":max_dirty,"revision":revision,
-            "dirty_sectors":data.len(),"data":{"encoding":"sparse-sectors-le-v1","sha256":format!("{:x}",hash.finalize())}})
+            "dirty_sectors":data.len(),"data":data.iter().map(|(lba, bytes)|
+                (lba, crate::state::bytes(bytes))).collect::<Vec<_>>()})
     }
     pub fn new(options: Options) -> Result<Self, String> {
-        if !(0x400000..=0x4000000).contains(&options.sectors)
+        if !(0x400000..=0xfffffc00).contains(&options.sectors)
             || !options.sectors.is_multiple_of(1024)
             || !(1..=1 << 21).contains(&options.max_dirty_sectors)
         {
             return Err(
-                "SDHC requires 2..32 GiB in 1024-sector units and a bounded sparse allocation"
+                "SDHC/SDXC requires 2 GiB to below 2 TiB in 1024-sector units and a bounded sparse allocation"
                     .into(),
             );
         }
@@ -129,7 +148,7 @@ impl Card {
     pub fn nonzero_sectors(&self) -> impl Iterator<Item = (u32, &[u8])> {
         self.data
             .iter()
-            .map(|(&lba, bytes)| (lba, bytes.as_slice()))
+            .map(|(&lba, bytes)| (lba, bytes.as_ref()))
     }
     pub fn dirty_sectors(&self) -> usize {
         self.data.len()
@@ -150,7 +169,7 @@ impl Card {
             return Err("SD sector beyond card capacity".into());
         }
         static ZERO: [u8; SECTOR] = [0; SECTOR];
-        Ok(self.data.get(&lba).map_or(&ZERO, Vec::as_slice))
+        Ok(self.data.get(&lba).map_or(&ZERO[..], |bytes| bytes.as_ref()))
     }
     pub fn read_bytes(&self, offset: u64, out: &mut [u8]) -> Result<(), String> {
         self.byte_range(offset, out.len())?;
@@ -219,10 +238,7 @@ impl Card {
             if block.iter().all(|b| *b == 0) {
                 self.data.remove(&lba);
             } else {
-                self.data
-                    .entry(lba)
-                    .or_insert_with(|| vec![0; SECTOR])
-                    .copy_from_slice(&block);
+                self.data.insert(lba, Arc::from(&block[..]));
             }
         }
         self.revision = revision;
@@ -248,32 +264,44 @@ impl Card {
 mod tests {
     use super::*;
     #[test]
-    fn fingerprint_bounds_sparse_bytes_and_retains_addresses_content_and_metadata() {
+    fn sdxc_medium_retains_high_block_addresses() {
+        let mut card = Card::new(Options {
+            sectors: 0x10000000,
+            max_dirty_sectors: 2,
+        })
+        .unwrap();
+        card.write_bytes((0x10000000u64 - 1) * 512, &[0xa5; 512])
+            .unwrap();
+        assert_eq!(card.sector(0x0fffffff).unwrap(), &[0xa5; 512]);
+        assert!(card.sector(0x10000000).is_err());
+        card.validate().unwrap();
+    }
+    #[test]
+    fn state_retains_addresses_content_and_metadata() {
         let mut a = Card::new(Options {
             sectors: 0x800000,
             max_dirty_sectors: 4096,
         })
         .unwrap();
         a.write_bytes(512, &vec![0xa5; 2 * 1024 * 1024]).unwrap();
-        let identity = a.fingerprint();
-        assert!(serde_json::to_vec(&identity).unwrap().len() < 350);
-        assert_eq!(a.fingerprint(), identity);
+        let identity = a.clone();
+        assert_eq!(a, identity);
         let mut b = a.clone();
-        b.data.get_mut(&1).unwrap()[511] ^= 1;
-        assert_ne!(b.fingerprint(), identity);
+        Arc::make_mut(b.data.get_mut(&1).unwrap())[511] ^= 1;
+        assert_ne!(b, identity);
         b = a.clone();
         let bytes = b.data.remove(&1).unwrap();
         b.data.insert(4097, bytes);
-        assert_ne!(b.fingerprint(), identity);
+        assert_ne!(b, identity);
         b = a.clone();
         b.revision += 1;
-        assert_ne!(b.fingerprint(), identity);
+        assert_ne!(b, identity);
         b = a.clone();
         b.max_dirty += 1;
-        assert_ne!(b.fingerprint(), identity);
+        assert_ne!(b, identity);
         b = a.clone();
         b.sectors += 1024;
-        assert_ne!(b.fingerprint(), identity);
+        assert_ne!(b, identity);
     }
     #[test]
     fn sector_checkpoint_uses_bulk_bytes_without_changing_card_identity() {
@@ -289,6 +317,8 @@ mod tests {
         assert!(saved.bytes() < 1200);
         let mut restored: Card = saved.decode("card").unwrap();
         assert_eq!(serde_json::to_value(&restored).unwrap(), before);
+        let from_json: Card = serde_json::from_value(before.clone()).unwrap();
+        assert_eq!(from_json, card);
         let mut actual = vec![0; 1024];
         restored.read_bytes(512, &mut actual).unwrap();
         assert_eq!(actual, payload);
@@ -323,10 +353,10 @@ mod tests {
         })
         .unwrap();
         card.write_bytes(0, &[0x46; 1024]).unwrap();
-        let before = card.fingerprint();
+        let before = card.clone();
         for limit in [0, 1, (1 << 21) + 1] {
             assert!(card.set_allocation_limit(limit).is_err());
-            assert_eq!(card.fingerprint(), before);
+            assert_eq!(card, before);
         }
         let revision = card.revision();
         card.set_allocation_limit(8).unwrap();

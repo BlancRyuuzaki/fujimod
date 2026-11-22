@@ -14,6 +14,9 @@ pub mod persistent_inputs;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const SETTINGS_SCHEMA_URI: &str = "https://fujimod.com/schemas/settings.generated.schema.json";
+/// Leading bytes of each copy of a copied profile record: its little-endian
+/// copy number.
+pub const COPY_NUMBER_BYTES: u64 = 4;
 
 /// Located settings bank and named settings for one firmware.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,7 +139,7 @@ impl SectionLength {
     }
 }
 
-/// The stock user profile: a sixteen-byte header kept by the power controller
+/// The stock user profile: a header kept by the power controller
 /// and journal records in managed flash blocks. Firmware that finds no valid
 /// header and records resets the profile to its defaults at startup.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,9 +151,19 @@ impl SectionLength {
     tsify(hashmap_as_object, missing_as_null)
 )]
 pub struct SettingsProfile {
-    /// Stock header defaults. Byte 14 is the marker `0xaa`; byte 15 holds the
-    /// checksum that makes the sixteen bytes sum to zero.
+    /// Stock eight- or sixteen-byte header. The last two bytes hold marker
+    /// `0xaa` and the checksum that makes the header sum to zero.
     pub header: UpdateRange,
+    /// X-Processor 4 only: the header's offset in the boot loader's handoff
+    /// block. Absent for X-Processor Pro, whose header goes to sub-CPU
+    /// registers.
+    #[serde(default)]
+    pub loader_offset: Option<u64>,
+    /// First 16-bit register of the header on a checksum SPI power controller.
+    /// The header fills one register per two bytes: four registers for an
+    /// eight-byte header, eight for a sixteen-byte one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_register: Option<u8>,
     /// Journal records the stock loader requires, by name.
     pub records: BTreeMap<String, ProfileRecord>,
     /// Fields initialized from the calibration bank or a declared fill.
@@ -234,7 +247,7 @@ pub struct ConfigurationWindow {
     pub flash_offset: u64,
     /// Window length in bytes.
     pub bytes: u64,
-    /// Lowercase hexadecimal SHA-256 of the window.
+    /// Build/cache identity of the window; unused when loading settings.
     pub sha256: String,
     /// The stock copy that fills the configuration store from this window.
     pub basis: String,
@@ -266,6 +279,11 @@ pub struct ProfileRecord {
     pub parity_offset: u64,
     /// Bytes every valid record carries outside the defaults.
     pub fields: Vec<SettingsField>,
+    /// Sealed copies the stock formatter writes back to back from the start
+    /// of the block, each with its copy number in its first four bytes
+    /// (little-endian). Absent for a single copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copies: Option<u8>,
 }
 
 /// A method-4 encoded section of the installed flash image.
@@ -283,7 +301,7 @@ pub struct SettingsSource {
     pub address: u64,
     /// Decoded length in bytes.
     pub size: u64,
-    /// Lowercase hexadecimal SHA-256 of the decoded section.
+    /// Build/cache identity of the decoded section; unused when loading settings.
     pub sha256: String,
 }
 
@@ -310,7 +328,7 @@ pub struct SettingsBank {
     pub bytes: u64,
 }
 
-/// Bytes at a firmware address in the decoded update, identified by SHA-256.
+/// A bounded range at a firmware address in the decoded update.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -323,7 +341,7 @@ pub struct UpdateRange {
     pub address: u64,
     /// Length in bytes.
     pub size: u64,
-    /// Lowercase hexadecimal SHA-256 of the stock bytes.
+    /// Build/cache identity of the stock bytes; unused when loading settings.
     pub sha256: String,
 }
 
@@ -382,7 +400,6 @@ impl FirmwareSettings {
                 if window.bytes == 0
                     || window.flash_offset.checked_add(window.bytes).is_none()
                     || window.basis.is_empty()
-                    || !hex_digest(&window.sha256)
                     || self.defaults.is_some()
                     || !self.fields.is_empty()
                     || !self.sections.is_empty()
@@ -395,6 +412,9 @@ impl FirmwareSettings {
                 }
                 window.bytes
             }
+            // X-Processor 4 RAM journal profile: no flash bank, no configuration
+            // window. The header and journal records live in CPU-virtual RAM.
+            (None, None) => 0,
             _ => return fail("settings need exactly one bank or configuration window"),
         };
         let source_end = self.source.address.checked_add(self.source.size);
@@ -420,10 +440,7 @@ impl FirmwareSettings {
             {
                 return fail("stock range outside the source section");
             }
-            if range.size == 0
-                || range.address.checked_add(range.size).is_none()
-                || !hex_digest(&range.sha256)
-            {
+            if range.size == 0 || range.address.checked_add(range.size).is_none() {
                 return fail("invalid update range");
             }
         }
@@ -437,11 +454,24 @@ impl FirmwareSettings {
         // Store extents, each with the offsets its fields and settings occupy.
         let mut stores: BTreeMap<&str, (u64, BTreeSet<u64>)> = BTreeMap::new();
         stores.insert("bank", (bank_bytes, BTreeSet::new()));
+        if self.bank.is_none() && self.configuration.is_none() {
+            // X-Processor 4: the RAM configuration store the stock initializer
+            // zero-fills (0x480000 bytes) and repopulates from the defaults
+            // table. A profile layout names it for configuration-byte settings
+            // such as the debug gate; the profile builder does not place it.
+            stores.insert("ram", (0x48_0000, BTreeSet::new()));
+        }
         if let Some(profile) = profile {
-            if profile.header.size != 16 {
-                return fail("profile header is not sixteen bytes");
+            let size = profile.header.size;
+            if !matches!(size, 8 | 16) {
+                return fail("profile header must contain eight or sixteen bytes");
             }
-            stores.insert("header", (14, BTreeSet::new()));
+            if let Some(register) = profile.power_register
+                && u64::from(register) + size / 2 > 256
+            {
+                return fail("profile header does not fit its checksum SPI registers");
+            }
+            stores.insert("header", (size - 2, BTreeSet::new()));
             for (name, record) in &profile.records {
                 let parity_bytes = (record.parity_offset / 4).div_ceil(8);
                 if name.is_empty()
@@ -452,6 +482,13 @@ impl FirmwareSettings {
                     || record.bytes > 0x10_0000
                 {
                     return fail("profile record name, defaults or parity outside the record");
+                }
+                if record.copies.is_some_and(|copies| {
+                    !(2..=8).contains(&copies)
+                        || record.defaults_offset < COPY_NUMBER_BYTES
+                        || record.fields.iter().any(|f| f.offset < COPY_NUMBER_BYTES)
+                }) {
+                    return fail("profile record copies overlap their copy number");
                 }
                 stores.insert(name, (record.parity_offset, BTreeSet::new()));
             }
@@ -482,11 +519,19 @@ impl FirmwareSettings {
                 }
             }
         }
+        // A copied record's copy number is written per copy, never by a field.
+        let numbered = |store: &str, offset: u64| {
+            offset < COPY_NUMBER_BYTES
+                && profile
+                    .and_then(|p| p.records.get(store))
+                    .is_some_and(|record| record.copies.is_some())
+        };
         for (name, setting) in &self.settings {
             let mut sizes = setting.values.values().map(Vec::len);
             let size = sizes.next().unwrap_or(0);
             if name.is_empty()
                 || !sizes.all(|other| other == size)
+                || numbered(&setting.store, setting.offset)
                 || !place(&mut stores, &setting.store, setting.offset, size)
             {
                 return fail("named setting is empty, uneven, unstored or overlaps a field");
@@ -501,6 +546,7 @@ impl FirmwareSettings {
             };
             if field.store == "bank"
                 || field.basis.is_empty()
+                || numbered(&field.store, field.offset)
                 || !within(field.offset, field.bytes, *extent)
             {
                 return fail("derived field outside its profile store");
@@ -558,14 +604,6 @@ impl FirmwareSettings {
         }
         Ok(())
     }
-}
-
-/// A lowercase hexadecimal SHA-256.
-fn hex_digest(digest: &str) -> bool {
-    digest.len() == 64
-        && digest
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 #[cfg(test)]

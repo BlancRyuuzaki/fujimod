@@ -78,14 +78,6 @@
   color: var(--faint);
 }
 
-/* The same 4px track as the emulator's loading bar. */
-.progress-row .bar {
-  display: flex;
-  gap: 2px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
 /* Bodies a contributor owns: a 1px outline 2px outside the track, following its rounded ends. */
 .progress-row.owned .bar {
   position: relative;
@@ -100,76 +92,56 @@
   box-sizing: border-box;
   pointer-events: none;
 }
-.progress-row .phase {
+.progress-row .progress-bar {
   position: relative;
-  flex: var(--w) 1 0;
   padding: 7px 0 9px; /* hit target taller than the mark */
   outline: none;
 }
 .progress-row .track {
-  position: relative;
+  display: flex;
+  gap: 2px;
   height: 4px;
   border-radius: 2px;
-  background: rgb(118 118 128 / 24%);
-  overflow: hidden;
   transition: opacity 120ms;
 }
-/* A segment of separately graded features: one cell each, filled by its share. */
-.progress-row .track.cells {
-  display: flex;
-  gap: 1px;
-  background: none;
-}
-.progress-row .cell {
-  position: relative;
-  flex: 1 1 0;
+.progress-row .track:empty,
+.progress-row .track-group {
   background: rgb(118 118 128 / 24%);
+}
+.progress-row .track-group {
+  flex: var(--outcomes) 1 0px;
+  min-width: 0;
+  border-radius: 2px;
   overflow: hidden;
 }
-.progress-row .cell::after {
-  content: '';
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: var(--p);
-  background: var(--c);
-  transition: filter 120ms;
-}
-.progress-row .phase.open .cell::after {
-  filter: brightness(1.2);
-}
 .progress-row .fill {
-  position: absolute;
-  inset: 0 auto 0 0;
   width: var(--p);
+  height: 100%;
   background: var(--c);
-  transition: filter 120ms;
 }
 .progress-row .bar:has(.open) .track {
   opacity: 0.45;
 }
-.progress-row .phase.open .track {
+.progress-row .progress-bar.open .track {
   opacity: 1;
 }
-.progress-row .phase.open .fill {
+.progress-row .progress-bar.open .fill {
   filter: brightness(1.2);
 }
-.progress-row .phase:focus-visible .track {
+.progress-row .progress-bar:focus-visible .track {
   outline: 2px solid var(--blue);
   outline-offset: 2px;
 }
 
 .progress-row .tip {
   position: absolute;
-  z-index: 2;
+  z-index: 50;
   bottom: calc(100% + 22px); /* clears this row's name and status */
   left: 50%;
-  width: 240px;
-  translate: -50% 0;
-  padding: 10px 12px 11px;
+  width: min(240px, calc(100vw - 16px));
+  translate: calc(-50% + var(--tip-shift-x, 0px)) var(--tip-shift-y, 0px);
   border-radius: 12px;
-  background: rgb(44 44 46 / 97%);
-  -webkit-backdrop-filter: blur(20px) saturate(1.6);
-  backdrop-filter: blur(20px) saturate(1.6);
+  background: var(--key2);
   box-shadow:
     0 0 0 0.5px rgb(255 255 255 / 12%) inset,
     0 10px 30px rgb(0 0 0 / 55%);
@@ -177,11 +149,28 @@
   line-height: 1.45;
   opacity: 0;
   visibility: hidden;
+  pointer-events: none;
   transform: translateY(4px);
   transition:
     opacity 140ms,
     transform 140ms,
     visibility 0s 140ms;
+}
+@media (max-width: 600px) {
+  /* A hidden, off-screen tip still widens the document in WebKit. */
+  .progress-row .progress-bar:not(.open) .tip {
+    display: none;
+  }
+}
+.progress-row .tip-scroll {
+  max-height: min(420px, calc(100dvh - 40px));
+  padding: 10px 12px 11px;
+  border-radius: inherit;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: rgb(255 255 255 / 28%) transparent;
 }
 .progress-row .tip::after {
   /* keeps the hover alive while the pointer crosses to the tip's links */
@@ -190,22 +179,17 @@
   inset: 100% 0 auto;
   height: 26px;
 }
-.progress-row .phase:first-child .tip {
-  left: 0;
-  translate: 0 0;
-}
-.progress-row .phase:last-child .tip {
-  left: auto;
-  right: 0;
-  translate: 0 0;
-}
-.progress-row .phase.open .tip {
+.progress-row .progress-bar.open .tip {
   opacity: 1;
   visibility: visible;
+  pointer-events: auto;
   transform: none;
   transition:
     opacity 140ms,
     transform 140ms;
+}
+.progress-row .tip-group + .tip-group {
+  margin-top: 10px;
 }
 .progress-row .tip .tip-label {
   display: flex;
@@ -248,11 +232,6 @@
   padding-left: 10px;
   color: var(--dim);
   font-variant-numeric: tabular-nums;
-}
-.progress-row .tip li.partial.todo::before {
-  content: '◐';
-  font-weight: 400;
-  color: var(--c);
 }
 .progress-row .tip li.todo {
   color: var(--dim);

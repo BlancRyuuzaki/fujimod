@@ -1,0 +1,92 @@
+{
+  "$schema": "https://fujimod.com/schemas/body.schema.json",
+  "schema": 1,
+  "id": "xh2s",
+  "soc_id": "xp5",
+  "dram_bytes": 2147483648,
+  "nand": null,
+  "sensor": null,
+  "lens": null,
+  "display": null,
+  "microcontroller": null,
+  "power_control": null,
+  "card_slot": null,
+  "control_bus_chips": [],
+  "connections": [
+    {
+      "id": "power-controller-bus",
+      "kind": "power-control",
+      "signals": []
+    },
+    {
+      "id": "power-controller-select",
+      "kind": "power-control",
+      "signals": [
+        {
+          "kind": "gpio",
+          "port": 15,
+          "pin": 15,
+          "active_level": true
+        }
+      ]
+    },
+    {
+      "id": "thermal-0",
+      "kind": "control",
+      "signals": [
+        {
+          "kind": "adc",
+          "channel": 0,
+          "threshold": null
+        }
+      ]
+    }
+  ],
+  "parts": [
+    "power-controller",
+    "xh2s-serial-nor"
+  ],
+  "wiring": [
+    {
+      "source_id": "spi8",
+      "target_id": "power-controller",
+      "signal": "serial_data"
+    },
+    {
+      "source_id": "flash",
+      "target_id": "xh2s-serial-nor",
+      "signal": "storage"
+    }
+  ],
+  "hardware": {
+    "serial_attachments": [
+      {
+        "part_id": "power-controller",
+        "controller_id": "spi8",
+        "connection_id": "power-controller-bus",
+        "select_connection_id": "power-controller-select"
+      }
+    ],
+    "gpio_feedback": [],
+    "keypad_samples": {},
+    "thermal_connection_ids": [
+      "thermal-0"
+    ],
+    "bus_drain": {
+      "address": 2147483648,
+      "processor_ids": [
+        "core0",
+        "core1",
+        "core2",
+        "core3"
+      ],
+      "basis": "The stock firmware drains the bus with a discarded read of the end of its first memory region: helper 0x17f1794 (slot 1) and classifier 0x17f15b0 read 0x80000000, where X-T5 and X-S20 read 0x60000000 and X100VI 0x68000000."
+    },
+    "profiles": {
+      "xh2s": {
+        "limits": [],
+        "dram_basis": "The stock bus-drain helpers split memory at 0x80000000; the first region ends there. Memory above it (0x80000000..0x98000000) is used by a debug-gated memory test at 0x306b1d4, so installed capacity is larger and unmeasured."
+      }
+    }
+  }
+}

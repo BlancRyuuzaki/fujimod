@@ -6,17 +6,20 @@ edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 publish.workspace = true
+license.workspace = true
 
 [lib]
 doctest = false
 
 [dependencies]
+ciborium = "0.2.2"
 fujimod-framebuffer.workspace = true
 fujimod-emulator.workspace = true
 fujimod-emulator-cpu.workspace = true
 fujimod-emulator-devices.workspace = true
 fujimod-emulator-exr2-resources.workspace = true
 fujimod-emulator-storage.workspace = true
+fujimod-perf.workspace = true
 fujimod-recording.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -27,6 +30,7 @@ wasm-bindgen.workspace = true
 fujimod-workspace-hack.workspace = true
 
 [dev-dependencies]
+fujimod-catalog-configuration.workspace = true
 fujimod-emulator-ip.workspace = true
 fujimod-emulator-imaging.workspace = true
 fujimod-emulator-exr2-images.workspace = true

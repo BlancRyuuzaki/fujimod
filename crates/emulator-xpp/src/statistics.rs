@@ -529,6 +529,19 @@ impl Device for Engine {
     fn name(&self) -> &'static str {
         "xpp-imaging-statistics"
     }
+    fn set_scene(&mut self, input: &Value) -> Result<bool, String> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Scene { light: f64 }
+
+        if self.scene.is_none() {
+            return Ok(false);
+        }
+        let scene: Scene = serde_json::from_value(input.clone())
+            .map_err(|error| format!("X-Processor Pro scene light: {error}"))?;
+        self.set_scene_light(scene.light)?;
+        Ok(true)
+    }
     fn read(&mut self, cx: &mut Cx<'_>, address: u64, size: u8) -> u64 {
         u64::from(match self.offset(address, size) {
             Some(0) => self.word(0) | RUN,
@@ -914,12 +927,11 @@ mod tests {
         let wall = [srgb(1015), srgb(764), srgb(577)];
         let levels: [u8; 3] = [wall[0], wall[1], wall[2]];
         let wall_pixels = || {
-            std::iter::repeat(levels)
-                .take(16)
-                .flat_map(|pixel| pixel)
+            std::iter::repeat_n(levels, 16)
+                .flatten()
                 .collect::<Vec<u8>>()
         };
-        let mut engine = || {
+        let engine = || {
             Engine::new(BASE, 106, 1000)
                 .unwrap()
                 .with_scene(sums)
@@ -940,10 +952,10 @@ mod tests {
         write(&mut stats, &mut h, BASE + ZONE_SUMS, 0x1000);
         write(&mut stats, &mut h, BASE + CONTROL, START);
         advance(&mut stats, &mut h, 1000);
-        for c in 0..3 {
+        for (c, &sum) in sums.iter().enumerate().take(3) {
             for zone in [0, 255] {
                 let value = word(&h, 0x1000 + 0x400 * c + 4 * zone);
-                let expected = f64::from(sums[c]);
+                let expected = f64::from(sum);
                 assert!(
                     (f64::from(value) - expected).abs() <= expected * 0.02,
                     "c{c} zone{zone}: {value} vs {expected}"

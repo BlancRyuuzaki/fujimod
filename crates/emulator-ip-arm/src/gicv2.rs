@@ -23,7 +23,13 @@ impl Gic {
         serde_json::to_value(self).unwrap()
     }
     pub fn restore(&mut self, value: &serde_json::Value) -> Result<(), String> {
-        let mut state: Self = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+        let state: Self = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+        self.validate_state(&state)?;
+        *self = state;
+        Ok(())
+    }
+
+    pub fn validate_state(&self, state: &Self) -> Result<(), String> {
         let vectors = [&state.enabled, &state.pending, &state.active];
         if state.cores != self.cores
             || state.lines != self.lines
@@ -55,12 +61,11 @@ impl Gic {
                 }
             }
         }
-        let eligible = state.eligible.clone();
-        state.refresh();
-        if state.eligible != eligible {
+        let mut recalculated = state.clone();
+        recalculated.refresh();
+        if recalculated.eligible != state.eligible {
             return Err("GIC checkpoint eligibility differs from its registers".into());
         }
-        *self = state;
         Ok(())
     }
     pub fn new(cores: usize, lines: usize) -> Self {
@@ -101,10 +106,8 @@ impl Gic {
         self.refresh();
     }
     pub fn pulse(&mut self, line: usize) {
-        if line < self.lines {
-            if line >= 32 {
-                self.pending[0][line] = true;
-            }
+        if line < self.lines && line >= 32 {
+            self.pending[0][line] = true;
         }
         self.refresh();
     }
@@ -176,7 +179,7 @@ impl Gic {
         write: bool,
         value: u32,
     ) -> Result<u32, String> {
-        if core >= self.cores || ![1, 2, 4].contains(&size) || offset % size != 0 {
+        if core >= self.cores || ![1, 2, 4].contains(&size) || !offset.is_multiple_of(size) {
             return Err("GIC access alignment/width".into());
         }
         if !distributor {
@@ -340,10 +343,8 @@ impl Gic {
                     } else {
                         core
                     };
-                    if write && value & (1 << bit) != 0 {
-                        if line >= 16 {
-                            array[b][line] = action % 2 == 0 || held;
-                        }
+                    if write && value & (1 << bit) != 0 && line >= 16 {
+                        array[b][line] = action % 2 == 0 || held;
                     }
                     if array[b][line] {
                         result |= 1 << bit;

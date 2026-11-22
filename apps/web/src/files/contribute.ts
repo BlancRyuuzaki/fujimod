@@ -1,4 +1,5 @@
-import { isShareUrl } from './share-url';
+import { resolveShareUrl } from './share-url';
+import { sharingBase, sharingUrl } from '../sharing-server';
 
 export interface ContributionFile {
   model: string;
@@ -23,13 +24,47 @@ interface Status {
 const failure = 'Upload failed. Your files are still on this device. Try again.';
 const partBytes = 8 * 1024 * 1024;
 
+interface ContributionInput {
+  id: string;
+  files: ContributionFile[];
+  manifest: unknown;
+  message: string;
+}
+
 /** The caller retains the ID and the same files until the contribution succeeds. */
 export async function contribute(
-  input: { id: string; files: ContributionFile[]; manifest: unknown; message: string },
+  input: ContributionInput,
   progress: (p: ContributionProgress) => void,
   signal?: AbortSignal,
 ): Promise<{ id: string; shareUrl: string }> {
-  const base = `https://share.fujimod.com/contributions/${encodeURIComponent(input.id)}`;
+  const result = await transferContribution(input, progress, signal);
+  if (!result.shareUrl) throw Error(failure);
+  return { id: result.id, shareUrl: result.shareUrl };
+}
+
+export async function uploadReportArchive(
+  id: string,
+  blob: Blob,
+  progress: (p: ContributionProgress) => void,
+) {
+  await transferContribution(
+    {
+      id,
+      files: [{ model: 'report', serial: 'report', name: 'report.zip', blob }],
+      manifest: null,
+      message: '',
+      reportArchive: true,
+    },
+    progress,
+  );
+}
+
+async function transferContribution(
+  input: ContributionInput & { reportArchive?: true },
+  progress: (p: ContributionProgress) => void,
+  signal?: AbortSignal,
+): Promise<{ id: string; shareUrl?: string }> {
+  const base = sharingUrl(`/contributions/${encodeURIComponent(input.id)}`);
   let done = 0;
   const total = input.files.reduce((sum, file) => sum + file.blob.size, 0);
   const update = () => progress({ done, total });
@@ -52,6 +87,7 @@ export async function contribute(
       '',
       'POST',
       JSON.stringify({
+        reportArchive: input.reportArchive,
         files: input.files.map(({ model, serial, name, blob }) => ({
           model,
           serial,
@@ -82,20 +118,19 @@ export async function contribute(
           continue;
         }
         const saved = new Map(started.parts.map((part) => [part.partNumber, part.bytes]));
-        const source = file.blob
-          .stream()
-          .pipeThrough(
-            new TransformStream<Uint8Array<ArrayBuffer>, Uint8Array<ArrayBuffer>>({
-              transform(chunk, controller) {
-                signal?.throwIfAborted();
-                done += chunk.byteLength;
-                update();
-                controller.enqueue(chunk);
-              },
-            }),
-          )
-          .pipeThrough(new CompressionStream('gzip'));
-        const reader = source.getReader();
+        const source = file.blob.stream().pipeThrough(
+          new TransformStream<Uint8Array<ArrayBuffer>, Uint8Array<ArrayBuffer>>({
+            transform(chunk, controller) {
+              signal?.throwIfAborted();
+              done += chunk.byteLength;
+              update();
+              controller.enqueue(chunk);
+            },
+          }),
+        );
+        const reader = (
+          input.reportArchive ? source : source.pipeThrough(new CompressionStream('gzip'))
+        ).getReader();
         const abort = () => {
           void reader.cancel(signal?.reason).catch(() => {});
         };
@@ -156,10 +191,11 @@ export async function contribute(
       if (receipt.id !== status.id) throw Error(failure);
       shareUrl = receipt.shareUrl;
     }
-    if (!isShareUrl(shareUrl)) throw Error(failure);
+    const link = input.reportArchive ? undefined : resolveShareUrl(shareUrl, sharingBase());
+    if (!input.reportArchive && !link) throw Error(failure);
     done = total;
     update();
-    return { id: status.id, shareUrl };
+    return { id: status.id, shareUrl: link };
   } catch (error) {
     signal?.throwIfAborted();
     throw Error(failure, { cause: error });

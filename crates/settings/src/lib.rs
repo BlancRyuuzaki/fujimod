@@ -20,11 +20,12 @@ pub struct Settings {
 /// The user profile: the power controller's header and the flash journal records.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Profile {
-    pub header: [u8; 16],
+    pub header: Vec<u8>,
     pub records: Vec<Record>,
 }
 
-/// A sealed journal record and its flash block.
+/// A sealed journal record and its flash block. A record the layout copies
+/// holds every sealed copy back to back, each numbered in its first bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record {
     pub bytes: Vec<u8>,
@@ -59,23 +60,23 @@ fn source(layout: &FirmwareSettings, flash: &[u8]) -> Result<Vec<u8>, String> {
         .and_then(|offset| flash.get(offset..))
         .ok_or("settings source section is outside the flash image")?;
     let (mut bytes, _) = fujimod_firmware::decompress(stream).map_err(|error| error.to_string())?;
-    bytes.truncate(section.size as usize);
-    if fujimod_firmware::sha256(&bytes) != section.sha256 {
-        return Err("settings source section differs from the layout".into());
+    let size = usize::try_from(section.size).map_err(|_| "settings source section is too large")?;
+    if bytes.len() < size {
+        return Err("settings source section is shorter than the layout".into());
     }
+    bytes.truncate(size);
     Ok(bytes)
 }
 
 fn read(section: &[u8], layout: &FirmwareSettings, range: &UpdateRange) -> Result<Vec<u8>, String> {
-    let start = (range.address - layout.source.address) as usize;
-    let bytes = section[start..start + range.size as usize].to_vec();
-    if fujimod_firmware::sha256(&bytes) != range.sha256 {
-        return Err(format!(
-            "stock bytes at {:#x} differ from the layout",
-            range.address
-        ));
-    }
-    Ok(bytes)
+    let bytes = range
+        .address
+        .checked_sub(layout.source.address)
+        .and_then(|offset| usize::try_from(offset).ok())
+        .zip(usize::try_from(range.size).ok())
+        .and_then(|(start, size)| section.get(start..start.checked_add(size)?))
+        .ok_or("stock range is outside the decoded source section")?;
+    Ok(bytes.to_vec())
 }
 
 fn word(bytes: &[u8], at: usize) -> u32 {
@@ -123,7 +124,19 @@ pub fn build(
         if camera.is_some() {
             return Err(format!("{} has no settings bank", layout.firmware_id));
         }
-        stores.insert("bank", configuration(layout, flash)?);
+        let bank_bytes = match &layout.configuration {
+            Some(_window) => configuration(layout, flash)?,
+            // X-Processor 4 RAM journal profile: no flash bank, the header and
+            // journal records live in CPU-virtual RAM. Empty bank store suffices
+            // for settings that reference header/record stores instead.
+            None => vec![],
+        };
+        stores.insert("bank", bank_bytes);
+        if layout.bank.is_none() && layout.configuration.is_none() {
+            // The RAM configuration store a profile layout may name for
+            // configuration-byte settings (the debug gate). Not placed.
+            stores.insert("ram", vec![0; 0x48_0000]);
+        }
         return profile(layout, &section, requested, stores, None);
     };
     let descriptor = read(&section, layout, &bank.descriptor)?;
@@ -180,9 +193,6 @@ fn configuration(layout: &FirmwareSettings, flash: &[u8]) -> Result<Vec<u8>, Str
         .zip(usize::try_from(window.bytes).ok())
         .and_then(|(start, size)| flash.get(start..start.checked_add(size)?))
         .ok_or("configuration window is outside the flash image")?;
-    if fujimod_firmware::sha256(bytes) != window.sha256 {
-        return Err("configuration window differs from the layout".into());
-    }
     Ok(bytes.to_vec())
 }
 
@@ -196,7 +206,7 @@ fn profile<'a>(
 ) -> Result<Settings, String> {
     if let Some(profile) = &layout.profile {
         let header = read(section, layout, &profile.header)?;
-        if header[14] != 0xaa {
+        if header[header.len() - 2] != 0xaa {
             return Err("stock profile header has no marker".into());
         }
         stores.insert("header", header);
@@ -258,14 +268,23 @@ fn profile<'a>(
     let profile = match &layout.profile {
         None => None,
         Some(located) => {
-            let mut header: [u8; 16] = stores["header"].clone().try_into().expect("sixteen bytes");
-            header[15] = header[..15].iter().fold(0u8, |sum, b| sum.wrapping_sub(*b));
+            let mut header = stores.remove("header").expect("validated profile header");
+            let checksum = header.len() - 1;
+            header[checksum] = header[..checksum].iter().fold(0u8, |sum, b| sum.wrapping_sub(*b));
             let mut records = Vec::new();
             for (name, record) in &located.records {
                 let mut bytes = stores.remove(name.as_str()).expect("record store");
-                seal_journal(&mut bytes, record.parity_offset as usize)?;
+                let copies = record.copies.map_or(1, u32::from);
+                let mut sealed = Vec::with_capacity(bytes.len() * copies as usize);
+                for copy in 0..copies {
+                    if record.copies.is_some() {
+                        put(&mut bytes, 0, &copy.to_le_bytes());
+                    }
+                    seal_journal(&mut bytes, record.parity_offset as usize)?;
+                    sealed.extend_from_slice(&bytes);
+                }
                 records.push(Record {
-                    bytes,
+                    bytes: sealed,
                     block: record.block,
                     managed_index: record.managed_index,
                 });

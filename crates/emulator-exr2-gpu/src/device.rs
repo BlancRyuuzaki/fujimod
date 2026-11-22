@@ -1,9 +1,9 @@
 //! Runtime connection for the vector engine: physical DMA, routed IRQs and
 //! exact completion deadlines. The peripheral has no processor capability.
-use super::{CommandProcessor, IRQ, Inputs, Profile, recording};
-use fujimod_emulator_devices::{Action, Cx, Device, Unsupported, bus::HostRequest};
+use super::{CommandProcessor, GlesLatency, IRQ, Inputs, Profile, recording};
+use fujimod_emulator_devices::{Action, Cx, Device, Unsupported, WordMap, bus::HostRequest};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 #[derive(Clone, Deserialize)]
@@ -28,9 +28,11 @@ pub struct Wiring {
     pub controllers: Vec<(usize, fujimod_emulator_devices::exr2::irq::Inputs)>,
 }
 pub struct VectorGpu {
+    publication_generation: u64,
     state: CommandProcessor,
     controllers: [Option<fujimod_emulator_devices::exr2::irq::Inputs>; 2],
     due: BTreeMap<u64, u64>,
+    due_order: BTreeSet<(u64, u64)>,
     recording: Option<recording::Recorder>,
     next_host_request: u64,
     host_request: Option<HostRequest>,
@@ -99,17 +101,19 @@ impl VectorGpu {
             })
             .transpose()?;
         Ok(Self {
+            publication_generation: 0,
             state,
             controllers,
             due: BTreeMap::new(),
+            due_order: BTreeSet::new(),
             recording,
             next_host_request: 0,
             host_request: None,
             host_request_published: false,
         })
     }
-    fn actions(&mut self, cx: &mut Cx<'_>, actions: Vec<Action>) -> Result<(), String> {
-        for action in actions {
+    fn actions(&mut self, cx: &mut Cx<'_>, actions: &mut Vec<Action>) -> Result<(), String> {
+        for action in actions.drain(..) {
             match action {
                 Action::Log(record) | Action::Record(record) => cx.record(record),
                 Action::QueueIrq(core, line) => cx.raise_irq(core.into(), line.into())?,
@@ -118,38 +122,40 @@ impl VectorGpu {
                         .now()
                         .checked_add(delay)
                         .ok_or("vector engine completion time overflow")?;
-                    if delay == 0 || self.due.insert(token, at).is_some() {
+                    if delay == 0 || self.due.contains_key(&token) {
                         return Err("invalid vector engine completion token".into());
                     }
+                    self.due.insert(token, at);
+                    self.due_order.insert((at, token));
                 }
             }
         }
         Ok(())
     }
     fn settle(&mut self, cx: &mut Cx<'_>) -> Result<(), String> {
-        let mut ready: Vec<_> = self
-            .due
-            .iter()
-            .filter(|(_, at)| **at <= cx.now())
-            .map(|(&token, &at)| (at, token))
-            .collect();
-        ready.sort_unstable();
-        for (_, token) in ready {
-            let (_, outputs) = self.state.output(token).map_err(|e| e.0)?;
-            for (address, bytes) in &outputs {
-                cx.ram_write(*address, bytes)?;
+        let now = cx.now();
+        let mut actions = Vec::new();
+        while let Some(&(at, token)) = self.due_order.first() {
+            if at > now {
+                break;
             }
-            if let Some(recording) = &mut self.recording {
-                recording
-                    .completion(cx.now(), token, &outputs)
-                    .map_err(|error| format!("could not write vector GPU recording: {error}"))?;
+            {
+                let outputs = self.state.output(token).map_err(|e| e.0)?;
+                for (address, bytes) in outputs {
+                    cx.ram_write(*address, bytes)?;
+                }
+                if let Some(recording) = &mut self.recording {
+                    recording.completion(now, token, outputs).map_err(|error| {
+                        format!("could not write vector GPU recording: {error}")
+                    })?;
+                }
             }
-            let mut actions = Vec::new();
             self.state
-                .complete(token, cx.now(), &mut actions)
+                .complete(token, now, &mut actions)
                 .map_err(|e| e.0)?;
             self.due.remove(&token);
-            self.actions(cx, actions)?;
+            self.due_order.remove(&(at, token));
+            self.actions(cx, &mut actions)?;
         }
         Ok(())
     }
@@ -253,16 +259,8 @@ impl Inputs for Connected<'_, '_> {
         result
     }
 }
-impl Device for VectorGpu {
-    fujimod_emulator_devices::checkpoint_fields!(state: CommandProcessor, due: BTreeMap<u64,u64>);
-    fn fingerprint(&self) -> std::result::Result<serde_json::Value, String> {
-        Ok(serde_json::json!({"engine":self.state,"deadlines":self.due}))
-    }
-
-    fn name(&self) -> &'static str {
-        "vector-gpu"
-    }
-    fn read(&mut self, cx: &mut Cx<'_>, address: u64, size: u8) -> u64 {
+impl VectorGpu {
+    fn read_published(&mut self, cx: &mut Cx<'_>, address: u64, size: u8) -> u64 {
         let now = cx.now();
         let cpu = cx.cpu as i64;
         if let Err(error) = self.settle(cx) {
@@ -293,7 +291,9 @@ impl Device for VectorGpu {
             }
         }
     }
-    fn write(&mut self, cx: &mut Cx<'_>, address: u64, size: u8, value: u64) {
+}
+impl VectorGpu {
+    fn write_published(&mut self, cx: &mut Cx<'_>, address: u64, size: u8, value: u64) {
         let now = cx.now();
         let cpu = cx.cpu as i64;
         if let Err(error) = self.settle(cx) {
@@ -375,7 +375,7 @@ impl Device for VectorGpu {
         }
         // A rejected hardware command does not acquire a completion or DMA.
         // Preserve any diagnostic records emitted before the refusal.
-        if let Err(error) = self.actions(cx, actions) {
+        if let Err(error) = self.actions(cx, &mut actions) {
             cx.fail(error);
             return;
         }
@@ -383,19 +383,229 @@ impl Device for VectorGpu {
             cx.unsupported(reason);
         }
     }
-    fn pollable(&self, address: u64, size: u8) -> bool {
-        self.state.read(address, size.into()).is_ok()
-    }
-    fn next_deadline(&self, _now: u64) -> Option<u64> {
-        self.due.values().copied().min()
-    }
-    fn advance(&mut self, cx: &mut Cx<'_>) {
+}
+impl VectorGpu {
+    fn advance_published(&mut self, cx: &mut Cx<'_>) {
         if self
             .next_deadline(cx.now())
             .is_some_and(|at| at <= cx.now())
             && let Err(error) = self.settle(cx)
         {
             cx.fail(error);
+        }
+    }
+}
+impl VectorGpu {
+    fn complete_host_request_published(
+        &mut self,
+        cx: &mut Cx<'_>,
+        id: u64,
+        result: &[u8],
+    ) -> Result<(), String> {
+        if self
+            .host_request
+            .as_ref()
+            .is_none_or(|request| request.id != id || !self.host_request_published)
+        {
+            return Err("Vector WebGPU result has no matching published request".into());
+        }
+        let mut actions = Vec::new();
+        self.state
+            .complete_webgpu_request(id, result, &mut actions)
+            .map_err(|error| error.0)?;
+        self.host_request = None;
+        self.host_request_published = false;
+        self.actions(cx, &mut actions)
+    }
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Saved {
+    state: CommandProcessor,
+    due: BTreeMap<u64, u64>,
+    due_order: BTreeSet<(u64, u64)>,
+}
+#[derive(PartialEq, serde::Serialize)]
+struct PublishedJob {
+    id: u64,
+    revision: u64,
+    fields: super::JobFields,
+}
+#[derive(PartialEq, serde::Serialize)]
+struct Publication {
+    gles: fujimod_emulator_ip_dmp::gles::Publication,
+    last_job: Option<PublishedJob>,
+    pending_completions: usize,
+    #[serde(skip)]
+    deadlines: BTreeMap<u64, u64>,
+    cpu_raster_calls: u64,
+    cpu_vector_paint_calls: u64,
+    gpu_gles_lists: u64,
+    gpu_vector_paint_calls: u64,
+    regs: WordMap,
+    path: WordMap,
+    fill: WordMap,
+    written: BTreeSet<u32>,
+    clear_ack_offsets: BTreeSet<u32>,
+    command_pending: Option<(i64, Vec<u32>)>,
+    busy: bool,
+    jobs_started: i64,
+    jobs_completed: i64,
+    bytes_completed: i64,
+    irqs_raised: i64,
+    acknowledgments: i64,
+    ram_bytes: u64,
+    max_fill_bytes: u64,
+    max_copy_bytes: u64,
+    max_command_capture_bytes: u64,
+    max_clear_bytes: u64,
+    bytes_per_tick: u64,
+    copy_bytes_per_tick: u64,
+    gles_latency: GlesLatency,
+    gles_latency_ticks: u64,
+    gles_byte_rate_ticks: u64,
+    copy_profile: Option<Profile>,
+    clear_profile: Option<Profile>,
+    next_token: u64,
+    next_job: u64,
+}
+impl VectorGpu {
+    fn publication_state(&self) -> Publication {
+        let s = &self.state;
+        Publication {
+            gles: s.gles.publication_state(),
+            last_job: s.last_job.as_ref().map(|job| PublishedJob {
+                id: job.id,
+                revision: job.revision,
+                fields: job.fields.clone(),
+            }),
+            pending_completions: s.completions.len(),
+            deadlines: self.due.clone(),
+            cpu_raster_calls: s.cpu_raster_calls,
+            cpu_vector_paint_calls: s.cpu_vector_paint_calls,
+            gpu_gles_lists: s.gpu_gles_lists,
+            gpu_vector_paint_calls: s.gpu_vector_paint_calls,
+            regs: s.regs.clone(),
+            path: s.path.clone(),
+            fill: s.fill.clone(),
+            written: s.written.clone(),
+            clear_ack_offsets: s.clear_ack_offsets.clone(),
+            command_pending: s.command_pending.clone(),
+            busy: s.busy,
+            jobs_started: s.jobs_started,
+            jobs_completed: s.jobs_completed,
+            bytes_completed: s.bytes_completed,
+            irqs_raised: s.irqs_raised,
+            acknowledgments: s.acknowledgments,
+            ram_bytes: s.ram_bytes,
+            max_fill_bytes: s.max_fill_bytes,
+            max_copy_bytes: s.max_copy_bytes,
+            max_command_capture_bytes: s.max_command_capture_bytes,
+            max_clear_bytes: s.max_clear_bytes,
+            bytes_per_tick: s.bytes_per_tick,
+            copy_bytes_per_tick: s.copy_bytes_per_tick,
+            gles_latency: s.gles_latency,
+            gles_latency_ticks: s.gles_latency_ticks,
+            gles_byte_rate_ticks: s.gles_byte_rate_ticks,
+            copy_profile: s.copy_profile,
+            clear_profile: s.clear_profile,
+            next_token: s.next_token,
+            next_job: s.next_job,
+        }
+    }
+}
+
+impl Device for VectorGpu {
+    fn publication_generation(&self) -> Option<u64> {
+        Some(self.publication_generation)
+    }
+    fn checkpoint(&self) -> Result<fujimod_emulator_devices::checkpoint::Checkpoint, String> {
+        #[derive(serde::Serialize)]
+        struct Snapshot<'a> {
+            state: &'a CommandProcessor,
+            due: &'a BTreeMap<u64, u64>,
+            due_order: &'a BTreeSet<(u64, u64)>,
+        }
+        fujimod_emulator_devices::checkpoint::Checkpoint::encode(
+            self.name(),
+            &Snapshot {
+                state: &self.state,
+                due: &self.due,
+                due_order: &self.due_order,
+            },
+        )
+    }
+    fn validate_checkpoint(
+        &self,
+        saved: &fujimod_emulator_devices::checkpoint::Checkpoint,
+    ) -> Result<(), String> {
+        let _: Saved = saved.decode(self.name())?;
+        if !saved.blobs().is_empty() {
+            return Err("device snapshot blob lengths differ".into());
+        }
+        Ok(())
+    }
+    fn restore_checkpoint(
+        &mut self,
+        saved: &fujimod_emulator_devices::checkpoint::Checkpoint,
+    ) -> Result<(), String> {
+        self.validate_checkpoint(saved)?;
+        let saved: Saved = saved.decode(self.name())?;
+        let before = self.publication_state();
+        self.state = saved.state;
+        self.due = saved.due;
+        self.due_order = saved.due_order;
+        if self.publication_state() != before {
+            self.publication_generation = self.publication_generation.wrapping_add(1);
+        }
+        Ok(())
+    }
+    fn fingerprint(&self) -> std::result::Result<serde_json::Value, String> {
+        Ok(
+            serde_json::json!({"engine":self.state,"deadlines":self.due,"deadline_order":self.due_order}),
+        )
+    }
+
+    fn name(&self) -> &'static str {
+        "vector-gpu"
+    }
+    fn read(&mut self, cx: &mut Cx<'_>, address: u64, size: u8) -> u64 {
+        if self
+            .next_deadline(cx.now())
+            .is_none_or(|due| due > cx.now())
+        {
+            return self.read_published(cx, address, size);
+        }
+        let before = self.publication_state();
+        let result = self.read_published(cx, address, size);
+        if self.publication_state() != before {
+            self.publication_generation = self.publication_generation.wrapping_add(1);
+        }
+        result
+    }
+    fn write(&mut self, cx: &mut Cx<'_>, address: u64, size: u8, value: u64) {
+        let before = self.publication_state();
+        self.write_published(cx, address, size, value);
+        if self.publication_state() != before {
+            self.publication_generation = self.publication_generation.wrapping_add(1);
+        }
+    }
+    fn pollable(&self, address: u64, size: u8) -> bool {
+        self.state.read(address, size.into()).is_ok()
+    }
+    fn next_deadline(&self, _now: u64) -> Option<u64> {
+        self.due_order.first().map(|(at, _)| *at)
+    }
+    fn advance(&mut self, cx: &mut Cx<'_>) {
+        if self
+            .next_deadline(cx.now())
+            .is_none_or(|due| due > cx.now())
+        {
+            return;
+        }
+        let before = self.publication_state();
+        self.advance_published(cx);
+        if self.publication_state() != before {
+            self.publication_generation = self.publication_generation.wrapping_add(1);
         }
     }
     fn take_host_request(&mut self) -> Option<HostRequest> {
@@ -415,46 +625,16 @@ impl Device for VectorGpu {
         id: u64,
         result: &[u8],
     ) -> Result<(), String> {
-        if self
-            .host_request
-            .as_ref()
-            .is_none_or(|request| request.id != id || !self.host_request_published)
-        {
-            return Err("Vector WebGPU result has no matching published request".into());
+        let before = self.publication_state();
+        let result = self.complete_host_request_published(cx, id, result);
+        if self.publication_state() != before {
+            self.publication_generation = self.publication_generation.wrapping_add(1);
         }
-        let mut actions = Vec::new();
-        self.state
-            .complete_webgpu_request(id, result, &mut actions)
-            .map_err(|error| error.0)?;
-        self.host_request = None;
-        self.host_request_published = false;
-        self.actions(cx, actions)
+        result
     }
     fn save(&self) -> serde_json::Value {
-        // Host presentation samples this on every continuation. Pending DMA
-        // pixels belong to the exact typed checkpoint and fingerprint, not
-        // the diagnostic JSON returned to a viewer.
-        let s = &self.state;
-        serde_json::json!({"engine":{
-            "gles":s.gles.diagnostics(),"regs":s.regs,"path":s.path,"fill":s.fill,"written":s.written,
-            "clear_ack_offsets":s.clear_ack_offsets,"command_pending":s.command_pending,
-            "busy":s.busy,"jobs_started":s.jobs_started,"jobs_completed":s.jobs_completed,
-            "bytes_completed":s.bytes_completed,"irqs_raised":s.irqs_raised,
-            "cpu_raster_calls":s.cpu_raster_calls,
-            "cpu_vector_paint_calls":s.cpu_vector_paint_calls,
-            "gpu_gles_lists":s.gpu_gles_lists,
-            "gpu_vector_paint_calls":s.gpu_vector_paint_calls,
-            "acknowledgments":s.acknowledgments,"last_job":s.last_job,
-            "ram_bytes":s.ram_bytes,"max_fill_bytes":s.max_fill_bytes,
-            "max_copy_bytes":s.max_copy_bytes,"max_clear_bytes":s.max_clear_bytes,
-            "max_command_capture_bytes":s.max_command_capture_bytes,
-            "bytes_per_tick":s.bytes_per_tick,
-            "copy_bytes_per_tick":s.copy_bytes_per_tick,"gles_latency":s.gles_latency,
-            "gles_latency_ticks":s.gles_latency_ticks,"gles_byte_rate_ticks":s.gles_byte_rate_ticks,
-            "copy_profile":s.copy_profile,
-            "clear_profile":s.clear_profile,"pending_completions":s.completions.len(),
-            "next_token":s.next_token,"next_job":s.next_job
-        },"deadlines":self.due})
+        // Publication excludes pending DMA pixels, retained by exact checkpoints.
+        serde_json::json!({"engine":self.publication_state(),"deadlines":self.due})
     }
 }
 

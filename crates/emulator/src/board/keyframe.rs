@@ -10,6 +10,7 @@ mod portable;
 struct Saved {
     #[serde(with = "portable::policy")]
     execution_policy: ExecutionPolicy,
+    power_off: bool,
     #[serde(with = "portable::timeline")]
     timeline: Timeline,
     interrupt_changed: Vec<bool>,
@@ -21,6 +22,7 @@ struct Saved {
     interrupt_delivery: Vec<bool>,
     irq_observations: Option<(usize, Vec<Value>)>,
     instructions: Vec<u64>,
+    epoch_instructions: Vec<u64>,
     accounted: Vec<u64>,
     deadlines: Vec<Option<u64>>,
     generations: Vec<u64>,
@@ -56,8 +58,8 @@ pub struct Keyframe {
     quantum: Option<usize>,
     host_pause: bool,
     isolated_core: Option<usize>,
-    hooks: Vec<(usize, HookId)>,
-    mmio: Vec<(usize, u64, usize)>,
+    hooks: Vec<(usize, Option<HookId>)>,
+    mmio: Vec<(usize, u64, usize, u64)>,
     controllers: Vec<Option<usize>>,
     observations: Vec<(usize, Vec<u64>)>,
     durable_blocker: Option<String>,
@@ -95,8 +97,10 @@ impl State {
         let Self {
             execution_policy,
             device_workers: _,
+            parked_until_sgi: _,
             host_pause: _,
             clock_limit: _,
+            power_off,
             memory: _,
             bus: _,
             timeline,
@@ -110,6 +114,7 @@ impl State {
             pins,
             interrupt_delivery,
             instructions,
+            epoch_instructions,
             accounted,
             deadlines,
             generations,
@@ -131,14 +136,24 @@ impl State {
             reset_contexts: _,
             exclusive: _,
             code_run,
+            code_shadow: _,
+            blocks: _,
+            run_entries: _,
+            polls: _,
+            settled: _,
             active_slice: _,
+            code_write_deferred: _,
             parallel: _,
             decoders: _,
             memory_access: _,
             continuation: _,
+            // Host loop fast-forward configuration, wiring and counters; the
+            // proof leaves no architectural trace to restore.
+            mprofile_loops: _,
         } = self;
         Saved {
             execution_policy: *execution_policy,
+            power_off: *power_off,
             timeline: timeline.clone(),
             interrupt_changed: interrupt_changed.clone(),
             released: released.clone(),
@@ -149,6 +164,7 @@ impl State {
             interrupt_delivery: interrupt_delivery.clone(),
             irq_observations: irq_observations.clone(),
             instructions: instructions.clone(),
+            epoch_instructions: epoch_instructions.clone(),
             accounted: accounted.clone(),
             deadlines: deadlines.clone(),
             generations: generations.clone(),
@@ -173,6 +189,7 @@ impl State {
     }
     fn restore_state(&mut self, saved: &Saved) -> Result<(), String> {
         self.execution_policy = saved.execution_policy;
+        self.power_off = saved.power_off;
         self.clock_limit = None;
         self.timeline.clone_from(&saved.timeline);
         self.interrupt_changed.clone_from(&saved.interrupt_changed);
@@ -185,6 +202,7 @@ impl State {
             .clone_from(&saved.interrupt_delivery);
         self.irq_observations.clone_from(&saved.irq_observations);
         self.instructions.clone_from(&saved.instructions);
+        self.epoch_instructions.clone_from(&saved.epoch_instructions);
         self.accounted.clone_from(&saved.accounted);
         self.deadlines.clone_from(&saved.deadlines);
         self.generations.clone_from(&saved.generations);
@@ -208,6 +226,7 @@ impl State {
         self.processor_generations
             .clone_from(&saved.processor_generations);
         self.code_run = saved.code_run;
+        self.code_write_deferred = false;
         if let (Some(interrupts), Some(gic)) = (&mut self.interrupts, &saved.gic) {
             interrupts.gic.restore(gic)?;
         }
@@ -270,7 +289,7 @@ impl Board {
             quantum: self.quantum.get(),
             host_pause: self.host_pause.get(),
             isolated_core: self.isolated_core.get(),
-            hooks: self.hooks.clone(),
+            hooks: self.hook_wiring(),
             mmio: self.mmio.clone(),
             controllers: state
                 .core_interrupts
@@ -288,7 +307,7 @@ impl Board {
             .try_borrow_mut()
             .map_err(|_| "keyframe requires a stopped board")?;
         state.checkpoint_boundary()?;
-        if saved.hooks != self.hooks
+        if saved.hooks != self.hook_wiring()
             || saved.observations != self.observation_topology()
             || saved.mmio != self.mmio
             || saved.controllers

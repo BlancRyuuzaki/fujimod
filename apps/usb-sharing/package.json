@@ -1,6 +1,7 @@
 {
   "name": "fujimod-usb-sharing",
   "private": true,
+  "license": "GPL-2.0-only",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
@@ -11,7 +12,7 @@
     "generate": "node scripts/generate-camera-labels.ts"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20261029.1",
+    "@cloudflare/workers-types": "5.20261102.1",
     "@types/node": "^26.6.6",
     "miniflare": "5.20261012.1-beta",
     "typescript": "^7.0.2",

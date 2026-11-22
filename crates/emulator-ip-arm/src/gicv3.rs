@@ -62,7 +62,12 @@ struct Active {
 #[derive(Clone, Serialize, Deserialize)]
 struct Interface {
     system_register_enable: bool,
-    /// ICC_IGRPEN0, Non-secure ICC_IGRPEN1 and Secure ICC_IGRPEN1.
+    /// ICC_SRE_EL2.Enable: lets EL1 access ICC_SRE_EL1. Retained, not gating.
+    #[serde(default)]
+    hypervisor_enable: bool,
+    /// ICC_IGRPEN0, Non-secure ICC_IGRPEN1 and Secure ICC_IGRPEN1. With one
+    /// Security state no line is Secure Group 1, so ICC_IGRPEN1_EL3.EnableGrp1S
+    /// is retained without gating.
     enabled: [bool; 3],
     pmr: u8,
     bpr: [u8; 2],
@@ -76,6 +81,7 @@ impl Default for Interface {
     fn default() -> Self {
         Self {
             system_register_enable: false,
+            hypervisor_enable: false,
             enabled: [false; 3],
             pmr: 0,
             bpr: [0; 2],
@@ -102,6 +108,8 @@ pub struct Gic {
     // Derived per-group candidates, excluded from architectural/checkpoint
     // state.
     eligible: Vec<[Option<usize>; 3]>,
+    /// Scratch of `refresh`; no state.
+    candidates: Vec<usize>,
 }
 impl Gic {
     pub fn new(
@@ -137,6 +145,7 @@ impl Gic {
                 interfaces: vec![Interface::default(); cores],
             },
             eligible: vec![[None; 3]; cores],
+            candidates: Vec::new(),
         })
     }
     fn two_states(&self) -> bool {
@@ -196,6 +205,25 @@ impl Gic {
         (route as u32 & 0xffffff) | ((route >> 8) as u32 & 0xff000000)
     }
     fn refresh(&mut self) {
+        // Shared lines that can be eligible for some processor, in ID order.
+        // The per-processor search below applies its whole condition to
+        // them and to every private line, so it finds what a search of all
+        // lines finds.
+        let mut candidates = std::mem::take(&mut self.candidates);
+        candidates.clear();
+        candidates.extend(
+            self.state
+                .shared
+                .iter()
+                .enumerate()
+                .skip(32)
+                .filter(|(_, line)| line.enabled && !line.active && line.pending())
+                .map(|(id, _)| id),
+        );
+        self.refresh_from(&candidates);
+        self.candidates = candidates;
+    }
+    fn refresh_from(&mut self, candidates: &[usize]) {
         for core in 0..self.eligible.len() {
             for group in [GROUP0, GROUP1_NON_SECURE, GROUP1_SECURE] {
                 let interface = &self.state.interfaces[core];
@@ -213,7 +241,8 @@ impl Gic {
                 {
                     None
                 } else {
-                    (0..self.state.shared.len())
+                    (0..self.state.shared.len().min(32))
+                        .chain(candidates.iter().copied())
                         .filter(|&id| {
                             let line = self.line(core, id);
                             line.enabled
@@ -230,6 +259,12 @@ impl Gic {
                 };
             }
         }
+    }
+    /// Whether an SGI (ids 0..16) is latched for `core`, whatever its enable or priority.
+    /// Wakes a core that waits for a software interrupt before its own CPU interface runs.
+    pub fn sgi_pending(&self, core: usize) -> Result<bool, String> {
+        self.core(core)?;
+        Ok((0..16).any(|id| self.state.private[core][id].pending()))
     }
     /// The (IRQ, FIQ) outputs. This never acknowledges an ID.
     pub fn pins(&self, core: usize) -> Result<(bool, bool), String> {
@@ -392,18 +427,23 @@ impl Gic {
                 }
                 // This implementation has no legacy interface: SRE/DIB/DFB
                 // are RAO/WI; Enable is retained per core.
-                Ok(7 | u64::from(self.state.interfaces[core].system_register_enable) * 8)
+                Ok(7 | (u64::from(self.state.interfaces[core].system_register_enable) * 8))
             }
             0xe64d => {
-                if value.is_some_and(|word| word & !15 != 0) {
-                    return Err("unsupported GICv3 ICC_SRE_EL2 bits".into());
+                if let Some(v) = value {
+                    if v & !15 != 0 {
+                        return Err("unsupported GICv3 ICC_SRE_EL2 bits".into());
+                    }
+                    self.state.interfaces[core].hypervisor_enable = v & 8 != 0;
                 }
-                // This system-interface-only model selects the permitted
-                // RAO/WI implementation of SRE, DIB, DFB, and Enable.
-                Ok(15)
+                // As ICC_SRE_EL3: SRE/DIB/DFB are RAO/WI; Enable is retained per core.
+                Ok(7 | (u64::from(self.state.interfaces[core].hypervisor_enable) * 8))
             }
-            0xf667 if self.two_states() => {
+            0xf667 => {
                 // ICC_IGRPEN1_EL3: EnableGrp1NS (bit 0) and EnableGrp1S (bit 1).
+                // EnableGrp1NS is the Group 1 enable ICC_IGRPEN1_EL1 also
+                // addresses with one Security state, so an EL1 and an EL3
+                // access agree.
                 let enabled = &mut self.state.interfaces[core].enabled;
                 if let Some(word) = value {
                     if word & !3 != 0 {
@@ -413,19 +453,6 @@ impl Gic {
                     enabled[GROUP1_SECURE] = word & 2 != 0;
                 }
                 Ok(u64::from(enabled[GROUP1_NON_SECURE]) | (u64::from(enabled[GROUP1_SECURE]) << 1))
-            }
-            0xf667 => {
-                if let Some(word) = value {
-                    if !matches!(word, 0 | 3) {
-                        return Err("unsupported asymmetric GICv3 Group 1 enables".into());
-                    }
-                    self.state.interfaces[core].enabled[GROUP1_NON_SECURE] = word == 3;
-                }
-                Ok(if self.state.interfaces[core].enabled[GROUP1_NON_SECURE] {
-                    3
-                } else {
-                    0
-                })
             }
             0xc230 => {
                 if let Some(v) = value {
@@ -452,7 +479,7 @@ impl Gic {
                     }
                     self.state.interfaces[core].split_eoi = v & 2 != 0;
                 }
-                Ok(0x700 | u64::from(self.state.interfaces[core].split_eoi) * 2)
+                Ok(0x700 | (u64::from(self.state.interfaces[core].split_eoi) * 2))
             }
             0xc665 => Ok(7), // System interface only; SRE/DIB/DFB are RAO/WI.
             0xc666 | 0xc667 => {
@@ -569,7 +596,7 @@ impl Gic {
         size: u8,
         value: Option<u64>,
     ) -> Result<u64, String> {
-        if !matches!(size, 1 | 2 | 4 | 8) || offset % u64::from(size) != 0 {
+        if !matches!(size, 1 | 2 | 4 | 8) || !offset.is_multiple_of(u64::from(size)) {
             return Err("GICv3 MMIO width/alignment".into());
         }
         if private && offset < 0x10000 {
@@ -695,12 +722,12 @@ impl Gic {
                     continue;
                 }
                 let line = self.line_mut(core, id);
-                if let Some(v) = value {
-                    if id >= 16 {
-                        line.edge = v & (2 << (n * 2)) != 0;
-                    }
+                if let Some(v) = value
+                    && id >= 16
+                {
+                    line.edge = v & (2 << (n * 2)) != 0;
                 }
-                out |= u64::from(line.edge) * 2 << (n * 2);
+                out |= (u64::from(line.edge) * 2) << (n * 2);
             }
             return Ok(out);
         }
@@ -786,7 +813,6 @@ impl Gic {
             || s.distributor & !self.distributor_enables() != 0
             || s.interfaces.iter().any(|i| {
                 i.bpr.iter().any(|b| *b > 7)
-                    || i.enabled[groups..].iter().any(|e| *e)
                     || i.active.iter().any(|a| a.id >= lines || a.group >= groups)
             })
             || groups == 2
@@ -800,6 +826,61 @@ impl Gic {
         self.state = s;
         self.refresh();
         Ok(())
+    }
+}
+
+impl fujimod_emulator_devices::gic::InterruptController for Gic {
+    fn pins(&self, core: usize) -> Result<(bool, bool), String> {
+        Gic::pins(self, core)
+    }
+    fn sgi_pending(&self, core: usize) -> Result<bool, String> {
+        Gic::sgi_pending(self, core)
+    }
+    fn set_spi(&mut self, id: usize, high: bool) -> Result<(), String> {
+        Gic::set_spi(self, id, high)
+    }
+    fn set_ppi(&mut self, core: usize, id: usize, high: bool) -> Result<(), String> {
+        Gic::set_ppi(self, core, id, high)
+    }
+    fn system(&mut self, core: usize, register: u16, value: Option<u64>) -> Result<u64, String> {
+        Gic::system(self, core, register, value)
+    }
+    fn tracks_processor_security(&self) -> bool {
+        self.two_states()
+    }
+    fn set_processor_security(
+        &mut self,
+        core: usize,
+        security: ProcessorSecurity,
+    ) -> Result<(), String> {
+        Gic::set_processor_security(self, core, security)
+    }
+    fn distributor(
+        &mut self,
+        _core: usize,
+        offset: u64,
+        size: u8,
+        value: Option<u64>,
+    ) -> Result<u64, String> {
+        Gic::distributor(self, offset, size, value)
+    }
+    fn redistributor(
+        &mut self,
+        core: usize,
+        offset: u64,
+        size: u8,
+        value: Option<u64>,
+    ) -> Result<u64, String> {
+        Gic::redistributor(self, core, offset, size, value)
+    }
+    fn save(&self) -> Value {
+        Gic::save(self)
+    }
+    fn restore(&mut self, state: &Value) -> Result<(), String> {
+        Gic::restore(self, state)
+    }
+    fn boxed_clone(&self) -> Box<dyn fujimod_emulator_devices::gic::InterruptController> {
+        Box::new(self.clone())
     }
 }
 
@@ -818,14 +899,27 @@ mod tests {
         assert!(g.system(0, 0xf665, Some(16)).is_err());
     }
     #[test]
-    fn el2_sre_and_el3_group1_accept_only_modeled_settings() {
-        let mut g = super::Gic::new(vec![0], 128, super::SecurityStates::One).unwrap();
-        assert_eq!(g.system(0, 0xe64d, Some(9)).unwrap(), 15);
-        assert!(g.system(0, 0xe64d, Some(16)).is_err());
+    fn el2_sre_and_el3_group_enables_are_per_core_and_survive_checkpoint() {
+        let mut g = super::Gic::new(vec![0, 1], 128, super::SecurityStates::One).unwrap();
+        assert_eq!(g.system(0, 0xe64d, None).unwrap(), 7);
+        assert_eq!(g.system(0, 0xe64d, Some(0xf)).unwrap(), 15);
+        assert_eq!(g.system(1, 0xe64d, None).unwrap(), 7);
         assert_eq!(g.system(0, 0xf667, Some(3)).unwrap(), 3);
+        assert_eq!(g.system(1, 0xf667, None).unwrap(), 0);
+        // Bit 0 is the Group 1 enable the EL1 register also sets and clears.
+        assert_eq!(g.system(0, 0xc667, None).unwrap(), 1);
+        g.system(0, 0xc667, Some(0)).unwrap();
+        assert_eq!(g.system(0, 0xf667, None).unwrap(), 2);
+        g.system(0, 0xf667, Some(3)).unwrap();
+        assert_eq!(g.system(0, 0xc667, None).unwrap(), 1);
+        let saved = g.save();
+        g.system(0, 0xe64d, Some(0)).unwrap();
+        g.system(0, 0xf667, Some(0)).unwrap();
+        g.restore(&saved).unwrap();
+        assert_eq!(g.system(0, 0xe64d, None).unwrap(), 15);
         assert_eq!(g.system(0, 0xf667, None).unwrap(), 3);
-        assert!(g.system(0, 0xf667, Some(1)).is_err());
-        assert_eq!(g.system(0, 0xf667, None).unwrap(), 3);
+        assert!(g.system(0, 0xe64d, Some(16)).is_err());
+        assert!(g.system(0, 0xf667, Some(4)).is_err());
     }
     use super::*;
     fn enabled(affinities: Vec<u32>) -> Gic {
@@ -907,6 +1001,34 @@ mod tests {
         assert_eq!(g.system(0, 0xc660, None).unwrap(), 34);
         g.set_spi(35, true).unwrap();
         assert_eq!(g.system(0, 0xc662, None).unwrap(), 1023);
+    }
+    #[test]
+    fn sgi_pending_reports_a_latched_sgi_even_with_the_cpu_interface_disabled() {
+        let mut g = enabled(vec![0, 1, 2, 3, 4]);
+        for core in 0..5 {
+            assert!(!g.sgi_pending(core).unwrap());
+        }
+        g.system(0, 0xc65f, Some(0xe)).unwrap();
+        for core in 0..5 {
+            assert_eq!(g.sgi_pending(core).unwrap(), (1..=3).contains(&core));
+        }
+    }
+    #[test]
+    fn group_zero_sgi_targets_only_selected_secondary_affinities() {
+        let mut g = enabled(vec![0, 1, 2, 3, 4]);
+        for core in 0..5 {
+            g.redistributor(core, 0x10100, 4, Some(1)).unwrap();
+            g.redistributor(core, 0x10400, 1, Some(0x40)).unwrap();
+        }
+        g.system(0, 0xc65f, Some(0xe)).unwrap();
+        for core in 0..5 {
+            assert_eq!(g.pins(core).unwrap(), (false, (1..=3).contains(&core)));
+        }
+        for core in 1..=3 {
+            assert_eq!(g.system(core, 0xc640, None).unwrap(), 0);
+            g.system(core, 0xc641, Some(0)).unwrap();
+            assert_eq!(g.pins(core).unwrap(), (false, false));
+        }
     }
     #[test]
     fn sgi_affinity_broadcast_groups_and_private_banks() {
@@ -1112,57 +1234,5 @@ mod tests {
         assert_eq!(decoded.system(0, 0xc660, None).unwrap(), 40);
         assert!(Gic::new(vec![0], 512, SecurityStates::One).unwrap().restore(&saved).is_err());
         assert!(one.restore(&saved).is_err());
-    }
-}
-
-impl fujimod_emulator_devices::gic::InterruptController for Gic {
-    fn pins(&self, core: usize) -> Result<(bool, bool), String> {
-        Gic::pins(self, core)
-    }
-    fn set_spi(&mut self, id: usize, high: bool) -> Result<(), String> {
-        Gic::set_spi(self, id, high)
-    }
-    fn set_ppi(&mut self, core: usize, id: usize, high: bool) -> Result<(), String> {
-        Gic::set_ppi(self, core, id, high)
-    }
-    fn system(&mut self, core: usize, register: u16, value: Option<u64>) -> Result<u64, String> {
-        Gic::system(self, core, register, value)
-    }
-    fn tracks_processor_security(&self) -> bool {
-        self.two_states()
-    }
-    fn set_processor_security(
-        &mut self,
-        core: usize,
-        security: ProcessorSecurity,
-    ) -> Result<(), String> {
-        Gic::set_processor_security(self, core, security)
-    }
-    fn distributor(
-        &mut self,
-        _core: usize,
-        offset: u64,
-        size: u8,
-        value: Option<u64>,
-    ) -> Result<u64, String> {
-        Gic::distributor(self, offset, size, value)
-    }
-    fn redistributor(
-        &mut self,
-        core: usize,
-        offset: u64,
-        size: u8,
-        value: Option<u64>,
-    ) -> Result<u64, String> {
-        Gic::redistributor(self, core, offset, size, value)
-    }
-    fn save(&self) -> Value {
-        Gic::save(self)
-    }
-    fn restore(&mut self, state: &Value) -> Result<(), String> {
-        Gic::restore(self, state)
-    }
-    fn boxed_clone(&self) -> Box<dyn fujimod_emulator_devices::gic::InterruptController> {
-        Box::new(self.clone())
     }
 }

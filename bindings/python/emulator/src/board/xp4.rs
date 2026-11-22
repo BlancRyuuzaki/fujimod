@@ -1,6 +1,6 @@
 //! XP4-specific host capabilities borrowed from the single Board owner.
 use super::*;
-use pyo3::types::PyList;
+use pyo3::types::{PyBytes, PyList};
 
 #[pyclass(unsendable, module = "fujimod._native.emulator")]
 pub struct Xp4 {
@@ -19,15 +19,24 @@ impl Xp4 {
 
 #[pymethods]
 impl Xp4 {
+    /// A copy of the medium in the `host`th SD card slot (SD host declaration order).
+    fn card_medium(&self, py: Python<'_>, host: usize) -> PyResult<CardMedium> {
+        self.with(py, |s| s.card_medium(host).map(CardMedium))
+    }
+    /// Reset only program observation; unsettled NOR commands are refused.
+    fn reset_nor_program_coverage(&self, py: Python<'_>) -> PyResult<()> {
+        self.with(py, |s| s.reset_nor_program_coverage())
+    }
+    /// A copy of the backed NOR medium after completed writes.
+    fn nor_medium<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        self.with(py, |s| s.nor_medium().map(|bytes| PyBytes::new(py, &bytes)))
+    }
     fn __traverse__(&self, visit: PyVisit<'_>) -> Result<(), PyTraverseError> {
         visit.call(&self.owner)
     }
     #[pyo3(signature = (callback: "collections.abc.Callable[[int, int], object] | None"))]
     fn set_pc_handler(&self, py: Python<'_>, callback: Option<Py<PyAny>>) -> PyResult<()> {
-        self.with(py, |s| {
-            s.set_pc_handler(callback);
-            Ok(())
-        })
+        self.with(py, |s| s.set_pc_handler(callback))
     }
     #[pyo3(signature=(executable, readable, writable, return_address, store_limit=1<<20, core=0, device_policy=None))]
     fn driver_guard_begin(
@@ -54,10 +63,7 @@ impl Xp4 {
         })
     }
     fn driver_guard_end(&self, py: Python<'_>) -> PyResult<()> {
-        self.with(py, |s| {
-            s.driver_guard_end();
-            Ok(())
-        })
+        self.with(py, |s| s.driver_guard_end())
     }
     fn driver_guard_state<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
         self.with(py, |s| s.driver_guard_state(py))
@@ -88,22 +94,20 @@ impl Xp4 {
         })
     }
     fn function_watch_end(&self, py: Python<'_>) -> PyResult<()> {
-        self.with(py, |s| {
-            s.function_watch_end();
-            Ok(())
-        })
+        self.with(py, |s| s.function_watch_end())
     }
     fn function_watch_state<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
         self.with(py, |s| s.function_watch_state(py))
     }
-    #[pyo3(signature=(ranges, limit=1_000_000))]
+    #[pyo3(signature=(ranges, limit=1_000_000, writes_only=false))]
     fn memory_watch_begin(
         &self,
         py: Python<'_>,
         ranges: Vec<(u64, u64)>,
         limit: usize,
+        writes_only: bool,
     ) -> PyResult<()> {
-        self.with(py, |s| s.memory_watch_begin(ranges, limit))
+        self.with(py, |s| s.memory_watch_begin(ranges, limit, writes_only))
     }
     fn memory_watch_end(&self, py: Python<'_>) -> PyResult<()> {
         self.with(py, |s| s.memory_watch_end())
@@ -157,6 +161,11 @@ impl Xp4 {
     fn run(&self, py: Python<'_>, core: usize, budget: usize) -> PyResult<()> {
         self.with(py, |s| s.run(core, budget))
     }
+    /// Run a positive instruction budget, stopping before the even target PC.
+    /// Normal IRQ, wait and device yields can return before the target is reached.
+    fn run_to(&self, py: Python<'_>, core: usize, budget: usize, target: u64) -> PyResult<()> {
+        self.with(py, |s| s.run_to(core, budget, target))
+    }
     fn idle(&self, py: Python<'_>) -> PyResult<bool> {
         self.with(py, |s| Ok(s.idle()))
     }
@@ -165,6 +174,9 @@ impl Xp4 {
     }
     fn set_gpio_input(&self, py: Python<'_>, port: usize, pin: usize, high: bool) -> PyResult<()> {
         self.with(py, |s| s.set_gpio_input(port, pin, high))
+    }
+    fn turn_dial(&self, py: Python<'_>, name: &str, edges: i32) -> PyResult<()> {
+        self.with(py, |s| s.turn_dial(name, edges))
     }
     fn set_usb_connected(&self, py: Python<'_>, connected: bool) -> PyResult<()> {
         self.with(py, |s| s.set_usb_connected(connected))
@@ -199,6 +211,13 @@ impl Xp4 {
     }
     fn device_records<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         self.with(py, |s| s.device_records(py))
+    }
+    fn translation_maintenance_state<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        self.with(py, |s| s.translation_maintenance_state(py))
+    }
+    /// Execution counters and deadlines without GPIO or observation history.
+    fn scheduler_state<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        self.with(py, |s| s.scheduler_state(py))
     }
     #[pyo3(signature=(observations=true))]
     fn state<'py>(&self, py: Python<'py>, observations: bool) -> PyResult<Bound<'py, PyDict>> {

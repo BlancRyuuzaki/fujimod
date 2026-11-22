@@ -72,6 +72,17 @@ struct Zoom {
     level: bool,
     home_level: Option<bool>,
 }
+/// A built-in ND filter on a lens-unit output register (X100T: mixed-width 0xD400,
+/// insert coil bit 7, remove coil bit 8, idle 0x054). While it is in, the aperture wire
+/// (f-number squared) is scaled by `factor` (3 EV: 8), via the shared transmission wire
+/// the iris publisher also applies.
+#[derive(Clone, Copy, Debug)]
+pub struct NdOptions {
+    pub register: u16,
+    pub insert_mask: u16,
+    pub remove_mask: u16,
+    pub factor: f64,
+}
 pub struct LensUnit {
     protocol: Protocol,
     registers: [u16; 128],
@@ -82,11 +93,16 @@ pub struct LensUnit {
     position: Option<fujimod_emulator_devices::parts::optics::Position>,
     aperture: Option<(fujimod_emulator_devices::parts::optics::ApertureHandle, Vec<(i64, f64)>)>,
     focus: Option<(fujimod_emulator_devices::parts::optics::FocusHandle, i64, f64)>,
+    nd: Option<(
+        NdOptions,
+        fujimod_emulator_devices::parts::optics::ApertureHandle,
+        fujimod_emulator_devices::parts::optics::ApertureHandle,
+    )>,
 }
 impl LensUnit {
     pub fn new(options: Options, wiring: Wiring) -> Result<Self, String> {
-        if let Protocol::Banked { clock, .. } = options.protocol {
-            if clock.iter().any(|clock| {
+        if let Protocol::Banked { clock, .. } = options.protocol
+            && clock.iter().any(|clock| {
                 matches!(
                     clock,
                     BankedClock::EncoderStages {
@@ -95,9 +111,9 @@ impl LensUnit {
                         ticks_per_quantum: 0
                     }
                 )
-            }) {
-                return Err("banked lens clock quantum must be positive".into());
-            }
+            })
+        {
+            return Err("banked lens clock quantum must be positive".into());
         }
         if matches!(options.protocol, Protocol::MixedWidth { period_ticks: 0 }) {
             return Err("mixed-width lens requires a positive period scale".into());
@@ -149,6 +165,7 @@ impl LensUnit {
             position: wiring.position,
             aperture: None,
             focus: None,
+            nd: None,
         })
     }
     /// Explicit board initialization, before CPU release. It drives no IRQ
@@ -181,6 +198,47 @@ impl LensUnit {
         }
         self.aperture = Some((output, positions));
         self.publish_optics()
+    }
+    pub fn attach_nd(
+        &mut self,
+        options: NdOptions,
+        aperture: fujimod_emulator_devices::parts::optics::ApertureHandle,
+        transmission: fujimod_emulator_devices::parts::optics::ApertureHandle,
+    ) -> Result<(), String> {
+        if !options.factor.is_finite()
+            || options.factor < 1.
+            || options.insert_mask == 0
+            || options.remove_mask == 0
+            || options.insert_mask & options.remove_mask != 0
+        {
+            return Err("ND filter requires distinct coil bits and a finite factor >= 1".into());
+        }
+        self.nd = Some((options, aperture, transmission));
+        Ok(())
+    }
+    /// A write to the ND output register: an insert or remove coil pulse moves the
+    /// filter; the transmission and the current aperture follow.
+    fn nd_write(&mut self, register: u16, data: u16) -> Result<(), String> {
+        let Some((options, aperture, transmission)) = &self.nd else {
+            return Ok(());
+        };
+        if register != options.register {
+            return Ok(());
+        }
+        let target = if data & options.insert_mask != 0 && data & options.remove_mask == 0 {
+            options.factor
+        } else if data & options.remove_mask != 0 && data & options.insert_mask == 0 {
+            1.
+        } else {
+            return Ok(());
+        };
+        let mut t = transmission.lock().map_err(|_| "ND transmission poisoned")?;
+        if *t != target {
+            let mut a = aperture.lock().map_err(|_| "iris transmission poisoned")?;
+            *a = *a / *t * target;
+            *t = target;
+        }
+        Ok(())
     }
     pub fn attach_focus(
         &mut self,
@@ -349,6 +407,7 @@ impl LensUnit {
                 self.mechanics.stop(axis);
             }
         }
+        self.nd_write((address as u16) << 9, data)?;
         self.registers[address] = data;
         Ok(())
     }
@@ -476,8 +535,9 @@ impl LensUnit {
         }
         if self.zoom.is_some() {
             let (direction, clock) = self.zoom_clock()?;
-            let z = self.zoom.as_mut().unwrap();
-            if z.direction != direction || z.clock != clock {
+            if let Some(z) = self.zoom.as_mut()
+                && (z.direction != direction || z.clock != clock)
+            {
                 z.due = match clock {
                     Some(c) => Some(
                         at.checked_add(Self::zoom_period(z, c)?)

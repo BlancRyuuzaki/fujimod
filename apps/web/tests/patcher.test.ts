@@ -175,6 +175,7 @@ function index() {
     firmwares: [
       {
         boot_instructions: ['Copy files to your card.'],
+        mods: [],
         id: 'x70-110',
         model: 'X70',
         version: '1.10',
@@ -214,17 +215,25 @@ test('validates hash-to-filename catalog and rejects path traversal, missing map
   const duplicate = index();
   duplicate.firmwares.push(duplicate.firmwares[0]);
   assert.throws(() => validateIndex(duplicate));
+  const sd_boot_v1_installable = index();
+  Object.assign(sd_boot_v1_installable.firmwares[0], { downloads: { sd_boot_v1_installable: true } });
+  assert.throws(() => validateIndex(sd_boot_v1_installable), /update file name/);
+  for (const name of ['FWUP0009.DAT', '../FPUPDATE.DAT', 'fwup0009.dat', 7]) {
+    Object.assign(sd_boot_v1_installable.firmwares[0], { update_filename: name });
+    if (name === 'FWUP0009.DAT') assert.equal(validateIndex(sd_boot_v1_installable).firmwares.length, 1);
+    else assert.throws(() => validateIndex(sd_boot_v1_installable), /update file name/);
+  }
 });
 test('ZIP has known CRC32, correct file names and CRCs, data and directory offsets', async () => {
   assert.equal(crc32(text('123456789')), 0xcbf43926);
   const expected = { ffboot: text('boot bytes'), ffsys: text('sys bytes') };
   const download = await modifiedDownload(
-    'sd-boot',
+    'sd-boot-v1',
     expected,
     { model: 'X70', version: '1.10' },
     'abcdef12',
   );
-  assert.equal(download.name, 'fujimod-modified-sd-boot-x70-1.10-build-abcdef12.zip');
+  assert.equal(download.name, 'fujimod-modified-sd-boot-v1-x70-1.10-build-abcdef12.zip');
   const archive = new Uint8Array(await download.blob.arrayBuffer()),
     view = new DataView(archive.buffer);
   let cursor = 0;
@@ -259,15 +268,15 @@ test('installable download names the archive and preserves the camera update fil
   const download = await modifiedDownload(
     'installable',
     files,
-    { model: 'GFX 100 II', version: '2.01' },
+    { model: 'GFX 100 II', version: '2.01', update_filename: 'GXUP0008.DAT' },
     '1234abcd',
   );
   assert.equal(download.name, 'fujimod-modified-installable-gfx-100-ii-2.01-build-1234abcd.zip');
   const entries = unzipSync(new Uint8Array(await download.blob.arrayBuffer()));
-  assert.deepEqual(Object.keys(entries), ['ffboot.bin', 'ffsys.bin', 'FPUPDATE.DAT']);
+  assert.deepEqual(Object.keys(entries), ['ffboot.bin', 'ffsys.bin', 'GXUP0008.DAT']);
   assert.deepEqual(entries['ffboot.bin'], files.ffboot);
   assert.deepEqual(entries['ffsys.bin'], files.ffsys);
-  assert.deepEqual(entries['FPUPDATE.DAT'], files.fpupdate);
+  assert.deepEqual(entries['GXUP0008.DAT'], files.fpupdate);
   await assert.rejects(
     modifiedDownload(
       'installable',

@@ -27,6 +27,21 @@ impl Capability for dyn AnalogInputs {
     }
 }
 
+/// Externally supplied gravity at an attached accelerometer, in sensor axes
+/// expressed as multiples of standard gravity.
+pub trait GravityInput {
+    fn gravity_g(&self) -> [f64; 3];
+    fn set_gravity_g(&mut self, gravity: [f64; 3]) -> Result<(), String>;
+}
+impl Capability for dyn GravityInput {
+    fn of(device: &dyn Device) -> Option<&Self> {
+        device.gravity_input()
+    }
+    fn of_mut(device: &mut dyn Device) -> Option<&mut Self> {
+        device.gravity_input_mut()
+    }
+}
+
 /// Status registers of serial endpoints that external inputs drive.
 pub trait SerialStatus {
     fn status_value(&self, route: usize, register: u8) -> Result<u8, String>;
@@ -157,6 +172,8 @@ pub trait FrameSource {
     fn configure(&mut self, period: u64, cadence: StatisticsCadence, now: u64) -> Result<(), String>;
     /// The source's clock, cadence and latched exposure, for diagnostics.
     fn frame_state(&self) -> serde_json::Value;
+    /// Frame index and latched sensor exposure in seconds and analog gain.
+    fn frame_exposure(&self) -> Result<Option<(u64, f64, f64)>, String>;
     /// Passive pre-ISP RGB U16LE samples on a uniform grid of the latched
     /// sensor view. Raster dimensions are bounded to 256 by 256.
     fn sensor_sample_rgb(&self, width: usize, height: usize) -> Result<Vec<u8>, String>;

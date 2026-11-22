@@ -6,6 +6,7 @@
 //! page, and loads from an identity page. Every virtual address also holds a
 //! decoy, so a flat execution path cannot produce the asserted physical effect
 //! by accident.
+use fujimod_catalog_configuration::RunEngine;
 use super::{
     bus::{Bus, Mode},
     factory, Board,
@@ -51,7 +52,7 @@ fn board() -> Board {
     .unwrap();
     graph
         .build(
-            factory::Options::new(factory::Engine::Unicorn)
+            factory::Options::new(RunEngine::Unicorn)
                 .with_translation_cache_size_bytes(1 << 20),
             Bus::new(Mode::Strict),
             None,

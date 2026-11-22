@@ -11,6 +11,14 @@
 //! byte rate. Event `n` drives interrupt line `irq_routes[n]` when its
 //! INTEN bit is set. Loads may read declared read-only memories as well as
 //! RAM; stores into them refuse.
+//!
+//! A source window may pace its transfers ([`Source::transfer_ticks`]), as a
+//! peripheral FIFO fed at a fixed sample rate does. A channel whose SAR or DAR
+//! lies in a paced window runs one segment at a time: each segment ends after
+//! a DMASEV (or at a wait or DMAEND), and the next one becomes due after the
+//! time its own paced bytes take. A ring program that signals one buffer per
+//! DMASEV therefore raises its interrupts at the peripheral's rate instead of
+//! filling every buffer at once.
 use fujimod_emulator_devices::{Cx, Device, Record, Value as Field};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -31,6 +39,12 @@ pub trait Source: Send + Sync {
     /// Stores `bytes` at `address` when the transfer completes.
     fn write(&self, _address: u64, _bytes: &[u8]) -> Result<(), String> {
         Err("PL330 store into a read-only source".into())
+    }
+    /// Ticks that moving `bytes` through this window takes, for a window that
+    /// paces its transfers; `None` (the default) leaves the transfer to the
+    /// controller's [`Throughput`].
+    fn transfer_ticks(&self, _bytes: u64) -> Option<u64> {
+        None
     }
 }
 
@@ -54,13 +68,40 @@ struct Thread {
     lc: [u32; 2],
     running: bool,
     due: Option<u64>,
+    /// Event this thread waits for. Also the permit that resumes it after a
+    /// signal or INTCLR, so a cleared event bit cannot re-block the thread.
+    waiting: Option<u32>,
+    /// Loaded bytes not yet stored, retained while the thread waits.
+    fifo: VecDeque<u8>,
+    bytes: u64,
+    source: Option<u32>,
+    destination: Option<u32>,
 }
 
-/// Outcome of one program run: bytes stored, first load and store address.
+/// Outcome of one program run: bytes stored, first load and store address,
+/// and the time the run's bytes through paced windows take (`None` when the
+/// run moved no bytes through a paced window).
 struct Transfer {
     bytes: u64,
     source: u32,
     destination: u32,
+    paced_ticks: Option<u64>,
+}
+
+/// A run stops at DMAEND or at a DMAWFE whose event has not arrived. A paced
+/// channel also yields right after each DMASEV.
+enum RunOutcome {
+    Ended(Transfer),
+    Blocked(Transfer),
+    Yielded(Transfer),
+}
+
+impl RunOutcome {
+    fn transfer(&self) -> &Transfer {
+        match self {
+            RunOutcome::Ended(t) | RunOutcome::Blocked(t) | RunOutcome::Yielded(t) => t,
+        }
+    }
 }
 
 pub struct Pl330 {
@@ -69,6 +110,10 @@ pub struct Pl330 {
     sources: Vec<Arc<dyn Source>>,
     timing: Throughput,
     threads: [Thread; CHANNELS],
+    /// Transient: a channel resumed by [`Pl330::wake`] is still executing.
+    /// Its waiting field is only cleared when that run writes the thread back,
+    /// so a nested signal must not start it a second time.
+    executing: [bool; CHANNELS],
     inten: u32,
     events: u32,
     debug: [u32; 2],
@@ -96,6 +141,7 @@ impl Pl330 {
             sources,
             timing,
             threads: Default::default(),
+            executing: [false; CHANNELS],
             inten: 0,
             events: 0,
             debug: [0; 2],
@@ -103,16 +149,61 @@ impl Pl330 {
     }
 
     fn signal(&mut self, cx: &mut Cx<'_>, event: u32) -> Result<(), String> {
-        if self.inten >> event & 1 == 0 {
+        if self.inten >> event & 1 != 0 {
+            let line = *self
+                .irq_routes
+                .get(event as usize)
+                .ok_or("PL330 event has no interrupt route")?;
+            self.events |= 1 << event;
+            cx.set_irq(line, true);
             return Ok(());
         }
-        let line = *self
-            .irq_routes
-            .get(event as usize)
-            .ok_or("PL330 event has no interrupt route")?;
         self.events |= 1 << event;
-        cx.set_irq(line, true);
+        self.wake(cx, 1 << event)
+    }
+
+    /// Resumes threads waiting on an event in `mask`. The waiting field stays
+    /// until DMAWFE consumes it, so an event bit already cleared by INTCLR
+    /// still lets the thread continue.
+    fn wake(&mut self, cx: &mut Cx<'_>, mask: u32) -> Result<(), String> {
+        for n in 0..CHANNELS {
+            if self.threads[n]
+                .waiting
+                .is_some_and(|event| mask >> event & 1 != 0)
+            {
+                self.resume(cx, n)?;
+            }
+        }
         Ok(())
+    }
+
+    fn resume(&mut self, cx: &mut Cx<'_>, n: usize) -> Result<(), String> {
+        if self.paced(&self.threads[n]) {
+            return self.advance(cx, n);
+        }
+        if std::mem::replace(&mut self.executing[n], true) {
+            return Ok(());
+        }
+        let outcome = self.run(cx, n, true);
+        self.executing[n] = false;
+        if let RunOutcome::Ended(transfer) = outcome? {
+            self.record_transfer(cx, n, transfer);
+        }
+        Ok(())
+    }
+
+    fn record_transfer(&self, cx: &mut Cx<'_>, n: usize, transfer: Transfer) {
+        cx.record(Record::new(
+            "PL330 transfer complete",
+            [
+                ("base", Field::int(self.base)),
+                ("channel", Field::int(n as u64)),
+                ("source", Field::int(u64::from(transfer.source))),
+                ("destination", Field::int(u64::from(transfer.destination))),
+                ("size", Field::int(transfer.bytes)),
+                ("tick", Field::int(cx.now())),
+            ],
+        ));
     }
 
     fn load(&self, cx: &Cx<'_>, address: u64, len: usize) -> Result<Vec<u8>, String> {
@@ -120,6 +211,132 @@ impl Pl330 {
             Some(source) => source.read(address, len),
             None => cx.ram_bytes(address, len),
         }
+    }
+
+    /// Whether `t` currently addresses a paced window.
+    fn paced(&self, t: &Thread) -> bool {
+        self.sources.iter().any(|s| {
+            s.transfer_ticks(0).is_some()
+                && (s.contains(u64::from(t.sar), 1) || s.contains(u64::from(t.dar), 1))
+        })
+    }
+
+    /// Adds `count` bytes to the paced total of the window holding `address`.
+    fn pace(&self, paced: &mut [u64], address: u64, count: usize) {
+        if let Some(i) = self.sources.iter().position(|s| s.contains(address, count)) {
+            paced[i] += count as u64;
+        }
+    }
+
+    fn paced_ticks(&self, paced: &[u64]) -> Option<u64> {
+        let mut total = None;
+        for (source, &bytes) in self.sources.iter().zip(paced) {
+            if bytes > 0
+                && let Some(ticks) = source.transfer_ticks(bytes)
+            {
+                total = Some(total.unwrap_or(0) + ticks);
+            }
+        }
+        total
+    }
+
+    /// Time a run's data movement takes, without the setup cost.
+    fn data_ticks(&self, transfer: &Transfer) -> u64 {
+        transfer
+            .paced_ticks
+            .unwrap_or_else(|| transfer.bytes.div_ceil(self.timing.bytes_per_tick))
+    }
+
+    /// Continues paced channel `n`: the next segment runs at once when it moves
+    /// no data, otherwise it becomes due after its paced time. A waiter whose
+    /// next segment moves data before its next DMASEV runs at once, because a
+    /// deadline and a wait cannot coexist. Bounded so a program that signals
+    /// forever without moving data refuses instead of spinning.
+    fn advance(&mut self, cx: &mut Cx<'_>, n: usize) -> Result<(), String> {
+        if std::mem::replace(&mut self.executing[n], true) {
+            return Ok(());
+        }
+        let result = self.advance_segments(cx, n);
+        self.executing[n] = false;
+        result
+    }
+
+    fn advance_segments(&mut self, cx: &mut Cx<'_>, n: usize) -> Result<(), String> {
+        for _ in 0..1024 {
+            let preview = self.run(cx, n, false)?;
+            let ticks = self.data_ticks(preview.transfer());
+            if ticks > 0 && self.threads[n].waiting.is_none() {
+                let at = cx.now() + ticks;
+                self.threads[n].running = true;
+                self.threads[n].due = Some(at);
+                cx.schedule(at, n as u64);
+                return Ok(());
+            }
+            match self.run(cx, n, true)? {
+                RunOutcome::Ended(transfer) => {
+                    self.record_transfer(cx, n, transfer);
+                    return Ok(());
+                }
+                RunOutcome::Blocked(_) => return Ok(()),
+                RunOutcome::Yielded(_) => {}
+            }
+        }
+        Err("PL330 paced program signals without moving data".into())
+    }
+
+    /// Runs the instructions after a paced channel's DMASEV that take no
+    /// time: DMANOP, the barriers, DMAMOV, DMALP/DMALPEND and DMAADDH/DMAADNH.
+    /// It stops at the first instruction that moves data, waits, signals or
+    /// ends. The hardware executes these at once, before the CPU services the
+    /// interrupt, so a CPU that patches the program from its handler must not
+    /// redirect a thread that has already passed the patched bytes. The X-T5
+    /// audio-record ring (generators 0x1398168/0x1398aa4) rewrites a
+    /// "DMALP; DMALPEND to 0" stub right after the half-A DMASEV; read late,
+    /// the stub sent the thread back to half A, the ring ran one half out of
+    /// phase, and the stop's DMAEND landed on the thread's own pc.
+    /// These instructions touch only the thread's registers, so a preview
+    /// and an applied run produce the same result.
+    fn run_instant(&self, cx: &Cx<'_>, t: &mut Thread) -> Result<(), String> {
+        for _ in 0..STEP_LIMIT {
+            let pc = t.pc;
+            let op = cx.ram_bytes(u64::from(pc), 1)?[0];
+            let len = match op {
+                0x12 | 0x13 | 0x18 => 1,
+                0xbc => self.mov(cx, t, pc)?,
+                0x20 | 0x22 => {
+                    t.lc[usize::from(op >> 1 & 1)] =
+                        u32::from(cx.ram_bytes(u64::from(pc) + 1, 1)?[0]);
+                    2
+                }
+                0x38 | 0x3c => {
+                    let lc = usize::from(op >> 2 & 1);
+                    if t.lc[lc] != 0 {
+                        t.lc[lc] -= 1;
+                        t.pc = pc.wrapping_sub(u32::from(cx.ram_bytes(u64::from(pc) + 1, 1)?[0]));
+                        continue;
+                    }
+                    2
+                }
+                0x54 | 0x56 | 0x5c | 0x5e => {
+                    let b = cx.ram_bytes(u64::from(pc) + 1, 2)?;
+                    let raw = u16::from_le_bytes([b[0], b[1]]);
+                    let add = if op & 0x08 == 0 {
+                        u32::from(raw)
+                    } else {
+                        i32::from(raw as i16) as u32
+                    };
+                    if op & 2 == 0 {
+                        t.sar = t.sar.wrapping_add(add);
+                    } else {
+                        t.dar = t.dar.wrapping_add(add);
+                    }
+                    3
+                }
+                _ => return Ok(()),
+            };
+            t.pc = pc.wrapping_add(len);
+        }
+        Err("PL330 program exceeds step bound".into())
     }
 
     /// Executes the DMAMOV at `pc` on `t` and returns its length. Preview,
@@ -155,13 +372,12 @@ impl Pl330 {
         Err("PL330 program exceeds step bound".into())
     }
 
-    /// Runs channel `n` to DMAEND. Without `apply`, no memory, event or
-    /// channel state changes; loaded bytes are not read.
-    fn run(&mut self, cx: &mut Cx<'_>, n: usize, apply: bool) -> Result<Transfer, String> {
+    /// Runs channel `n` until DMAEND or an event wait that has not been
+    /// signaled. Without `apply`, no memory, event or channel state changes;
+    /// loaded bytes are not read.
+    fn run(&mut self, cx: &mut Cx<'_>, n: usize, apply: bool) -> Result<RunOutcome, String> {
         let mut t = self.threads[n].clone();
-        let mut fifo = VecDeque::new();
-        let mut bytes = 0;
-        let mut first: [Option<u32>; 2] = [None; 2];
+        let mut paced = vec![0u64; self.sources.len()];
         let fetch = |cx: &Cx<'_>, pc: u32, len: usize| cx.ram_bytes(u64::from(pc), len);
         for _ in 0..STEP_LIMIT {
             let pc = t.pc;
@@ -170,16 +386,23 @@ impl Pl330 {
             match op {
                 // DMAEND
                 0x00 => {
+                    let transfer = Transfer {
+                        bytes: t.bytes,
+                        source: t.source.unwrap_or(0),
+                        destination: t.destination.unwrap_or(0),
+                        paced_ticks: self.paced_ticks(&paced),
+                    };
                     t.running = false;
                     t.due = None;
+                    t.waiting = None;
+                    t.fifo.clear();
+                    t.bytes = 0;
+                    t.source = None;
+                    t.destination = None;
                     if apply {
                         self.threads[n] = t;
                     }
-                    return Ok(Transfer {
-                        bytes,
-                        source: first[0].unwrap_or(0),
-                        destination: first[1].unwrap_or(0),
-                    });
+                    return Ok(RunOutcome::Ended(transfer));
                 }
                 // DMALD, DMALDP<S|B>
                 0x04 | 0x25 | 0x27 => {
@@ -187,11 +410,12 @@ impl Pl330 {
                         len = 2;
                     }
                     let count = ((1u32 << (t.ccr >> 1 & 7)) * ((t.ccr >> 4 & 15) + 1)) as usize;
-                    first[0].get_or_insert(t.sar);
+                    t.source.get_or_insert(t.sar);
+                    self.pace(&mut paced, u64::from(t.sar), count);
                     if apply {
-                        fifo.extend(self.load(cx, u64::from(t.sar), count)?);
+                        t.fifo.extend(self.load(cx, u64::from(t.sar), count)?);
                     } else {
-                        fifo.extend(std::iter::repeat_n(0, count));
+                        t.fifo.extend(std::iter::repeat_n(0, count));
                     }
                     if t.ccr & 1 != 0 {
                         t.sar = t.sar.wrapping_add(count as u32);
@@ -203,21 +427,47 @@ impl Pl330 {
                         len = 2;
                     }
                     let count = ((1u32 << (t.ccr >> 15 & 7)) * ((t.ccr >> 18 & 15) + 1)) as usize;
-                    if fifo.len() < count {
+                    if t.fifo.len() < count {
                         return Err("PL330 store exceeds loaded data".into());
                     }
-                    let data: Vec<u8> = fifo.drain(..count).collect();
-                    first[1].get_or_insert(t.dar);
+                    let data: Vec<u8> = t.fifo.drain(..count).collect();
+                    t.destination.get_or_insert(t.dar);
                     let at = u64::from(t.dar);
+                    self.pace(&mut paced, at, count);
                     match self.sources.iter().find(|s| s.contains(at, count)) {
                         Some(source) if !source.writable() => {
-                            return Err("PL330 store into a read-only source".into());
+                            return Err(format!(
+                                "PL330 store into a read-only source at {at:#x} ({count} bytes)"
+                            ));
                         }
                         Some(source) if apply => source.write(at, &data)?,
                         None if apply => cx.ram_write(at, &data)?,
                         _ => {}
                     }
-                    bytes += count as u64;
+                    t.bytes += count as u64;
+                    if t.ccr >> 14 & 1 != 0 {
+                        t.dar = t.dar.wrapping_add(count as u32);
+                    }
+                }
+                // DMASTZ: store one destination burst of zeros without using the FIFO
+                // (X-T5 4.31 audio serial instance 1 transmit program clears its buffer with it).
+                0x0c => {
+                    let count = ((1u32 << (t.ccr >> 15 & 7)) * ((t.ccr >> 18 & 15) + 1)) as usize;
+                    t.destination.get_or_insert(t.dar);
+                    let at = u64::from(t.dar);
+                    self.pace(&mut paced, at, count);
+                    let zeros = vec![0u8; count];
+                    match self.sources.iter().find(|s| s.contains(at, count)) {
+                        Some(source) if !source.writable() => {
+                            return Err(format!(
+                                "PL330 store into a read-only source at {at:#x} ({count} bytes)"
+                            ));
+                        }
+                        Some(source) if apply => source.write(at, &zeros)?,
+                        None if apply => cx.ram_write(at, &zeros)?,
+                        _ => {}
+                    }
+                    t.bytes += count as u64;
                     if t.ccr >> 14 & 1 != 0 {
                         t.dar = t.dar.wrapping_add(count as u32);
                     }
@@ -248,12 +498,59 @@ impl Pl330 {
                     if apply {
                         self.signal(cx, event)?;
                     }
+                    if self.paced(&t) {
+                        t.pc = t.pc.wrapping_add(len);
+                        self.run_instant(cx, &mut t)?;
+                        let transfer = Transfer {
+                            bytes: t.bytes,
+                            source: t.source.unwrap_or(0),
+                            destination: t.destination.unwrap_or(0),
+                            paced_ticks: self.paced_ticks(&paced),
+                        };
+                        if apply {
+                            self.threads[n] = t;
+                        }
+                        return Ok(RunOutcome::Yielded(transfer));
+                    }
                 }
-                // DMAADDH SAR/DAR
-                0x54 | 0x56 => {
+                // DMAWFE. Wait at this PC until the event arrives.
+                0x36 => {
+                    len = 2;
+                    let event = u32::from(fetch(cx, pc + 1, 1)?[0] >> 3);
+                    if t.waiting == Some(event) {
+                        t.waiting = None;
+                        if apply && self.inten >> event & 1 == 0 {
+                            self.events &= !(1 << event);
+                        }
+                    } else if self.events >> event & 1 != 0 {
+                        if apply && self.inten >> event & 1 == 0 {
+                            self.events &= !(1 << event);
+                        }
+                    } else {
+                        t.waiting = Some(event);
+                        t.due = None;
+                        let transfer = Transfer {
+                            bytes: t.bytes,
+                            source: t.source.unwrap_or(0),
+                            destination: t.destination.unwrap_or(0),
+                            paced_ticks: self.paced_ticks(&paced),
+                        };
+                        if apply {
+                            self.threads[n] = t;
+                        }
+                        return Ok(RunOutcome::Blocked(transfer));
+                    }
+                }
+                // DMAADDH/DMAADNH SAR/DAR. DMAADNH's immediate is signed.
+                0x54 | 0x56 | 0x5c | 0x5e => {
                     len = 3;
                     let b = fetch(cx, pc + 1, 2)?;
-                    let add = u32::from(u16::from_le_bytes([b[0], b[1]]));
+                    let raw = u16::from_le_bytes([b[0], b[1]]);
+                    let add = if op & 0x08 == 0 {
+                        u32::from(raw)
+                    } else {
+                        i32::from(raw as i16) as u32
+                    };
                     if op & 2 == 0 {
                         t.sar = t.sar.wrapping_add(add);
                     } else {
@@ -266,7 +563,10 @@ impl Pl330 {
             }
             t.pc = t.pc.wrapping_add(len);
         }
-        Err("PL330 program exceeds step bound".into())
+        Err(format!(
+            "PL330 program exceeds step bound at pc {:#x} lc {:?}",
+            t.pc, t.lc
+        ))
     }
 
     fn debug(&mut self, cx: &mut Cx<'_>) -> Result<(), String> {
@@ -286,18 +586,25 @@ impl Pl330 {
                 let previous = self.threads[n].clone();
                 let mut t = previous.clone();
                 t.pc = second;
+                t.waiting = None;
+                t.fifo.clear();
+                t.bytes = 0;
+                t.source = None;
+                t.destination = None;
                 self.setup_registers(cx, &mut t)?;
                 self.threads[n] = t;
                 let transfer = match self.run(cx, n, false) {
-                    Ok(transfer) => transfer,
+                    Ok(
+                        RunOutcome::Ended(transfer)
+                        | RunOutcome::Blocked(transfer)
+                        | RunOutcome::Yielded(transfer),
+                    ) => transfer,
                     Err(e) => {
                         self.threads[n] = previous;
                         return Err(e);
                     }
                 };
-                let at = cx.now()
-                    + self.timing.setup_ticks
-                    + transfer.bytes.div_ceil(self.timing.bytes_per_tick);
+                let at = cx.now() + self.timing.setup_ticks + self.data_ticks(&transfer);
                 self.threads[n].running = true;
                 self.threads[n].due = Some(at);
                 cx.schedule(at, n as u64);
@@ -307,6 +614,11 @@ impl Pl330 {
                 let t = &mut self.threads[(first >> 8 & 7) as usize];
                 t.running = false;
                 t.due = None;
+                t.waiting = None;
+                t.fifo.clear();
+                t.bytes = 0;
+                t.source = None;
+                t.destination = None;
             }
             // DMASEV from the manager thread.
             (0, 0x34) => self.signal(cx, arg >> 3)?,
@@ -335,18 +647,25 @@ impl Pl330 {
             (0x024, false) => self.events,
             (0x028, false) => self.events & self.inten,
             (0x02c, true) => {
-                for e in (0..32).filter(|e| (value & self.events) >> e & 1 != 0) {
+                // Only bits that were pending can release a waiter. INTCLR
+                // clears events; it does not create one.
+                let cleared = value & self.events;
+                for e in (0..32).filter(|e| (cleared >> e) & 1 != 0) {
                     if let Some(&line) = self.irq_routes.get(e as usize) {
                         cx.set_irq(line, false);
                     }
                 }
                 self.events &= !value;
+                self.wake(cx, cleared)?;
                 0
             }
             // FSRD, FSRC, FTRD: no faults.
             (0x030 | 0x034 | 0x038, false) => 0,
-            // CSRn executing/stopped, CPCn.
-            (0x100..0x140, false) if o & 7 == 0 => u32::from(self.threads[n].running),
+            // CSRn executing/waiting/stopped, CPCn.
+            (0x100..0x140, false) if o & 7 == 0 => match self.threads[n].waiting {
+                Some(_) => 4,
+                None => u32::from(self.threads[n].running),
+            },
             (0x100..0x140, false) => self.threads[n].pc,
             (0x400..0x500, false) => match o & 0x1f {
                 0 => self.threads[c].sar,
@@ -406,21 +725,20 @@ impl Device for Pl330 {
     }
     fn event(&mut self, cx: &mut Cx<'_>, token: u64) {
         let n = token as usize;
-        if n >= CHANNELS || !self.threads[n].due.is_some_and(|at| at <= cx.now()) {
+        if n >= CHANNELS
+            || self.threads[n].waiting.is_some()
+            || !self.threads[n].due.is_some_and(|at| at <= cx.now())
+        {
             return;
         }
         match self.run(cx, n, true) {
-            Ok(transfer) => cx.record(Record::new(
-                "PL330 transfer complete",
-                [
-                    ("base", Field::int(self.base)),
-                    ("channel", Field::int(n as u64)),
-                    ("source", Field::int(u64::from(transfer.source))),
-                    ("destination", Field::int(u64::from(transfer.destination))),
-                    ("size", Field::int(transfer.bytes)),
-                    ("tick", Field::int(cx.now())),
-                ],
-            )),
+            Ok(RunOutcome::Ended(transfer)) => self.record_transfer(cx, n, transfer),
+            Ok(RunOutcome::Blocked(_)) => {}
+            Ok(RunOutcome::Yielded(_)) => {
+                if let Err(e) = self.advance(cx, n) {
+                    cx.fail(e);
+                }
+            }
             Err(e) => cx.fail(e),
         }
     }
@@ -467,8 +785,14 @@ impl Device for Pl330 {
         if routes != self.irq_routes || timing != self.timing {
             return Err("PL330 checkpoint wiring or timing differs".into());
         }
-        if threads.iter().any(|t| t.running != t.due.is_some()) {
-            return Err("PL330 checkpoint thread run state disagrees with its deadline".into());
+        if threads.iter().any(|t| {
+            t.running != (t.due.is_some() || t.waiting.is_some())
+                || (t.due.is_some() && t.waiting.is_some())
+                || t.waiting.is_some_and(|event| event >= 32)
+        }) {
+            return Err(
+                "PL330 checkpoint thread run state disagrees with its deadline or wait".into(),
+            );
         }
         Ok(())
     }
@@ -485,7 +809,7 @@ impl Device for Pl330 {
         Ok(())
     }
     fn fingerprint(&self) -> Result<Value, String> {
-        Ok(self.checkpoint()?.fingerprint())
+        Ok(self.checkpoint()?.state())
     }
 }
 
@@ -797,6 +1121,260 @@ mod tests {
     }
 
     #[test]
+    fn dmaadnh_subtracts_its_signed_immediate() {
+        let timing = Throughput {
+            setup_ticks: 16,
+            bytes_per_tick: 16,
+        };
+        let mut dma = Pl330::new(BASE, (207..211).collect(), vec![], timing).unwrap();
+        let mut h = TestHost {
+            now: 100,
+            ram: vec![0; 0x8000],
+            ..TestHost::default()
+        };
+        h.ram[0x3000..0x3010].fill(0xaa);
+        let mut program = vec![0xbc, 0];
+        program.extend(0x3010u32.to_le_bytes());
+        program.extend([0xbc, 2]);
+        program.extend(0x4010u32.to_le_bytes());
+        program.extend([0xbc, 1]);
+        program.extend(0x5c017u32.to_le_bytes());
+        program.extend([0x5c, 0xf0, 0xff]);
+        program.extend([0x5e, 0xf0, 0xff]);
+        program.extend([0x04, 0x08, 0x34, 0, 0]);
+        h.ram[0x100..0x100 + program.len()].copy_from_slice(&program);
+        write(&mut dma, &mut h, 0x20, 1 << 0);
+        dmago(&mut dma, &mut h, 0, 0x100);
+        // The eager DMAMOV preview publishes the program's initial addresses;
+        // DMAADNH runs at transfer time and moves the actual copy back 0x10.
+        assert_eq!(reg(&mut dma, &mut h, 0x400), 0x3010);
+        assert_eq!(reg(&mut dma, &mut h, 0x404), 0x4010);
+        assert_eq!(h.events, vec![(117, 0)]);
+        h.now = 117;
+        complete(&mut dma, &mut h, 0);
+        assert_eq!(h.ram[0x4000..0x4010], [0xaa; 16]);
+        assert_eq!(reg(&mut dma, &mut h, 0x400), 0x3010);
+        assert_eq!(reg(&mut dma, &mut h, 0x404), 0x4010);
+        assert_eq!(h.irqs, vec![(207, true)]);
+    }
+
+    #[test]
+    fn dmawfe_blocks_until_event_10_and_dmasev_2_raises_irq_209() {
+        let timing = Throughput {
+            setup_ticks: 10,
+            bytes_per_tick: 10,
+        };
+        let mut dma = Pl330::new(BASE, (207..211).collect(), vec![], timing).unwrap();
+        let mut h = TestHost {
+            now: 100,
+            ram: vec![0; 0x8000],
+            ..TestHost::default()
+        };
+        h.ram[0x3000..0x3010].fill(0xaa);
+        let mut program = vec![0xbc, 0];
+        program.extend(0x3000u32.to_le_bytes());
+        program.extend([0xbc, 2]);
+        program.extend(0x4000u32.to_le_bytes());
+        program.extend([0xbc, 1]);
+        program.extend(0x5c017u32.to_le_bytes());
+        // DMALD; DMAWFE 10; DMAST; DMASEV 2; DMAEND.
+        program.extend([0x04, 0x36, 10 << 3, 0x08, 0x34, 2 << 3, 0]);
+        h.ram[0x100..0x100 + program.len()].copy_from_slice(&program);
+        write(&mut dma, &mut h, 0x20, 1 << 2);
+
+        // The preview stops at the wait: setup only, with no bytes stored.
+        dmago(&mut dma, &mut h, 0, 0x100);
+        assert_eq!(h.events, vec![(110, 0)]);
+        assert_eq!(reg(&mut dma, &mut h, 0x100), 1);
+        h.now = 110;
+        complete(&mut dma, &mut h, 0);
+
+        // Blocked at DMAWFE with the loaded bytes retained in its FIFO.
+        assert_eq!(reg(&mut dma, &mut h, 0x100), 4);
+        assert_eq!(reg(&mut dma, &mut h, 0x104), 0x100 + SETUP_LEN + 1);
+        assert_eq!(h.ram[0x4000..0x4010], [0; 16]);
+        assert!(h.irqs.is_empty());
+        assert_eq!(h.records.len(), 0);
+
+        // The waiting thread, its FIFO and its accounting survive a checkpoint.
+        let saved = dma.checkpoint().unwrap();
+        let mut resumed = Pl330::new(BASE, (207..211).collect(), vec![], timing).unwrap();
+        resumed.validate_checkpoint(&saved).unwrap();
+        resumed.restore_checkpoint(&saved).unwrap();
+        let saved_json = dma.save();
+        let mut json_resumed = Pl330::new(BASE, (207..211).collect(), vec![], timing).unwrap();
+        json_resumed.restore(&saved_json).unwrap();
+        assert_eq!(json_resumed.save(), saved_json);
+        dma = resumed;
+        assert_eq!(reg(&mut dma, &mut h, 0x100), 4);
+
+        // CPU debug DMASEV 10 resumes it; the program then stores, signals
+        // event 2 and raises its routed IRQ 209.
+        write(&mut dma, &mut h, 0xd08, 0x5034_0000);
+        write(&mut dma, &mut h, 0xd04, 0);
+        assert_eq!(h.ram[0x4000..0x4010], [0xaa; 16]);
+        assert_eq!(h.irqs, vec![(209, true)]);
+        assert_eq!(h.records.len(), 1);
+        assert!(
+            h.records[0]
+                .fields
+                .iter()
+                .any(|(k, v)| k == "size" && *v == Field::int(16))
+        );
+        assert_eq!(reg(&mut dma, &mut h, 0x100), 0);
+        assert_eq!(reg(&mut dma, &mut h, 0x24), 1 << 2);
+
+        // Event 2 is an interrupt resource, so INTCLR clears it.
+        write(&mut dma, &mut h, 0x2c, 1 << 2);
+        assert_eq!(h.irqs, vec![(209, true), (209, false)]);
+        assert_eq!(reg(&mut dma, &mut h, 0x24), 0);
+    }
+
+    #[test]
+    fn intclr_wakes_an_interrupt_event_waiter_and_dmakill_forgets_the_wait() {
+        let timing = Throughput {
+            setup_ticks: 1,
+            bytes_per_tick: 1,
+        };
+        let mut dma = Pl330::new(BASE, (207..211).collect(), vec![], timing).unwrap();
+        let mut h = TestHost {
+            now: 100,
+            ram: vec![0; 0x2000],
+            ..TestHost::default()
+        };
+        // DMAWFE 2; DMAEND.
+        h.ram[0x100..0x104].copy_from_slice(&[0x36, 2 << 3, 0, 0]);
+        write(&mut dma, &mut h, 0x20, 1 << 2);
+        dmago(&mut dma, &mut h, 0, 0x100);
+        h.now = 101;
+        complete(&mut dma, &mut h, 0);
+        assert_eq!(reg(&mut dma, &mut h, 0x100), 4);
+
+        // An interrupt-mode event raises IRQ 209 but leaves the thread waiting.
+        write(&mut dma, &mut h, 0xd08, 0x1034_0000);
+        write(&mut dma, &mut h, 0xd04, 0);
+        assert_eq!(h.irqs, vec![(209, true)]);
+        assert_eq!(reg(&mut dma, &mut h, 0x100), 4);
+        assert_eq!(h.records.len(), 0);
+
+        // INTCLR lowers the interrupt and resumes the waiter.
+        write(&mut dma, &mut h, 0x2c, 1 << 2);
+        assert_eq!(h.irqs, vec![(209, true), (209, false)]);
+        assert_eq!(reg(&mut dma, &mut h, 0x100), 0);
+        assert_eq!(h.records.len(), 1);
+
+        // A killed waiter is forgotten: a later event cannot restart it.
+        h.ram[0x200..0x204].copy_from_slice(&[0x36, 10 << 3, 0, 0]);
+        dmago(&mut dma, &mut h, 0, 0x200);
+        h.now = 102;
+        complete(&mut dma, &mut h, 0);
+        assert_eq!(reg(&mut dma, &mut h, 0x100), 4);
+        write(&mut dma, &mut h, 0xd08, 0x0001_0001);
+        write(&mut dma, &mut h, 0xd04, 0);
+        assert_eq!(reg(&mut dma, &mut h, 0x100), 0);
+        write(&mut dma, &mut h, 0xd08, 0x5034_0000);
+        write(&mut dma, &mut h, 0xd04, 0);
+        assert_eq!(reg(&mut dma, &mut h, 0x100), 0);
+        assert_eq!(h.records.len(), 1);
+    }
+
+    #[test]
+    fn an_event_mode_signal_sets_es_without_an_irq_or_route() {
+        let timing = Throughput {
+            setup_ticks: 16,
+            bytes_per_tick: 16,
+        };
+        // Event 7 has no interrupt route; event mode does not need one.
+        let mut dma = Pl330::new(BASE, vec![207], vec![], timing).unwrap();
+        let mut h = TestHost {
+            now: 100,
+            ram: vec![0; 0x8000],
+            ..TestHost::default()
+        };
+        h.ram[0x3000..0x3010].fill(0xaa);
+        let mut program = vec![0xbc, 0];
+        program.extend(0x3000u32.to_le_bytes());
+        program.extend([0xbc, 2]);
+        program.extend(0x4000u32.to_le_bytes());
+        program.extend([0xbc, 1]);
+        program.extend(0x5c017u32.to_le_bytes());
+        // DMASEV 0 is routed but event-mode; DMASEV 7 has no route at all.
+        program.extend([0x04, 0x08, 0x34, 0 << 3, 0x34, 7 << 3, 0]);
+        h.ram[0x100..0x100 + program.len()].copy_from_slice(&program);
+        dmago(&mut dma, &mut h, 0, 0x100);
+        h.now = 117;
+        complete(&mut dma, &mut h, 0);
+        assert_eq!(h.ram[0x4000..0x4010], [0xaa; 16]);
+        // INTEN is zero, so both resources are events: ES latches them, the
+        // interrupt status stays clear and no route moves.
+        assert_eq!(reg(&mut dma, &mut h, 0x24), 1 | 1 << 7);
+        assert_eq!(reg(&mut dma, &mut h, 0x28), 0);
+        assert!(h.irqs.is_empty());
+        assert_eq!(h.records.len(), 1);
+    }
+
+    #[test]
+    fn intclr_does_not_wake_a_waiter_whose_event_was_never_signaled() {
+        let timing = Throughput {
+            setup_ticks: 1,
+            bytes_per_tick: 1,
+        };
+        let mut dma = Pl330::new(BASE, (207..211).collect(), vec![], timing).unwrap();
+        let mut h = TestHost {
+            now: 100,
+            ram: vec![0; 0x2000],
+            ..TestHost::default()
+        };
+        // DMAWFE 10; DMAEND.
+        h.ram[0x100..0x104].copy_from_slice(&[0x36, 10 << 3, 0, 0]);
+        dmago(&mut dma, &mut h, 0, 0x100);
+        h.now = 101;
+        complete(&mut dma, &mut h, 0);
+        assert_eq!(reg(&mut dma, &mut h, 0x100), 4);
+        // Neither its own bit nor a blanket clear is an event.
+        write(&mut dma, &mut h, 0x2c, 1 << 10);
+        assert_eq!(reg(&mut dma, &mut h, 0x100), 4);
+        write(&mut dma, &mut h, 0x2c, u32::MAX);
+        assert_eq!(reg(&mut dma, &mut h, 0x100), 4);
+        assert!(h.records.is_empty());
+        // A signaled event still releases it.
+        write(&mut dma, &mut h, 0xd08, 0x5034_0000);
+        write(&mut dma, &mut h, 0xd04, 0);
+        assert_eq!(reg(&mut dma, &mut h, 0x100), 0);
+        assert_eq!(h.records.len(), 1);
+    }
+
+    #[test]
+    fn intclr_does_not_start_or_complete_a_scheduled_transfer() {
+        let timing = Throughput {
+            setup_ticks: 16,
+            bytes_per_tick: 16,
+        };
+        let mut dma = Pl330::new(BASE, (207..211).collect(), vec![], timing).unwrap();
+        let mut h = TestHost {
+            now: 100,
+            ram: vec![0; 0x8000],
+            ..TestHost::default()
+        };
+        h.ram[0x3000..0x3010].fill(0xaa);
+        let program = copy_program(0x3000, 0x4000, 0x5c017, 2);
+        h.ram[0x100..0x100 + program.len()].copy_from_slice(&program);
+        write(&mut dma, &mut h, 0x20, 1 << 2);
+        dmago(&mut dma, &mut h, 0, 0x100);
+        // A blanket INTCLR while the job is merely scheduled must not run it.
+        write(&mut dma, &mut h, 0x2c, u32::MAX);
+        assert_eq!(reg(&mut dma, &mut h, 0x100), 1);
+        assert_eq!(h.ram[0x4000..0x4010], [0; 16]);
+        assert!(h.records.is_empty());
+        assert!(h.irqs.is_empty());
+        h.now = 117;
+        complete(&mut dma, &mut h, 0);
+        assert_eq!(h.ram[0x4000..0x4010], [0xaa; 16]);
+        assert_eq!(h.records.len(), 1);
+        assert_eq!(h.irqs, vec![(209, true)]);
+    }
+
+    #[test]
     fn stores_into_a_source_window_refuse() {
         let timing = Throughput {
             setup_ticks: 1,
@@ -836,6 +1414,44 @@ mod tests {
             self.0.lock().unwrap().push((address, bytes.to_vec()));
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_waiting_thread_that_signals_its_own_event_runs_once() {
+        let timing = Throughput {
+            setup_ticks: 1,
+            bytes_per_tick: 1,
+        };
+        let sink = Arc::new(Sink(Default::default()));
+        let mut dma = Pl330::new(BASE, vec![207], vec![sink.clone()], timing).unwrap();
+        let mut h = TestHost {
+            now: 100,
+            ram: vec![0; 0x2000],
+            ..TestHost::default()
+        };
+        h.ram[0x1000..0x1010].fill(7);
+        // DMAWFE 2; DMALD; DMAST; DMASEV 2; DMAEND.
+        let mut program = vec![0xbc, 0];
+        program.extend(0x1000u32.to_le_bytes());
+        program.extend([0xbc, 2]);
+        program.extend((ROM as u32 + 0x20).to_le_bytes());
+        program.extend([0xbc, 1]);
+        program.extend(0x5c017u32.to_le_bytes());
+        program.extend([0x36, 2 << 3, 0x04, 0x08, 0x34, 2 << 3, 0]);
+        h.ram[0x100..0x100 + program.len()].copy_from_slice(&program);
+        dmago(&mut dma, &mut h, 0, 0x100);
+        h.now = 101;
+        complete(&mut dma, &mut h, 0);
+        assert_eq!(reg(&mut dma, &mut h, 0x100), 4);
+        // Event 2 releases the thread; its own DMASEV 2 must not resume the
+        // same program counter a second time.
+        write(&mut dma, &mut h, 0xd08, 0x1034_0000);
+        write(&mut dma, &mut h, 0xd04, 0);
+        assert_eq!(sink.0.lock().unwrap().len(), 1);
+        assert_eq!(h.records.len(), 1);
+        assert_eq!(reg(&mut dma, &mut h, 0x100), 0);
+        // No thread waits, so the signaled event stays pending.
+        assert_eq!(reg(&mut dma, &mut h, 0x24), 1 << 2);
     }
 
     #[test]
@@ -912,6 +1528,113 @@ mod tests {
         assert_eq!(h.irqs, vec![(208, true)]);
     }
 
+    /// A FIFO that returns a 16-bit counter per two-byte load and paces each
+    /// four-byte frame at 100 ticks.
+    struct PacedFifo(std::sync::Mutex<u16>);
+    impl Source for PacedFifo {
+        fn contains(&self, address: u64, len: usize) -> bool {
+            address >= ROM && address + len as u64 <= ROM + 8
+        }
+        fn read(&self, _: u64, len: usize) -> Result<Vec<u8>, String> {
+            let mut next = self.0.lock().unwrap();
+            let mut out = vec![];
+            for _ in 0..len / 2 {
+                out.extend(next.to_le_bytes());
+                *next += 1;
+            }
+            Ok(out)
+        }
+        fn transfer_ticks(&self, bytes: u64) -> Option<u64> {
+            Some(bytes / 4 * 100)
+        }
+    }
+
+    fn samples(ram: &[u8]) -> Vec<u16> {
+        ram.chunks(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect()
+    }
+
+    #[test]
+    fn a_paced_ring_signals_one_buffer_per_period() {
+        let timing = Throughput {
+            setup_ticks: 1,
+            bytes_per_tick: 1,
+        };
+        let fifo = Arc::new(PacedFifo(Default::default()));
+        let mut dma = Pl330::new(BASE, (253..261).collect(), vec![fifo], timing).unwrap();
+        let mut h = TestHost {
+            ram: vec![0; 0x2000],
+            ..TestHost::default()
+        };
+        // The X-T5 audio-record ring (0x1396af8) in miniature: buffer A, then
+        // DMAWFE 1 (the CPU's permit); DMASEV 0 (buffer done); buffer B; the
+        // same wait and signal; DMALP 1/DMALPEND back to the start. Each buffer
+        // is DMALP 4 { DMAWFPS 0; DMALDPS 0; DMALDPS 0; DMAST } with 2-byte
+        // loads and 4-byte stores, 16 bytes.
+        let mut program = vec![0xbc, 0];
+        program.extend((ROM as u32).to_le_bytes());
+        program.extend([0xbc, 2]);
+        program.extend(0x1000u32.to_le_bytes());
+        program.extend([0xbc, 1]);
+        program.extend(0x0084_c202u32.to_le_bytes());
+        let buffer = [0x30, 0, 0x20, 3, 0x30, 0, 0x25, 0, 0x25, 0, 0x08, 0x38, 7, 0x13];
+        program.extend([0x30, 0]);
+        program.extend(&buffer[2..]);
+        program.extend([0x36, 1 << 3, 0x34, 0]);
+        program.extend([0xbc, 2]);
+        program.extend(0x1100u32.to_le_bytes());
+        program.extend(&buffer[2..]);
+        program.extend([0x36, 1 << 3, 0x34, 0]);
+        let back = program.len() as u8 + 2;
+        program.extend([0x20, 1, 0x38, back, 0]);
+        h.ram[0x100..0x100 + program.len()].copy_from_slice(&program);
+        let permit = |d: &mut Pl330, h: &mut TestHost| {
+            write(d, h, 0x2c, 1);
+            write(d, h, 0xd08, 0x34_0000 | 1 << 27);
+            write(d, h, 0xd04, 0);
+        };
+
+        write(&mut dma, &mut h, 0x20, 1);
+        dmago(&mut dma, &mut h, 0, 0x100);
+        permit(&mut dma, &mut h);
+        // Only buffer A's 16 bytes (four frames) are due: 1 + 400 ticks.
+        assert_eq!(h.events, vec![(401, 0)]);
+
+        h.now = 401;
+        complete(&mut dma, &mut h, 0);
+        assert_eq!(samples(&h.ram[0x1000..0x1010]), (0..8).collect::<Vec<_>>());
+        assert_eq!(h.ram[0x1100..0x1110], [0; 16]);
+        assert_eq!(h.irqs, vec![(253, true)]);
+        assert_eq!(h.events.last(), Some(&(801, 0)));
+
+        // A prompt CPU: buffer B completes one period later.
+        permit(&mut dma, &mut h);
+        h.now = 801;
+        complete(&mut dma, &mut h, 0);
+        assert_eq!(samples(&h.ram[0x1100..0x1110]), (8..16).collect::<Vec<_>>());
+        assert_eq!(h.irqs, vec![(253, true), (253, false), (253, true)]);
+        assert_eq!(h.events.last(), Some(&(1201, 0)));
+
+        // A late CPU: A' fills on time but waits for the permit, and its
+        // signal follows the permit at once; B' is due one period after that.
+        write(&mut dma, &mut h, 0x2c, 1);
+        h.now = 1201;
+        complete(&mut dma, &mut h, 0);
+        assert_eq!(samples(&h.ram[0x1000..0x1010]), (16..24).collect::<Vec<_>>());
+        assert_eq!(reg(&mut dma, &mut h, 0x100), 4);
+        assert_eq!(h.irqs.len(), 4);
+        h.now = 1500;
+        write(&mut dma, &mut h, 0xd08, 0x34_0000 | 1 << 27);
+        write(&mut dma, &mut h, 0xd04, 0);
+        assert_eq!(h.irqs.last(), Some(&(253, true)));
+        assert_eq!(h.events.last(), Some(&(1900, 0)));
+        assert_eq!(reg(&mut dma, &mut h, 0x100), 1);
+        assert_eq!(h.ram[0x1100..0x1110], samples_bytes(8..16)[..]);
+    }
+
+    fn samples_bytes(range: std::ops::Range<u16>) -> Vec<u8> {
+        range.flat_map(u16::to_le_bytes).collect()
+    }
+
     #[test]
     fn checkpoint_restores_threads_and_refuses_other_timing() {
         use fujimod_emulator_devices::test_host::{TestHost, assert_exact_restore, write};
@@ -942,6 +1665,125 @@ mod tests {
                 .unwrap()
                 .restore_checkpoint(&saved)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn checkpoint_refuses_contradictory_wait_state() {
+        let timing = Throughput {
+            setup_ticks: 4,
+            bytes_per_tick: 8,
+        };
+        let dma = Pl330::new(BASE, vec![40, 41], vec![], timing).unwrap();
+        let saved = dma.checkpoint().unwrap();
+        let (routes, timing, mut threads, inten, events, debug): SavedState =
+            saved.decode("pl330").unwrap();
+        let snapshot = |threads: &[Thread; CHANNELS]| {
+            fujimod_emulator_devices::checkpoint::Checkpoint::encode(
+                "pl330",
+                &(
+                    routes.clone(),
+                    timing,
+                    threads.clone(),
+                    inten,
+                    events,
+                    debug,
+                ),
+            )
+            .unwrap()
+        };
+        // A blocked thread is running only because it waits on an event.
+        threads[0].running = true;
+        threads[0].waiting = Some(4);
+        dma.validate_checkpoint(&snapshot(&threads)).unwrap();
+        // It cannot also carry a deadline.
+        threads[0].due = Some(5);
+        assert!(dma.validate_checkpoint(&snapshot(&threads)).is_err());
+        // Nor wait on an event the device does not have.
+        threads[0].due = None;
+        threads[0].waiting = Some(32);
+        assert!(dma.validate_checkpoint(&snapshot(&threads)).is_err());
+        // Running with neither a deadline nor a wait is still refused.
+        threads[0].waiting = None;
+        assert!(dma.validate_checkpoint(&snapshot(&threads)).is_err());
+    }
+
+    /// Firmware 24-bit audio-record ring (X-T5 0x1398168 generator, DARs moved into test RAM):
+    /// the CPU answers each event-0 interrupt like 0x1490fbc does (INTCLR, rewrite the completed
+    /// half, toggle the 0xec "jump to 0" patch, DMASEV 1); the stop writes DMAEND at the end of the
+    /// running half. One more interrupt must follow the stop before the channel ends.
+    #[test]
+    fn xt5_audio_ring_stop_raises_a_final_interrupt() {
+        struct Fifo;
+        impl Source for Fifo {
+            fn contains(&self, address: u64, len: usize) -> bool {
+                address >= 0xff91c000 && address + len as u64 <= 0xff91c004
+            }
+            fn read(&self, _: u64, len: usize) -> Result<Vec<u8>, String> {
+                Ok(vec![0; len])
+            }
+            fn transfer_ticks(&self, bytes: u64) -> Option<u64> {
+                Some(bytes * 10)
+            }
+        }
+        let hex = concat!(
+            "bc0000c091ffbc0200000100bc0104428c0030003000203b30002500085effff2500085effff2500085effff2500085e",
+            "ffff2500085effff2500085effff2500085effff2500085effff2500085effff2500085effff2500085effff2500085e",
+            "ffff2500085effff2500085effff2500085effff2500085effff13386318181818181818181818181818181818181818",
+            "181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818",
+            "181818181818181818181818181818181818181818181818181818181818181818181818181818360a34001818181818",
+            "bc0000c091ffbc0200100100bc0104428c00203b30002500085effff2500085effff2500085effff2500085effff2500",
+            "085effff2500085effff2500085effff2500085effff2500085effff2500085effff2500085effff2500085effff2500",
+            "085effff2500085effff2500085effff2500085effff1338631818181818181818181818181818181818181818181818",
+            "181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818181818",
+            "181818181818181818181818181818181818181818181818181818181818181818181818181818360a340018200138f2"
+        );
+        let program: Vec<u8> = (0..hex.len() / 2)
+            .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
+            .collect();
+        let timing = Throughput { setup_ticks: 1000, bytes_per_tick: 1 };
+        let mut dma = Pl330::new(BASE, (253..261).collect(), vec![Arc::new(Fifo)], timing).unwrap();
+        let mut h = TestHost { now: 0, ram: vec![0; 0x20000], ..TestHost::default() };
+        const P: usize = 0x1000;
+        h.ram[P..P + program.len()].copy_from_slice(&program);
+        write(&mut dma, &mut h, 0x20, 0x11);
+        dmago(&mut dma, &mut h, 0, P as u32);
+        write(&mut dma, &mut h, 0x2c, 1);
+        write(&mut dma, &mut h, 0xd08, 0x340000 | 1 << 27);
+        write(&mut dma, &mut h, 0xd04, 0);
+        let mut half = 0u8; // firmware toggle byte (0x2007c20)
+        let mut interrupts = 0;
+        let mut stopping = None;
+        for _ in 0..200 {
+            let seen = h.irqs.iter().filter(|i| **i == (253, true)).count();
+            if seen > interrupts {
+                interrupts = seen;
+                if let Some(at) = stopping {
+                    assert!(interrupts > at, "final interrupt arrived");
+                    return;
+                }
+                write(&mut dma, &mut h, 0x2c, 1);
+                if interrupts == 6 {
+                    let end = if half != 0 { 0xeb } else { 0x1db };
+                    h.ram[P + end] = 0;
+                    stopping = Some(interrupts);
+                } else {
+                    let patch: [u8; 4] = if half == 0 { [0x20, 1, 0x38, 0xee] } else { [0x18; 4] };
+                    h.ram[P + 0xec..P + 0xf0].copy_from_slice(&patch);
+                    half ^= 1;
+                }
+                write(&mut dma, &mut h, 0xd08, 0x340000 | 1 << 27);
+                write(&mut dma, &mut h, 0xd04, 0);
+                continue;
+            }
+            let Some(i) = (0..h.events.len()).min_by_key(|&i| h.events[i].0) else { break };
+            let (at, token) = h.events.remove(i);
+            h.now = h.now.max(at);
+            complete(&mut dma, &mut h, token);
+        }
+        panic!(
+            "no final interrupt: {} interrupts, thread pc {:#x} events {:#x}",
+            interrupts, dma.threads[0].pc, dma.events
         );
     }
 }

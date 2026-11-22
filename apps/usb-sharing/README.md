@@ -14,20 +14,27 @@ configured TURN credential lifetime, including when TURN is not enabled.
 Persistent rooms outlive their owner's connection until ended or idle; see
 [persistent links](../../crates/usb-proxy/SHARING.md#persistent-links-and-the-native-owner).
 
+## Local preview
+
+`apps/web` starts this Worker with `wrangler dev` on `127.0.0.1:8787` and proxies
+its public routes under the preview's own origin. That server supplies
+`ALLOWED_ORIGINS` and leaves `SHARING_ORIGIN` empty, so share links are
+site-relative. Production sets `SHARING_ORIGIN` in `wrangler.jsonc`.
+
 ## Deploy
 
 Use a Cloudflare account with Workers and SQLite Durable Objects available.
 From this directory:
 
 ```sh
-npm ci
+pnpm install --frozen-lockfile
 cf auth login
-npm test
-npm run check
-npm run deploy
+pnpm test
+pnpm run check
+pnpm run deploy
 ```
 
-`npm run deploy` uses the Cloudflare CLI's sign-in (see
+`pnpm run deploy` uses the Cloudflare CLI's sign-in (see
 [`scripts/cloudflare/wrangler.ts`](../../scripts/cloudflare/wrangler.ts)). It fails
 until R2 is enabled for the account, because `wrangler.jsonc` binds the private
 [issue-report](ISSUE_REPORTS.md) bucket.
@@ -78,8 +85,8 @@ Create a Realtime TURN key in the Cloudflare dashboard, then store its key ID an
 API token as Worker secrets using the interactive prompts:
 
 ```sh
-npx wrangler secret put TURN_KEY_ID
-npx wrangler secret put TURN_API_TOKEN
+pnpm exec wrangler secret put TURN_KEY_ID
+pnpm exec wrangler secret put TURN_API_TOKEN
 ```
 
 Do not put either value in Git, static build variables, browser code, or share
@@ -114,10 +121,10 @@ and storage have their own Cloudflare pricing, separate from TURN egress.
 
 ## Test
 
-`npm test` executes the actual Worker under Miniflare/workerd, including room
+`pnpm test` executes the actual Worker under Miniflare/workerd, including room
 ownership, opaque routing, revocation, temporary credential delivery, server
 secret isolation, issuance quotas and failed configuration. The Cloudflare API
-is mocked; these checks incur no Cloudflare charges. `npm run check` bundles a
+is mocked; these checks incur no Cloudflare charges. `pnpm run check` bundles a
 deployment without uploading it.
 
 The browser integration uses the built JS and native Python bindings and a named
@@ -142,3 +149,21 @@ live Cloudflare account or cross-network NAT behavior.
 References: [TURN credentials](https://developers.cloudflare.com/realtime/turn/generate-credentials/),
 [WebSocket hibernation](https://developers.cloudflare.com/durable-objects/best-practices/websockets/),
 [TURN pricing](https://developers.cloudflare.com/realtime/sfu/platform/pricing/).
+
+## CORS proxy
+
+`GET /proxy?url=<encoded URL>` streams a user-requested response
+from `fichiers.touslesdrivers.com/<id>/<filename>` (DAT or ZIP files),
+`dl.fujifilm-x.com/support/firmware/` (DAT or ZIP files), or the attachment
+endpoint on `fujifilm-korea.co.kr` (including `www`). URL policy lives in
+`proxy-policy.ts`; add host/path patterns there to allow other sources without
+changing the endpoint or streaming handler. No firmware hash list is required. Korea's attachment
+endpoint also serves other support files.
+
+Only configured website origins may use the route. It rejects redirects, sends
+no browser credentials upstream, and returns only the file body, content type
+and length with CORS and `Cache-Control: no-store`. It uses the existing
+connection rate limiter with a separate proxy key. It does not store files
+or use the Worker cache. The browser remains responsible for identifying and
+validating firmware before use. This transport policy does not grant a firmware
+license or establish fair use.

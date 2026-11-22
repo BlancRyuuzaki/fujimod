@@ -150,7 +150,13 @@ macro_rules! image_wire {
 
 /// Install this part's preparation of run image inputs.
 pub fn install_preparation() {
+    install_readable();
     fujimod_emulator_exr2_resources::install_image_preparation(preparation::prepare);
+}
+
+/// Install this part's readable snapshot decoder.
+pub fn install_readable() {
+    fujimod_emulator_exr2_resources::install_snapshot_json(checkpoint::readable);
 }
 
 /// Install the codec input logs use for this part's sensor frames.
@@ -331,7 +337,9 @@ impl ImageResources for Images {
             return Err("sensor RAW input must contain exactly width * height U16 samples".into());
         }
         let samples = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect();
         let frame = Frame::new(width, height, FramePixels::Raw16(samples))?;
@@ -375,6 +383,7 @@ impl ImageResources for Images {
     }
 
     fn checkpoint(&self) -> Result<ImageSnapshot, String> {
+        install_readable();
         checkpoint::checkpoint(self)
     }
     fn validate_checkpoint(&self, saved: &ImageSnapshot) -> Result<(), String> {
@@ -432,6 +441,9 @@ impl SensorState for Sensor {
             frames.push(self.0.latched.checkpoint()?);
         }
         Ok(frames)
+    }
+    fn fingerprint(&self) -> Result<serde_json::Value, String> {
+        Ok(self.0.fingerprint())
     }
     fn as_any(&self) -> &dyn Any {
         self

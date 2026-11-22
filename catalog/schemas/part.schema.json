@@ -1,5 +1,29 @@
 {
   "$defs": {
+    "ContactCamPosition": {
+      "additionalProperties": false,
+      "description": "A contact cam position along motor run time and its contact states.",
+      "properties": {
+        "contacts": {
+          "description": "Resulting contact states.",
+          "items": {
+            "type": "boolean"
+          },
+          "type": "array"
+        },
+        "run_ticks": {
+          "description": "Motor run time at which these contact states begin.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "run_ticks",
+        "contacts"
+      ],
+      "type": "object"
+    },
     "ContactPosition": {
       "additionalProperties": false,
       "description": "A pin drive position and its resulting contact states.",
@@ -1191,6 +1215,69 @@
             "interface"
           ],
           "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A motor-driven contact cam with a release latch. The attachment's\ninitial position is its run time at reset.",
+          "properties": {
+            "hold_drives": {
+              "description": "Drive values that hold the cam still.",
+              "items": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "const": "contact-cam",
+              "type": "string"
+            },
+            "latch_overrun_ticks": {
+              "description": "Run time past the latch tolerated before the drive stops.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "positions": {
+              "description": "Contact states along motor run time, ascending from 0; the last\nis the release latch.",
+              "items": {
+                "$ref": "#/$defs/ContactCamPosition"
+              },
+              "type": "array"
+            },
+            "release_drives": {
+              "description": "Hold drives under which a release input edge releases the latch.",
+              "items": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "release_ticks": {
+              "description": "Release input edge to the return to run time 0.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "run_drive": {
+              "description": "Drive value that runs the motor.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "run_drive",
+            "hold_drives",
+            "release_drives",
+            "positions",
+            "latch_overrun_ticks",
+            "release_ticks"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -1443,6 +1530,60 @@
             "page_bytes": {
               "default": null,
               "description": "Program-page capacity in bytes, when declared.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Serial NAND flash geometry and device identification, when declared.",
+          "properties": {
+            "jedec_id": {
+              "default": null,
+              "description": "JEDEC identification value, when supplied by the part definition.",
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "const": "serial-nand-flash",
+              "type": "string"
+            },
+            "page_bytes": {
+              "default": null,
+              "description": "Program-page capacity in bytes, when declared.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "pages_per_block": {
+              "default": null,
+              "description": "Pages per erase block, when declared.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "spare_bytes": {
+              "default": null,
+              "description": "Spare bytes per page, when declared.",
               "format": "uint64",
               "minimum": 0,
               "type": [

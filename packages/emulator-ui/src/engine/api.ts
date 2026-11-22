@@ -7,7 +7,6 @@ import type {
   CardState,
   CardTree,
   ControlInput,
-  Fingerprint,
   InputLog,
   Point,
   TouchPhase,
@@ -59,7 +58,12 @@ export interface EngineConfig {
   /** Physical contacts held before the first instruction of a cold boot. */
   bootInputs?: BootInput[];
   /** Cold boot with a fixed RTC; replay mode advances only through replay(). */
-  execution?: { mode: 'live' | 'replay'; clockSeconds2000?: number };
+  execution?: {
+    mode: 'live' | 'replay';
+    clockSeconds2000?: number;
+    /** Replay native inputs and time before starting the live clock. */
+    initialSteps?: readonly ReplayStep[];
+  };
 }
 export interface Engine {
   exportSnapshot(): Promise<Uint8Array>;
@@ -73,7 +77,7 @@ export interface Engine {
   undo(): Promise<Record<string, string>>;
   history(): Promise<InputLog>;
   replayHistory(bytes: Uint8Array): Promise<void>;
-  fingerprint(): Promise<Fingerprint>;
+  completeState(): Promise<Uint8Array>;
   prepare(config: EngineConfig): void;
   saveCamera(): Promise<void>;
   cameraSaves(

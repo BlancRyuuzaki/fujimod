@@ -21,18 +21,18 @@ interpreter, runtime adapter and browser checks. The shared
 Use `mise install`, then work in `apps/web`:
 
 ```sh
-npm ci
-npm --prefix packages/emulator-ui ci
+pnpm install --frozen-lockfile
 cd apps/web
-npm ci
-npm test
-npm run dev
+pnpm test
+pnpm run dev
 ```
 
 The root `web-build`, `web-test` and `web-preview` mise tasks run from that
 application directory. `web-test` runs both `@fujimod/emulator-ui` tests and the
-web app tests through `apps/web`'s `npm test`. The Pages workflow builds
-`apps/web` from approved main releases. Review branches do not deploy Pages.
+web app tests through `apps/web`'s `pnpm test`. The Web deploy workflow deploys `main`
+to `fujimod.com` nightly when it changed, reusing the deployed emulator runtimes and
+media; a maintainer deploys new runtimes by hand
+([apps/web/DEPLOYMENT.md](apps/web/DEPLOYMENT.md)). Merging does not deploy.
 
 ## Rust libraries
 
@@ -50,8 +50,6 @@ The Python package exposes the same execution core through `fujimod.emulator`.
 
 External EXR II board composers can consume `fujimod_emulator_exr2_boot_serial::BootSerialBlocks::devices()` into their device graph. Register each `Some(Mapping)` window and attach each `None` entry as an unmapped event device; the returned devices share one serial state and coordinator.
 
-`fujimod_emulator_devices::parts::nand::Nand` exports committed media through `committed_image()` and imports it into a fresh medium through `restore_committed()`. The caller supplies the board geometry and immutable base; import checks both geometry and base identity, then restores overlays, spare inputs, programmed pages and erased pages without CPU/controller/session state. Equivalent committed state produces deterministic bytes. The schema belongs to FujiMod, not a board-specific retained emulator format.
-
 ```sh
 cargo test --workspace --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -61,7 +59,7 @@ Every member depends on `fujimod-workspace-hack`, which
 [cargo-hakari](https://docs.rs/cargo-hakari) generates so that any package
 selection builds third-party crates with the same features and reuses one
 compiled copy. After adding or changing a dependency, run `mise run rust-hack`
-(install the tool with `cargo install cargo-hakari --version 0.9.39 --locked`);
+(`mise install` provides `cargo-hakari`);
 CI fails when the crate is out of date. `fujimod-unicorn-sys` compiles the
 Unicorn C archive with no features, so every feature set, test and binary of
 the CPU backend shares one archive per profile.
@@ -70,8 +68,7 @@ Development uses two profiles: `cargo test` builds the default debug profile,
 and every optimized local build (`--release`, `scripts/python_extension.py`,
 the emulator worker) shares `release`, which rebuilds in seconds: FujiMod
 crates at opt-level 2 without LTO, incremental, with dependencies fully
-optimized. `--profile dist` adds ThinLTO for published wheels and the web
-emulator; it runs about 5% faster and links for about 40 seconds longer.
+optimized. `--profile release-web` adds ThinLTO for the web emulator and web wheels; it runs about 5% faster and links for about 40 seconds longer.
 
 The core also builds for WebUSB. See the USB crate's
 [Wasm checks](crates/usb/README.md#wasm-core-checks) for the JS-runtime tests;
@@ -101,3 +98,11 @@ adapters handle execution and language boundaries.
 
 See [CI.md](CI.md) for the required checks, local commands, coverage reports and
 the distinction between public tests and firmware-dependent rehearsals.
+
+## License
+
+FujiMod is distributed under the GNU General Public License, version 2. See
+[LICENSE](LICENSE). The emulator runtime links Unicorn Engine, which is GPLv2
+as well; the source and modifications we use are in the
+[`justjake/unicorn`](https://github.com/justjake/unicorn) fork at the commit
+recorded as `unicorn_commit` in the runtime's `build.json`.

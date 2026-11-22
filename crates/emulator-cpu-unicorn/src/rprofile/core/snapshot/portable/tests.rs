@@ -17,6 +17,7 @@ fn options() -> Options {
                 reset: 0x70001001,
             },
         },
+        ..Default::default()
     }
 }
 fn processor(options: Options) -> Core {
@@ -69,25 +70,25 @@ fn fresh_processor_restores_architecture_tcm_pmu_clock_and_accounting_continuati
             .lock()
             .unwrap()
             .export_checkpoint();
-        let at_capture = cpu.fingerprint().unwrap();
+        let at_capture = cpu.state().unwrap();
         cpu.write_memory(0x70000023, &[0, 0]).unwrap();
         cpu.rprofile_identity(Some(0xffff)).unwrap();
         cpu.set_interrupt(Interrupt::Irq, true).unwrap();
-        let changed = cpu.fingerprint().unwrap();
+        let changed = cpu.state().unwrap();
         assert_eq!(saved.export().unwrap(), bytes);
-        assert_eq!(cpu.fingerprint().unwrap(), changed);
+        assert_eq!(cpu.state().unwrap(), changed);
         cpu.restore(saved.as_ref()).unwrap();
         assert_eq!(cpu.rprofile_identity(None).unwrap(), 0x5678);
         resume(&cpu, 2113).unwrap();
-        (bytes, monitors, at_capture, cpu.fingerprint().unwrap())
+        (bytes, monitors, at_capture, cpu.state().unwrap())
     };
     let target = processor(options());
-    let before = target.fingerprint().unwrap();
+    let before = target.state().unwrap();
     let imported = target.import_snapshot(&bytes).unwrap();
-    assert_eq!(target.fingerprint().unwrap(), before);
+    assert_eq!(target.state().unwrap(), before);
     target.restore(imported.as_ref()).unwrap();
     domain(&target, &monitors);
-    assert_eq!(target.fingerprint().unwrap(), at_capture);
+    assert_eq!(target.state().unwrap(), at_capture);
     assert_eq!(
         target
             .snapshot(Some(imported.as_ref()))
@@ -97,14 +98,14 @@ fn fresh_processor_restores_architecture_tcm_pmu_clock_and_accounting_continuati
         bytes
     );
     resume(&target, 2113).unwrap();
-    assert_eq!(target.fingerprint().unwrap(), expected);
+    assert_eq!(target.state().unwrap(), expected);
 }
 
 #[test]
 fn invalid_state_is_refused_before_cpu_private_memory_or_inputs_change() {
     let cpu = processor(options());
     let original = cpu.snapshot(None).unwrap().export().unwrap();
-    let before = cpu.fingerprint().unwrap();
+    let before = cpu.state().unwrap();
     for corrupt in 0..10 {
         let mut saved: State = decode(&original).unwrap();
         match corrupt {
@@ -122,12 +123,12 @@ fn invalid_state_is_refused_before_cpu_private_memory_or_inputs_change() {
             _ => saved.context.clear(),
         }
         assert!(cpu.import_snapshot(&encode(&saved).unwrap()).is_err());
-        assert_eq!(cpu.fingerprint().unwrap(), before);
+        assert_eq!(cpu.state().unwrap(), before);
     }
     let other = processor(Options::default());
-    let before = other.fingerprint().unwrap();
+    let before = other.state().unwrap();
     assert!(other.import_snapshot(&original).is_err());
-    assert_eq!(other.fingerprint().unwrap(), before);
+    assert_eq!(other.state().unwrap(), before);
 }
 
 #[test]
@@ -138,9 +139,9 @@ fn decode_binds_external_host_addresses_only_after_the_receiving_mapping_matches
     let bytes = source.snapshot(None).unwrap().export().unwrap();
     let target = processor(Options::default());
     let saved = target.import_snapshot(&bytes).unwrap();
-    let before = target.fingerprint().unwrap();
+    let before = target.state().unwrap();
     assert!(target.restore(saved.as_ref()).is_err());
-    assert_eq!(target.fingerprint().unwrap(), before);
+    assert_eq!(target.state().unwrap(), before);
     target.map_zeroed(0x3000, 0x1000, 3).unwrap();
     target.restore(saved.as_ref()).unwrap();
     assert_eq!(get(&target, arm::CORE[0]), 42);
@@ -192,8 +193,8 @@ fn portable_mapping_identity_is_independent_of_host_allocation_adjacency() {
     let imported = target.cpu.import_snapshot(&bytes).unwrap();
     target.cpu.restore(imported.as_ref()).unwrap();
     assert_eq!(
-        source.cpu.fingerprint().unwrap(),
-        target.cpu.fingerprint().unwrap()
+        source.cpu.state().unwrap(),
+        target.cpu.state().unwrap()
     );
 }
 
@@ -241,12 +242,12 @@ fn whole_domain_rebinding_preserves_exclusives_and_later_aba_writes_invalidate_t
         let target = &processor.cpu;
         let saved = target.import_snapshot(&bytes).unwrap();
         target.restore(saved.as_ref()).unwrap();
-        domain(&target, &monitors);
+        domain(target, &monitors);
         if aba {
-            words(&target, 0x2000, &[37]);
+            words(target, 0x2000, &[37]);
         }
-        resume(&target, 1).unwrap();
-        assert_eq!(get(&target, arm::CORE[2]), u32::from(aba));
+        resume(target, 1).unwrap();
+        assert_eq!(get(target, arm::CORE[2]), u32::from(aba));
         let mut bytes = [0; 4];
         target.read_memory(0x2000, &mut bytes).unwrap();
         assert_eq!(u32::from_le_bytes(bytes), if aba { 37 } else { 44 });

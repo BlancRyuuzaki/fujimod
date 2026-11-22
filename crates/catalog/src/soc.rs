@@ -34,6 +34,10 @@ pub struct SocHardware {
     pub companion: Option<CompanionHardware>,
     /// Additional block parameters, keyed by the block's identity.
     pub blocks: BTreeMap<String, BlockHardware>,
+    /// The byte every RAM cell holds at power-on, as read on a camera. Absent
+    /// when unmeasured; the emulator then starts RAM zeroed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub power_on_ram_fill: Option<u8>,
 }
 
 impl SocHardware {
@@ -365,8 +369,8 @@ pub enum BlockHardware {
     tsify(hashmap_as_object, missing_as_null)
 )]
 pub enum PictureLayout {
-    /// Blue, green, red and straight-alpha bytes.
-    Bgra8888Straight,
+    /// Straight-alpha, blue, green and red bytes, in memory order.
+    Abgr8888Straight,
 }
 
 /// Video-plane pixel packing declared by a display controller.

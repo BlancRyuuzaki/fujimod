@@ -4,7 +4,6 @@ use crate::{Pipe, RectangleComposition};
 use fujimod_framebuffer::Result;
 use fujimod_framebuffer::frame::Frame;
 use fujimod_framebuffer::frame::State as S;
-use sha2::{Digest, Sha256};
 
 pub const PROFILE: &str = "xm1-150-declared-luma-rectangle-overlay-unmeasured";
 pub const SIGNED_YCBCR_PROFILE: &str = "exr2-signed-ycbcr-rectangle-overlay-unmeasured";
@@ -135,14 +134,10 @@ pub fn decode(pipe: &Pipe, selected: Option<RectangleComposition>) -> Result<Vec
     Ok(rectangles)
 }
 
-pub fn compose(frame: &mut Frame, rectangles: &[Rectangle], diagnostic_hashes: bool) {
+pub fn compose(frame: &mut Frame, rectangles: &[Rectangle]) {
     if rectangles.is_empty() {
         return;
     }
-    frame.state.set(
-        "plane_sha256",
-        frame.state.get("frame_sha256").unwrap().clone(),
-    );
     frame.state.set(
         "rectangle_profile",
         S::str(match rectangles[0].composition {
@@ -150,30 +145,8 @@ pub fn compose(frame: &mut Frame, rectangles: &[Rectangle], diagnostic_hashes: b
             RectangleComposition::SignedYCbCr => SIGNED_YCBCR_PROFILE,
         }),
     );
-    let mut digest = diagnostic_hashes.then(Sha256::new);
-    if let Some(digest) = &mut digest {
-        digest.update(&frame.raw);
-    }
     let mut metadata = Vec::new();
     for r in rectangles {
-        for word in [
-            r.index,
-            r.left,
-            r.top,
-            r.right,
-            r.bottom,
-            r.thickness,
-            r.color,
-            r.opacity,
-        ] {
-            if let Some(digest) = &mut digest {
-                digest.update(word.to_le_bytes());
-            }
-        }
-        if let (Some(digest), Some((x, y))) = (&mut digest, r.corners) {
-            digest.update(x.to_le_bytes());
-            digest.update(y.to_le_bytes());
-        }
         let mut rectangle_metadata = vec![
             ("index", S::Int(r.index.into())),
             (
@@ -245,7 +218,7 @@ pub fn compose(frame: &mut Frame, rectangles: &[Rectangle], diagnostic_hashes: b
                 let x1 = (x1 as usize).min(frame.width);
                 for y in (y0 as usize).min(frame.height)..(y1 as usize).min(frame.height) {
                     let span = &mut rgb[(y * frame.width + x0) * 3..(y * frame.width + x1) * 3];
-                    for pixel in span.chunks_exact_mut(3) {
+                    for pixel in span.as_chunks_mut::<3>().0 {
                         for (value, color) in pixel.iter_mut().zip(r.rgb) {
                             *value = ((u32::from(*value) * (128 - r.opacity)
                                 + u32::from(color) * r.opacity
@@ -258,10 +231,6 @@ pub fn compose(frame: &mut Frame, rectangles: &[Rectangle], diagnostic_hashes: b
         }
     }
     frame.state.set("rectangles", S::List(metadata));
-    frame.state.set(
-        "frame_sha256",
-        digest.map_or(S::None, |d| S::str(&format!("{:x}", d.finalize()))),
-    );
     if let Some(S::List(mut limits)) = frame.state.get("limitations").cloned() {
         if rectangles.iter().any(|r| r.corners.is_some()) {
             limits.push(S::str("Auxiliary corner-frame inset lengths, inclusive endpoints and topmost order are declared, unmeasured interpretations"));

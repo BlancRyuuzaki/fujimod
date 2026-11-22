@@ -6,6 +6,7 @@ import { parseArgs } from 'node:util';
 import { createHash } from 'node:crypto';
 import { summarizeProfile, type CpuProfile } from './profile-summary.ts';
 import type { EmulatorModule } from '../../../bindings/javascript/emulator/module.ts';
+import { launchFujimod } from '../src/cameras/launch.playwright.ts';
 
 const { values } = parseArgs({
   options: {
@@ -70,7 +71,8 @@ function traceModule(module: EmulatorModule, sampleTicks: number) {
     return create(...args);
   };
   const prototype = module.Camera.prototype;
-  const replaceCard = prototype.replaceCard; // apply supplies the camera receiver.
+  // oxlint-disable-next-line typescript/unbound-method -- apply supplies the camera receiver.
+  const replaceCard = prototype.replaceCard;
   prototype.replaceCard = function (...args) {
     emit('card-boot', {
       files: args[0].map(({ path, length }) => ({ path, length })),
@@ -84,7 +86,8 @@ function traceModule(module: EmulatorModule, sampleTicks: number) {
     current.free();
     return result;
   };
-  const run = prototype.runUntil; // Saved with its receiver supplied by apply below.
+  // oxlint-disable-next-line typescript/unbound-method -- apply below supplies the receiver.
+  const run = prototype.runUntil;
   prototype.runUntil = function (...args) {
     const end = args[0];
     const advance = (tick: bigint) => {
@@ -104,7 +107,8 @@ function traceModule(module: EmulatorModule, sampleTicks: number) {
     } else advance(end);
     emit('run-end', { ...status(this), milliseconds: performance.now() - start });
   };
-  const boot = prototype.bootToRec; // Saved with its receiver supplied by apply below.
+  // oxlint-disable-next-line typescript/unbound-method -- apply below supplies the receiver.
+  const boot = prototype.bootToRec;
   prototype.bootToRec = function (...args) {
     const start = performance.now();
     emit('rec-start', status(this));
@@ -232,10 +236,7 @@ try {
     null,
     { timeout: 240_000 },
   );
-  await page.locator('input[type=file]').first().setInputFiles(values.update);
-  await page
-    .getByRole('button', { name: 'Run unmodified in your browser', exact: true })
-    .click({ timeout: 240_000 });
+  await launchFujimod(page, values.update);
   await page.waitForFunction(
     () =>
       performance.getEntriesByName('camera-engine-ready').length > 0 ||

@@ -3,10 +3,20 @@ use super::Board;
 use fujimod_emulator_devices::Device;
 
 impl Board {
-    /// Complete physical RAM digests without serializing device state.
-    pub fn memory_fingerprint(&self) -> Result<serde_json::Value, String> {
+    /// Complete physical RAM bytes without serializing device state.
+    pub fn memory_state(&self) -> Result<serde_json::Value, String> {
         let state = self.state.try_borrow().map_err(|_| "board is executing")?;
-        Ok(state.memory.fingerprint())
+        Ok(state.memory.memory_state())
+    }
+
+    pub fn display_frame_count(&self, output: usize) -> Result<u64, String> {
+        let state = self.state.try_borrow().map_err(|_| "board is executing")?;
+        let ids = state.bus.device_ids("display-timing");
+        self.track_device_kind("display-timing", &state.bus);
+        let [id] = ids.as_slice() else {
+            return Err("display frame count requires one display timing device".into());
+        };
+        state.bus.device_dyn(*id)?.display_frame_count(output)
     }
 
     pub fn device_states(&self, kind: &str) -> Result<serde_json::Value, String> {
@@ -15,10 +25,20 @@ impl Board {
         Ok(serde_json::json!(state.bus.device_states(kind)))
     }
 
-    pub fn device_fingerprints(&self, kind: &str) -> Result<serde_json::Value, String> {
+    /// Saved GIC state, for diagnostics.
+    pub fn gic_state(&self) -> Result<serde_json::Value, String> {
+        let state = self.state.try_borrow().map_err(|_| "board is executing")?;
+        Ok(state
+            .interrupts
+            .as_ref()
+            .map(|i| i.gic.save())
+            .unwrap_or(serde_json::Value::Null))
+    }
+
+    pub fn device_state_values(&self, kind: &str) -> Result<serde_json::Value, String> {
         let state = self.state.try_borrow().map_err(|_| "board is executing")?;
         self.track_device_kind(kind, &state.bus);
-        Ok(serde_json::json!(state.bus.device_fingerprints(kind)?))
+        Ok(serde_json::json!(state.bus.device_state_values(kind)?))
     }
 
     /// The current execution failure without observing devices.
@@ -44,7 +64,7 @@ impl Board {
         Ok(serde_json::json!({
             "execution_mode":s.bus.mode().name(), "execution_policy":s.execution_policy.name(),
             "counts_as_boot":s.bus.mode()==super::bus::Mode::Strict,
-            "timeline":s.timeline.save(), "instructions":s.instructions,
+            "timeline":s.timeline.save(), "instructions":s.instructions, "epoch_instructions":s.epoch_instructions, "power_off":s.power_off,
             "released":s.released, "waiting":s.waiting, "waiting_event":s.waiting_event,
             "events":s.events, "next_core":self.next_core.get(), "slice_left":self.slice_left.get(),
             "quantum":self.quantum.get(), "failure":s.error,
@@ -119,6 +139,9 @@ impl Board {
                 let capability = C::of_mut(device).ok_or(message)?;
                 let mut cx = fujimod_emulator_devices::Cx::new(host, usize::MAX, 0, id);
                 let result = input(capability, &mut cx);
+                if !cx.take_posted_writes().is_empty() {
+                    cx.fail("an external device input cannot issue bus-master MMIO writes");
+                }
                 Ok(match cx.take_refusal() {
                     Some(error) => Err(error),
                     None => result,
@@ -170,6 +193,9 @@ impl Board {
                 let device = bus.device_mut::<T>(id)?;
                 let mut cx = fujimod_emulator_devices::Cx::new(host, usize::MAX, 0, id);
                 let result = input(device, &mut cx);
+                if !cx.take_posted_writes().is_empty() {
+                    cx.fail("an external device input cannot issue bus-master MMIO writes");
+                }
                 // Return the operation's refusal inside the host result so
                 // already emitted IRQ effects still wake their controllers.
                 Ok(match cx.take_refusal() {
@@ -185,5 +211,9 @@ impl Board {
 }
 
 fn missing_capability<C: ?Sized>(device: &dyn Device) -> String {
-    format!("{} has no {} capability", device.name(), std::any::type_name::<C>())
+    format!(
+        "{} has no {} capability",
+        device.name(),
+        std::any::type_name::<C>()
+    )
 }

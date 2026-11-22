@@ -4,7 +4,6 @@
 mod camera;
 mod commands;
 mod display;
-mod fingerprint;
 mod history;
 pub mod jit;
 pub mod lifecycle;
@@ -17,7 +16,7 @@ use fujimod_emulator_session::card::{CardState, CardTree};
 use jit::{JitSelection, JitStatistics};
 use lifecycle::BootInput;
 use results::{
-    CardFile, Checkpoint, DeviceStates, DeviceWorkers, ErrorReport, Fingerprint, InputLog, Point,
+    CardFile, Checkpoint, DeviceStates, DeviceWorkers, ErrorReport, InputLog, Point,
     Preview, Profile, SavedMedia, SessionSnapshot, SessionState, TouchPhase, UsbStatus,
 };
 use serde::{Deserialize, Serialize};
@@ -134,6 +133,9 @@ pub fn memory_bytes() -> f64 {
 #[wasm_bindgen]
 #[derive(Clone, Copy)]
 pub struct Status {
+    /// Whether the modeled power controller is supplying the board.
+    #[wasm_bindgen(readonly, js_name = supplyOn)]
+    pub supply_on: bool,
     #[wasm_bindgen(readonly)]
     pub ticks: u64,
     #[wasm_bindgen(readonly)]
@@ -492,8 +494,10 @@ impl Camera {
     pub fn replay(&mut self, log: &[u8]) -> Result<Ts<Point>, Failure> {
         self.typed(|s| s.replay(log))
     }
-    pub fn fingerprint(&mut self) -> Result<Ts<Fingerprint>, Failure> {
-        self.typed(|s| s.fingerprint())
+    /// Complete stopped-session state as a canonical typed archive.
+    #[wasm_bindgen(js_name = completeState)]
+    pub fn complete_state(&mut self) -> Result<Vec<u8>, Failure> {
+        self.with(|s| s.complete_state())
     }
     /// Start the declared preview clock.
     pub fn preview(&mut self) -> Result<Ts<Preview>, Failure> {

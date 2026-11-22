@@ -3,7 +3,6 @@
 //! Ordinary physical RAM and shared monitor rollback belong to the board.
 use super::*;
 use fujimod_emulator_cpu::memory::pages::Image;
-use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::sync::atomic::Ordering;
 mod portable;
@@ -33,6 +32,7 @@ struct Saved {
     hint: Option<Hint>,
     exception: Option<arm::Exception>,
     failure: Option<String>,
+    data_cache: Option<crate::rprofile::data_cache::Saved>,
 }
 impl Snapshot for Saved {
     fn owner(&self) -> Identity {
@@ -111,34 +111,6 @@ impl Execution {
         }
         unsafe { self.cpu.observe_backings(&ranges) }
     }
-    pub(super) fn fingerprint(&self) -> Result<serde_json::Value, String> {
-        self.checkpoint_boundary()?;
-        let memory = self
-            .tcm
-            .iter()
-            .map(|bank| {
-                let bytes =
-                    unsafe { std::slice::from_raw_parts(bank.memory.as_ptr(), bank.memory.len()) };
-                serde_json::json!({"register":bank.register.get(),"memory":{
-                "bytes":bytes.len(),"sha256":format!("{:x}",Sha256::digest(bytes))}})
-            })
-            .collect::<Vec<_>>();
-        let mut maps = self.checkpoint_maps();
-        maps.sort_by_key(|m| m.address);
-        let reservation = self
-            .memory
-            .monitors
-            .lock()
-            .map_err(|_| "exclusive monitors poisoned")?
-            .reservation(self.monitor);
-        Ok(
-            serde_json::json!({"architecture":self.cpu.architecture_state()?, "identity_input":self.identity_input.get(), "pmu":self.pmu.get().fingerprint(),
-            "clock":self.clock.get().map(|c|serde_json::json!({"now":c.now,"phase":c.phase,"ratio":c.ratio.parts()})),
-            "execution_policy":self.policy.get().name(),
-            "tcm":memory,"irq":self.irq.get(),"reservation":reservation.map(|r|(r.address,r.size)),
-            "mappings":portable::maps_description(&maps) }),
-        )
-    }
     fn checkpoint_boundary(&self) -> Result<(), String> {
         self.memory.require_stopped()?;
         if self.active.get()
@@ -196,13 +168,12 @@ impl Core {
     ) -> Result<Box<dyn Snapshot>, String> {
         let e = &self.execution;
         e.checkpoint_boundary()?;
-        if let Some(previous) = previous {
-            if previous.owner() != self.identity()
+        if let Some(previous) = previous
+            && (previous.owner() != self.identity()
                 || !(previous.as_any().is::<Saved>()
-                    || previous.as_any().is::<portable::Imported>())
-            {
-                return Err("CPU snapshot belongs to a different processor/backend".into());
-            }
+                    || previous.as_any().is::<portable::Imported>()))
+        {
+            return Err("CPU snapshot belongs to a different processor/backend".into());
         }
         let context = e.cpu.snapshot(None)?;
         let tcm = std::array::from_fn(|bank| {
@@ -245,7 +216,58 @@ impl Core {
             hint: e.hint.get(),
             exception: e.exception.get(),
             failure: e.failure.borrow().clone(),
+            data_cache: e.data_cache.borrow().as_ref().map(|cache| cache.save()),
         }))
+    }
+    pub(super) fn direct_state(&self) -> Result<fujimod_emulator_cpu::CpuState, String> {
+        let saved = self.capture(None)?;
+        let saved = saved
+            .as_any()
+            .downcast_ref::<Saved>()
+            .ok_or("missing R-profile snapshot")?;
+        let tcm = saved
+            .tcm
+            .iter()
+            .map(|(register, image)| {
+                Ok(serde_json::json!({
+                    "register":register,
+                    "memory":image.to_bytes()?,
+                }))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let architecture = serde_json::to_vec(&serde_json::json!({
+            "architecture":self.execution.cpu.architecture_state()?,
+            "identity_input":saved.identity_input,
+            "pmu":saved.pmu,
+            "clock":saved.clock.map(|c| serde_json::json!({
+                "now":c.now,"phase":c.phase,"ratio":c.ratio.parts()
+            })),
+            "execution_policy":saved.policy.name(),
+            "tcm":tcm,
+            "irq":saved.irq,
+            "reservation":self
+                .execution
+                .memory
+                .monitors
+                .lock()
+                .map_err(|_| "exclusive monitors poisoned")?
+                .reservation(self.execution.monitor)
+                .map(|r| (r.address, r.size)),
+            "mappings":portable::maps_description(&saved.maps),
+        }))
+        .map_err(|error| error.to_string())?;
+        let mut backings = self
+            .execution
+            .maps
+            .borrow()
+            .iter()
+            .map(|map| map.bytes)
+            .collect::<Vec<_>>();
+        backings.sort_unstable();
+        Ok(fujimod_emulator_cpu::CpuState {
+            architecture,
+            backings,
+        })
     }
     pub(super) fn restore_captured(&self, snapshot: &dyn Snapshot) -> Result<(), String> {
         if snapshot.owner() != self.identity() {
@@ -331,6 +353,12 @@ impl Core {
         e.hint.set(saved.hint);
         e.exception.set(saved.exception);
         *e.failure.borrow_mut() = saved.failure.clone();
+        match (e.data_cache.borrow_mut().as_mut(), &saved.data_cache) {
+            (Some(cache), Some(lines)) => cache.restore(lines)?,
+            (None, None) => {}
+            _ => return Err("CPU snapshot data-cache presence differs".into()),
+        }
+        e.cache_spans_stale.set(true);
         e.rearm_observers()?;
         Ok(())
     }

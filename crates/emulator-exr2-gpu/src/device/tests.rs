@@ -95,6 +95,25 @@ fn setup_with_options(options: Options) -> (VectorGpu, Ram, [irq::InterruptContr
         controllers,
     )
 }
+#[test]
+fn next_deadline_tracks_the_earliest_scheduled_completion() {
+    let (mut gpu, mut host, _) = setup();
+    let now = host.now;
+    let mut actions = vec![
+        Action::Schedule {
+            delay: 20,
+            token: 2,
+        },
+        Action::Schedule {
+            delay: 10,
+            token: 1,
+        },
+    ];
+    gpu.actions(&mut Cx::new(&mut host, 0, 0, 0), &mut actions)
+        .unwrap();
+    assert!(actions.is_empty());
+    assert_eq!(gpu.next_deadline(now), Some(now + 10));
+}
 fn dmp_pair(words: &mut Vec<u32>, index: u16, value: u32) {
     words.extend([value, 0xf0000 | u32::from(index)]);
 }
@@ -107,7 +126,7 @@ fn dmp_upload(words: &mut Vec<u32>, index: u16, data: &[u32], increment: bool) {
             | u32::from(index),
     );
     words.extend_from_slice(&data[1..]);
-    if data.len() % 2 == 0 {
+    if data.len().is_multiple_of(2) {
         words.push(0xa5a5a5a5);
     }
 }
@@ -214,6 +233,7 @@ fn stock_gles_submit_register_executes_uniform_shader_draw() {
     assert_eq!(host.writes, 0);
     host.now = deadline;
     gpu.advance(&mut Cx::new(&mut host, 0, 0, 2));
+    assert_eq!(gpu.next_deadline(host.now), None);
     assert_eq!(host.effects, [(1, IRQ.into())]);
     assert!(host.writes > 0);
     assert_eq!(
@@ -313,7 +333,7 @@ fn x70_frame_job(
     let (mut gpu, mut host, mut controllers) = setup_with_options(options);
     enable(&mut controllers, &mut host, 1);
     let mut commands = dmp_quads(quads);
-    if commands.len() % 2 != 0 {
+    if !commands.len().is_multiple_of(2) {
         commands.push(0);
     }
     let ticks = gles_job_ticks(&mut gpu, &mut host, &commands);
@@ -401,6 +421,77 @@ fn put(gpu: &mut VectorGpu, host: &mut Ram, logical: u64, value: u64) -> Option<
     gpu.write(&mut cx, super::super::BASE + logical * 2, 4, value);
     cx.take_refusal()
 }
+#[test]
+fn failed_access_still_publishes_a_due_completion() {
+    let (mut gpu, mut host, mut controllers) = setup();
+    enable(&mut controllers, &mut host, 1);
+    for (offset, value) in [
+        (0x10, 128),
+        (0x14, 160),
+        (0x18, 0x12345678),
+        (0x1c, super::super::FILL_CONTROL.into()),
+    ] {
+        assert_eq!(put(&mut gpu, &mut host, offset, value), None);
+    }
+    host.now = 102;
+    let before = gpu.save();
+    let generation = gpu.publication_generation();
+    let mut cx = Cx::new(&mut host, 0, 0, 2);
+    gpu.write(&mut cx, super::super::BASE + 0x20, 2, 1);
+    assert!(cx.refusal().is_some());
+    assert_ne!(gpu.save(), before);
+    assert_ne!(gpu.publication_generation(), generation);
+}
+
+#[test]
+fn publication_generation_matches_writes_completions_and_checkpoint_restores() {
+    let (mut gpu, mut host, mut controllers) = setup();
+    enable(&mut controllers, &mut host, 1);
+    for (offset, value) in [
+        (0x10, 128),
+        (0x10, 128),
+        (0x14, 160),
+        (0x18, 0x12345678),
+        (0x1c, super::super::FILL_CONTROL.into()),
+    ] {
+        let before = gpu.save();
+        let generation = gpu.publication_generation();
+        assert_eq!(put(&mut gpu, &mut host, offset, value), None);
+        assert_eq!(
+            gpu.publication_generation() != generation,
+            gpu.save() != before
+        );
+    }
+    let saved = gpu.checkpoint().unwrap();
+    for now in [101, 102, 103] {
+        host.now = now;
+        let before = gpu.save();
+        let generation = gpu.publication_generation();
+        gpu.advance(&mut Cx::new(&mut host, 0, 0, 2));
+        assert_eq!(
+            gpu.publication_generation() != generation,
+            gpu.save() != before
+        );
+    }
+    let generation = gpu.publication_generation();
+    gpu.restore_checkpoint(&saved).unwrap();
+    assert_ne!(gpu.publication_generation(), generation);
+    let generation = gpu.publication_generation();
+    gpu.restore_checkpoint(&saved).unwrap();
+    assert_eq!(gpu.publication_generation(), generation);
+    let before = gpu.save();
+    let generation = gpu.publication_generation();
+    gpu.read(
+        &mut Cx::new(&mut host, 0, 0, 2),
+        super::super::BASE + 0x20,
+        4,
+    );
+    assert_eq!(
+        gpu.publication_generation() != generation,
+        gpu.save() != before
+    );
+}
+
 #[test]
 fn fill_commits_at_the_due_tick_routes_by_irq_enable_and_host_reads_are_pure() {
     let (mut gpu, mut host, mut controllers) = setup();

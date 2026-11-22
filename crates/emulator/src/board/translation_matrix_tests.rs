@@ -43,6 +43,7 @@
 //! | leaf `0x3`, read | read | `AArch64 access flag fault` | `the_walker_reports_exact_permission_faults` |
 //! | leaf `0x447`, PAN set, read | read | `AArch64 PAN permission fault` | `the_walker_reports_exact_permission_faults` |
 //! | `write_guest_memory` span, leaf `0x487` on second page | write | `AArch64 write permission fault` | `a_cross_page_span_is_walked_atomically` |
+use fujimod_catalog_configuration::RunEngine;
 use super::{
     bus::{Bus, Mode},
     factory, Board,
@@ -78,7 +79,7 @@ fn board(ram_size: u64) -> Board {
     .unwrap();
     graph
         .build(
-            factory::Options::new(factory::Engine::Unicorn)
+            factory::Options::new(RunEngine::Unicorn)
                 .with_translation_cache_size_bytes(1 << 20),
             Bus::new(Mode::Strict),
             None,

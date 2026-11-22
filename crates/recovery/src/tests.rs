@@ -145,6 +145,46 @@ fn crc32_matches_the_transfer_polynomial() {
     assert_eq!(xp4::crc32(b"123456789"), 0xcbf43926);
     assert_eq!(xp4::crc32(b""), 0);
 }
+/// The X-T5 4.31 startup keeps the update's selector: the preloaded selector leaves its body
+/// black. The recipe's facts are checked here against its own RAM image plan.
+#[test]
+fn xt5_431_startup_is_the_stock_selector_startup() {
+    let recipe = Recipe::bundled("xt5-431").unwrap().unwrap();
+    let setup = recipe.xp5.as_ref().unwrap();
+    assert!(setup.card_boot.is_none());
+    let stock = setup.stock_selector.as_ref().expect("X-T5 4.31 names a stock-selector startup");
+    // One edit, in the reset stage: `ldr x0, [x0, #8]` becomes `mov x0, #0x20000000`.
+    let edits: Vec<_> = stock.ram_edits.iter().map(|e| (e.address, e.old, e.new)).collect();
+    assert_eq!(edits, [(0x2ec4, 0xf940_0400, 0xd2a4_0000)]);
+    assert!(0x2ec4 < setup.reset_copy_size && setup.selector == 0x11a00);
+    // The cleared extents: the controller payload cache and the overlays, which are whole
+    // regions of the plan and end the image, and the erased tail of the reset stage's region.
+    let plan = recipe.plan.as_ref().unwrap();
+    let region = |name: &str| {
+        let region = plan.regions.iter().find(|r| r.name == name).unwrap();
+        (region.address, region.source.decoded_size)
+    };
+    let cleared: Vec<_> = stock.cleared.iter().map(|c| (c.address, c.size)).collect();
+    // The first is the erased tail of the reset stage's region, past what the stock setup copies.
+    let reset = region("reset stage");
+    assert_eq!(reset, (0, 0x20000));
+    assert_eq!(cleared[0], (0x18000, 0x8000));
+    assert!(cleared[0].0 >= setup.reset_copy_size && cleared[0].0 + cleared[0].1 == reset.1);
+    assert_eq!(cleared[1..], [region("controller payload cache"), region("overlays")]);
+    assert_eq!(cleared[2].0 + cleared[2].1, plan.size);
+    // The loader reads the card at the stock driver's default-speed clock divider.
+    assert_eq!(stock.transfer_clock_divider, Some(4));
+    assert!(stock.ram_edits.iter().all(|e| !e.what.is_empty()));
+    assert!(stock.cleared.iter().all(|c| !c.what.is_empty()));
+    // No other bundled recipe names one.
+    let catalog = fujimod_catalog::ReferenceCatalog::bundled().unwrap();
+    for id in catalog.firmware_ids().filter(|id| *id != "xt5-431") {
+        if let Some(other) = Recipe::bundled(id).unwrap() {
+            assert!(other.xp5.is_none_or(|setup| setup.stock_selector.is_none()), "{id}");
+        }
+    }
+}
+
 #[test]
 fn recipes_match_catalog_identities_and_generation() {
     let catalog = fujimod_catalog::ReferenceCatalog::bundled().unwrap();
@@ -169,7 +209,7 @@ fn recipes_match_catalog_identities_and_generation() {
         let status = availability(id).unwrap();
         assert_eq!(status.can_build, status.missing.is_empty());
         assert_eq!(
-            serde_json::to_value(status.sd_boot).unwrap(),
+            serde_json::to_value(status.sd_boot_combination).unwrap(),
             selected
                 .physical_controls
                 .as_ref()
@@ -206,4 +246,31 @@ fn cold_worker_requires_the_checked_condition_call_and_barrier_join() {
         assert!(xp4::worker(&changed, 0x30).is_err());
     }
     assert!(xp4::worker(&code, 0x34).is_err());
+}
+
+#[test]
+fn boot_files_are_an_allowlist_and_never_the_update() {
+    let file = |name: &str| File::new(name, vec![1]).unwrap();
+    let names = |files: &[File]| files.iter().map(|f| f.name.clone()).collect::<Vec<_>>();
+    let all = || vec![file("marble_init.bin"), file("ffboot.bin"), file("FPUPDATE.DAT")];
+    assert_eq!(
+        names(&boot_files_only(all(), "FPUPDATE.DAT").unwrap()),
+        ["marble_init.bin", "ffboot.bin"]
+    );
+    // The update is dropped whatever its case.
+    assert_eq!(
+        names(&boot_files_only(all(), "fpupdate.dat").unwrap()),
+        ["marble_init.bin", "ffboot.bin"]
+    );
+    // Anything else, a missing file, a repeat or another order is refused.
+    for bad in [
+        vec![file("marble_init.bin"), file("ffboot.bin"), file("extra.bin")],
+        vec![file("marble_init.bin"), file("FFBOOT.BIN")],
+        vec![file("marble_init.bin")],
+        vec![file("ffboot.bin"), file("marble_init.bin")],
+        vec![file("marble_init.bin"), file("ffboot.bin"), file("ffboot.bin")],
+        vec![file("FPUPDATE.DAT")],
+    ] {
+        assert!(boot_files_only(bad, "FPUPDATE.DAT").is_err());
+    }
 }

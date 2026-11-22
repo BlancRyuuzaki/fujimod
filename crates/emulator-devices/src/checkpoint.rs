@@ -3,7 +3,7 @@ mod archive;
 use serde::{Serialize, de::DeserializeOwned};
 use std::sync::Arc;
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Checkpoint {
     kind: std::borrow::Cow<'static, str>,
@@ -44,6 +44,9 @@ impl Checkpoint {
     pub fn children(&self) -> &[Checkpoint] {
         &self.children
     }
+    pub fn kind(&self) -> &str {
+        self.kind.as_ref()
+    }
     pub fn with_blobs(mut self, blobs: Vec<Arc<[u8]>>) -> Self {
         self.blobs = blobs;
         self
@@ -56,35 +59,77 @@ impl Checkpoint {
             + self.blobs.iter().map(|b| b.len()).sum::<usize>()
             + self.children.iter().map(Self::bytes).sum::<usize>()
     }
-    /// Content identity of the complete typed state: kind, encoded bytes,
-    /// blobs and children, with no host address or allocation identity.
-    pub fn fingerprint(&self) -> serde_json::Value {
-        use sha2::{Digest, Sha256};
-        let mut hash = Sha256::new();
-        fn visit(hash: &mut Sha256, state: &Checkpoint) {
-            let section = |hash: &mut Sha256, bytes: &[u8]| {
-                hash.update((bytes.len() as u64).to_le_bytes());
-                hash.update(bytes);
-            };
-            section(hash, state.kind.as_bytes());
-            section(hash, &state.bytes);
-            hash.update((state.blobs.len() as u64).to_le_bytes());
-            for blob in &state.blobs {
-                section(hash, blob);
-            }
-            hash.update((state.children.len() as u64).to_le_bytes());
-            for child in &state.children {
-                visit(hash, child);
+    /// Diagnostic extent of the complete typed state: kind, encoded byte
+    /// length, blob lengths and children. Binary content stays in the
+    /// checkpoint itself.
+    pub fn state(&self) -> serde_json::Value {
+        serde_json::json!({
+            "kind":self.kind,
+            "bytes":{"length":self.bytes.len()},
+            "blobs":self.blobs.iter().map(|blob| blob.len()).collect::<Vec<_>>(),
+            "children":self.children.iter().map(Self::state).collect::<Vec<_>>(),
+        })
+    }
+
+    /// First structural difference between two complete typed states.
+    pub fn diff(&self, other: &Self) -> Option<String> {
+        self.diff_at("state", other)
+    }
+
+    fn diff_at(&self, path: &str, other: &Self) -> Option<String> {
+        if self.kind != other.kind {
+            return Some(format!(
+                "{path}: kind {:?} differs from {:?}",
+                self.kind, other.kind
+            ));
+        }
+        if let Some(offset) = first_difference(&self.bytes, &other.bytes) {
+            return Some(format!("{path}/{}: bytes differ at offset {offset}", self.kind));
+        }
+        if self.blobs.len() != other.blobs.len() {
+            return Some(format!(
+                "{path}/{}: blob count {} differs from {}",
+                self.kind,
+                self.blobs.len(),
+                other.blobs.len()
+            ));
+        }
+        for (index, (left, right)) in self.blobs.iter().zip(&other.blobs).enumerate() {
+            if let Some(offset) = first_difference(left, right) {
+                return Some(format!(
+                    "{path}/{}: blob {index} differs at offset {offset}",
+                    self.kind
+                ));
             }
         }
-        visit(&mut hash, self);
-        serde_json::json!({"kind":self.kind,"bytes":self.bytes(),"sha256":format!("{:x}", hash.finalize())})
+        if self.children.len() != other.children.len() {
+            return Some(format!(
+                "{path}/{}: child count {} differs from {}",
+                self.kind,
+                self.children.len(),
+                other.children.len()
+            ));
+        }
+        for (index, (left, right)) in self.children.iter().zip(&other.children).enumerate() {
+            if let Some(message) = left.diff_at(&format!("{path}/{}/child[{index}]", self.kind), right)
+            {
+                return Some(message);
+            }
+        }
+        None
     }
     pub fn share_unchanged(&mut self, previous: &Self) {
         if self.kind == previous.kind && self.bytes == previous.bytes {
             self.bytes = previous.bytes.clone();
         }
     }
+}
+
+fn first_difference(left: &[u8], right: &[u8]) -> Option<usize> {
+    left.iter()
+        .zip(right)
+        .position(|(a, b)| a != b)
+        .or_else(|| (left.len() != right.len()).then_some(left.len().min(right.len())))
 }
 
 /// Complete owned fields. Shared wires use explicit implementations so restore
@@ -130,11 +175,11 @@ macro_rules! checkpoint_fields {
     };
 }
 
-/// Exact checkpoint, validation, restore and fingerprint of a device whose
+/// Exact checkpoint, validation, restore and state of a device whose
 /// mutable state is one serde value held in a field. `$check` is
 /// `fn(&Self, &$state) -> Result<(), String>` and validates the saved state
 /// against the device's wiring and invariants; restore assigns the field only
-/// after it passes. The fingerprint is the content identity of the same state.
+/// after it passes. The state JSON reports the extent of the same state.
 #[macro_export]
 macro_rules! checkpoint_state {
     ($field:ident : $state:ty, $check:path) => {
@@ -160,7 +205,7 @@ macro_rules! checkpoint_state {
             Ok(())
         }
         fn fingerprint(&self) -> std::result::Result<serde_json::Value, String> {
-            Ok(self.checkpoint()?.fingerprint())
+            Ok(self.checkpoint()?.state())
         }
     };
 }
@@ -185,16 +230,40 @@ pub mod array {
 }
 
 /// Encode contiguous byte storage as a CBOR byte string. JSON retains its
-/// ordinary integer-array representation, including diagnostic fingerprints.
+/// ordinary integer-array representation, including diagnostic state JSON.
 pub mod bytes {
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::{Deserializer, Serializer};
     pub fn serialize<S: Serializer>(value: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_bytes(value)
     }
     pub fn deserialize<'de, D: Deserializer<'de>, B: From<Vec<u8>>>(
         deserializer: D,
     ) -> Result<B, D::Error> {
-        Ok(Vec::<u8>::deserialize(deserializer)?.into())
+        struct Bytes;
+        impl<'de> serde::de::Visitor<'de> for Bytes {
+            type Value = Vec<u8>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("bytes")
+            }
+            fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<Self::Value, E> {
+                Ok(bytes.to_vec())
+            }
+            fn visit_byte_buf<E: serde::de::Error>(self, bytes: Vec<u8>) -> Result<Self::Value, E> {
+                Ok(bytes)
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(byte) = seq.next_element::<u8>()? {
+                    bytes.push(byte);
+                }
+                Ok(bytes)
+            }
+        }
+        // CBOR byte strings decode in bulk; JSON keeps its integer-array form.
+        Ok(deserializer.deserialize_byte_buf(Bytes)?.into())
     }
 }
 
@@ -313,6 +382,8 @@ mod tests {
         assert!(snapshot.bytes() < 8250);
         let decoded: Buffers = snapshot.decode("buffers").unwrap();
         assert_eq!(decoded, expected);
+        let decoded: Buffers = serde_json::from_value(serde_json::to_value(&expected).unwrap()).unwrap();
+        assert_eq!(decoded, expected);
         assert_eq!(
             serde_json::to_value(&decoded).unwrap(),
             serde_json::json!({
@@ -356,12 +427,12 @@ mod tests {
         let mut host = TestHost::new();
         write(&mut clock, &mut host, clock::BASE + 0x48, 1 << 28);
         let saved = clock.checkpoint().unwrap();
-        let state = clock.fingerprint().unwrap();
+        let state = saved.clone();
         advance(&mut clock, &mut host, 5);
         assert!(output.ready());
         clock.restore_checkpoint(&saved).unwrap();
         assert!(!output.ready());
-        assert_eq!(clock.fingerprint().unwrap(), state);
+        assert_eq!(clock.checkpoint().unwrap(), state);
         advance(&mut clock, &mut host, 4);
         assert!(!output.ready());
         advance(&mut clock, &mut host, 5);
@@ -369,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn state_macro_restores_after_validation_and_fingerprints_content() {
+    fn state_macro_restores_after_validation_and_retains_content() {
         use crate::{Cx, Device};
         #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
         struct State {
@@ -417,7 +488,7 @@ mod tests {
             state: State::default(),
         };
         other.restore_checkpoint(&saved).unwrap();
-        assert_eq!(other.fingerprint().unwrap(), probe.fingerprint().unwrap());
+        assert_eq!(other.checkpoint().unwrap(), probe.checkpoint().unwrap());
         assert!(
             other
                 .validate_checkpoint(&saved.clone().with_children(vec![saved.clone()]))

@@ -8,7 +8,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
@@ -66,9 +66,7 @@ fn opened(mut commands: Vec<E>, close: bool) -> Script {
     }
     Script::new(steps)
 }
-fn memory_script(value: u8, malformed: bool) -> Script {
-    let mut steps = info(4, "Model");
-    steps.extend(info(8, "1"));
+fn memory_read(value: u8, malformed: bool) -> Vec<E> {
     let request: Vec<u8> = [0x200001u32, 0, 0, 0, 2, 0, 0, 0x1000, 4]
         .into_iter()
         .flat_map(u32::to_le_bytes)
@@ -78,7 +76,12 @@ fn memory_script(value: u8, malformed: bool) -> Script {
     if malformed {
         response[0] ^= 1;
     }
-    steps.extend(exchange(request, response, 40));
+    exchange(request, response, 40)
+}
+fn memory_script(value: u8, malformed: bool) -> Script {
+    let mut steps = info(4, "Model");
+    steps.extend(info(8, "1"));
+    steps.extend(memory_read(value, malformed));
     opened(steps, !malformed)
 }
 struct TestSessions {
@@ -127,7 +130,9 @@ fn client(scripts: Vec<Script>) -> Client<TestSessions> {
         },
         mailbox_hint: None,
         fenced: false,
+        fatal: Arc::new(AtomicBool::new(false)),
         lease: None,
+        hold: false,
     }
 }
 #[test]
@@ -151,6 +156,33 @@ fn bounded_reads_release_ff80_before_reply_and_sync_or_idle_never_acquires() {
         }
         client.transaction(Operation::Close).await.unwrap();
         assert_eq!(client.sessions.opens.load(Ordering::SeqCst), 2);
+    });
+}
+#[test]
+fn a_held_session_serves_every_operation_until_close() {
+    block_on(async {
+        let mut steps = info(4, "Model");
+        steps.extend(info(8, "1"));
+        steps.extend(memory_read(1, false));
+        steps.extend(memory_read(2, false));
+        let script = opened(steps, true);
+        let mut client = client(vec![script.clone()]);
+        client.hold = true;
+        for value in [1, 2] {
+            let Answer::Bytes(data) = client
+                .transaction(Operation::Memory(0x1000, 4))
+                .await
+                .unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(data, vec![value; 4]);
+        }
+        // Identity once, no close between operations.
+        assert_eq!(script.remaining(), 2);
+        client.transaction(Operation::Close).await.unwrap();
+        assert_eq!(script.remaining(), 0);
+        assert_eq!(client.sessions.opens.load(Ordering::SeqCst), 1);
     });
 }
 #[test]
@@ -188,6 +220,7 @@ fn uncertain_completion_never_closes_reacquires_or_reclaims() {
                 .is_err()
         );
         assert!(client.fenced);
+        assert!(client.fatal.load(Ordering::Relaxed));
         assert_eq!(broken.remaining(), 0);
         assert!(matches!(
             client.transaction(Operation::Memory(0x1000, 4)).await,
@@ -195,6 +228,25 @@ fn uncertain_completion_never_closes_reacquires_or_reclaims() {
         ));
         assert_eq!(client.sessions.opens.load(Ordering::SeqCst), 1);
     });
+}
+
+#[test]
+fn owner_fence_errors_are_classified_before_opening_a_session() {
+    let fenced = fujimod_usb::Error::Proxy(fujimod_usb_proxy::Error(
+        "USB completion unknown; reconnect the device".into(),
+    ));
+    assert!(matches!(
+        classify_open(fenced),
+        fujimod_usb::Error::CompletionUnknown
+    ));
+    let busy = fujimod_usb::Error::Proxy(fujimod_usb_proxy::Error(
+        "Camera is in use by another session. Wait for its controller to release the device."
+            .into(),
+    ));
+    assert!(matches!(
+        classify_open(busy),
+        fujimod_usb::Error::SessionAlreadyOpen
+    ));
 }
 
 #[derive(Default)]
@@ -319,7 +371,9 @@ fn large_read_bursts_reuse_a_session_but_idle_sync_and_deadlines_release_it() {
             },
             mailbox_hint: None,
             fenced: false,
+            fatal: Arc::new(AtomicBool::new(false)),
             lease: None,
+            hold: false,
         };
         for _ in 0..2 {
             assert!(matches!(
@@ -403,17 +457,19 @@ fn sd_transactions_yield_to_another_ff80_client_and_revalidate_the_descriptor_hi
             },
             mailbox_hint: None,
             fenced: false,
+            fatal: Arc::new(AtomicBool::new(false)),
             lease: None,
+            hold: false,
         };
         for _ in 0..2 {
             assert!(matches!(
                 client
-                    .transaction(Operation::Card(Request::ReadDirectory {
+                    .transaction(Operation::Card(vec![Request::ReadDirectory {
                         path: "A:\\".into()
-                    }))
+                    }]))
                     .await
                     .unwrap(),
-                Answer::Card(Response::Directory(_))
+                Answer::Card(r) if matches!(r[..], [Response::Directory(_)])
             ));
             assert!(
                 !state.lock().unwrap().live,
@@ -425,8 +481,21 @@ fn sd_transactions_yield_to_another_ff80_client_and_revalidate_the_descriptor_hi
                     .unwrap();
             outside.close().await.unwrap();
         }
+        let batch = (0..3)
+            .map(|_| Request::ReadDirectory {
+                path: "A:\\".into(),
+            })
+            .collect();
+        assert!(matches!(
+            client.transaction(Operation::Card(batch)).await.unwrap(),
+            Answer::Card(r) if r.len() == 3
+        ));
         let state = state.lock().unwrap();
-        assert_eq!((state.opens, state.closes), (4, 4));
+        assert_eq!(
+            (state.opens, state.closes),
+            (5, 5),
+            "a batch shares one session and one attached service"
+        );
         assert_eq!(
             state.searches, 1,
             "the next transaction verifies the hint instead of rescanning"
@@ -471,40 +540,16 @@ fn unloading_an_absent_helper_never_acquires_usb() {
 }
 
 #[test]
-fn an_identity_without_catalog_firmware_is_its_own_connect_error() {
-    let error = ConnectError::UnsupportedFirmware {
-        product: "X-H2".into(),
-        internal_version: "3.51".into(),
-    };
-    assert_eq!(error.to_string(), "No catalog firmware for X-H2 3.51");
-    let boxed: Box<dyn std::error::Error> = error.into();
-    assert!(matches!(
-        boxed.downcast_ref::<ConnectError>(),
-        Some(ConnectError::UnsupportedFirmware { .. })
-    ));
-    assert!(matches!(
-        ConnectError::from("Selected firmware has no readable memory map"),
-        ConnectError::Failed(_)
-    ));
-    assert_ne!(EXIT_UNSUPPORTED_FIRMWARE, 1);
-}
-
-#[test]
-fn missing_mount_map_is_unsupported_before_opening_usb() {
+fn missing_mount_map_fails_before_opening_usb() {
     let limits = DebugMemoryLimits {
         read: std::num::NonZeroU32::new(256).unwrap(),
         write: std::num::NonZeroU32::new(1).unwrap(),
     };
-    let result = UsbDevice::connect("xh2-530".into(), None, limits, None);
-    match result {
+    match UsbDevice::connect("xh2-530".into(), None, limits, None, false) {
         Err(error) => {
-            assert_eq!(error.exit_status(), EXIT_UNSUPPORTED_FIRMWARE);
-            assert_eq!(error.to_string(), "No readable memory map for xh2-530");
+            assert_eq!(error.to_string(), "Selected firmware has no readable memory map");
+            assert!(error.downcast_ref::<fujimod_usb::Error>().is_none());
         }
         Ok(_) => panic!("Firmware without a state map must not start a USB worker"),
     }
-    assert_eq!(
-        ConnectError::from("USB transaction failed").exit_status(),
-        1
-    );
 }

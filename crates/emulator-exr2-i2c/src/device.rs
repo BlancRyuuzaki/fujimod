@@ -2,6 +2,7 @@
 //! Time, attached wire inputs and actual IRQ register outputs are the only
 //! capabilities. Discovery continuation is selected by the runtime bus.
 use super::{Channel, Registers, RouteBank, Routes, options::Options};
+use fujimod_emulator_devices::capability::GravityInput;
 use fujimod_emulator_devices::{Action, Cx, Device};
 use std::collections::BTreeMap;
 
@@ -19,6 +20,11 @@ pub struct I2cController {
     cable_expected: Option<bool>,
 }
 impl I2cController {
+    fn has_gravity_sensor(&self) -> bool {
+        self.engine.channel == Channel::Primary
+            && self.engine.parts.sensor_address.is_some()
+            && (self.engine.sensor_profile() || self.engine.parts.stationary)
+    }
     pub fn touch_period(&self) -> Result<u64, String> {
         self.engine
             .parts
@@ -75,18 +81,18 @@ impl I2cController {
     }
     fn settle_touch(&mut self, cx: &mut Cx<'_>) -> Result<(), String> {
         let (ready, reads) = (self.touch_ready(), self.touch_reads());
-        if let Some(panel) = &mut self.engine.parts.touch {
-            if let Some(frame) = panel.controller.tick(cx.now(), reads, ready)? {
-                let row = self
-                    .engine
-                    .parts
-                    .prefixed_registers
-                    .iter_mut()
-                    .find(|r| r.0 == panel.options.register)
-                    .ok_or("touch report register is absent")?;
-                row.1 = frame.to_vec();
-                cx.raise_irq(panel.options.core, panel.options.irq.into())?;
-            }
+        if let Some(panel) = &mut self.engine.parts.touch
+            && let Some(frame) = panel.controller.tick(cx.now(), reads, ready)?
+        {
+            let row = self
+                .engine
+                .parts
+                .prefixed_registers
+                .iter_mut()
+                .find(|r| r.0 == panel.options.register)
+                .ok_or("touch report register is absent")?;
+            row.1 = frame.to_vec();
+            cx.raise_irq(panel.options.core, panel.options.irq.into())?;
         }
         Ok(())
     }
@@ -127,7 +133,7 @@ impl I2cController {
             for register in 0..4 {
                 bridge.write_register(
                     register as u8,
-                    engine.parts.target_registers.get_or_zero(register) as u8,
+                    engine.bridge_registers().get_or_zero(register) as u8,
                 )?;
             }
         }
@@ -252,7 +258,7 @@ impl I2cController {
                 for register in 0..4 {
                     bridge.write_register(
                         register as u8,
-                        self.engine.parts.target_registers.get_or_zero(register) as u8,
+                        self.engine.bridge_registers().get_or_zero(register) as u8,
                     )?;
                 }
             }
@@ -260,7 +266,32 @@ impl I2cController {
         self.settle_touch(cx)
     }
 }
+impl GravityInput for I2cController {
+    fn gravity_g(&self) -> [f64; 3] {
+        self.engine.parts.gravity_g
+    }
+
+    fn set_gravity_g(&mut self, gravity: [f64; 3]) -> Result<(), String> {
+        if !self.has_gravity_sensor() {
+            return Err("bus has no modeled accelerometer".into());
+        }
+        if gravity
+            .iter()
+            .any(|value| !value.is_finite() || value.abs() > 2.0)
+        {
+            return Err("accelerometer gravity must be finite and within -2..2 g per axis".into());
+        }
+        self.engine.parts.gravity_g = gravity;
+        Ok(())
+    }
+}
 impl Device for I2cController {
+    fn gravity_input(&self) -> Option<&(dyn GravityInput + 'static)> {
+        self.has_gravity_sensor().then_some(self)
+    }
+    fn gravity_input_mut(&mut self) -> Option<&mut (dyn GravityInput + 'static)> {
+        self.has_gravity_sensor().then_some(self)
+    }
     fn touch_panel(&self) -> Option<&(dyn fujimod_emulator_devices::capability::TouchPanel + 'static)> {
         Some(self)
     }

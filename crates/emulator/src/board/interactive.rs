@@ -11,14 +11,21 @@ mod tests;
 pub(super) struct Epoch {
     clock: Clock,
     limit: u64,
+    boundary: fujimod_perf::EngineEndReason,
     progress: Vec<u64>,
     advanced: u64,
 }
 impl Epoch {
-    fn new(cores: usize, clock: Clock, limit: u64) -> Self {
+    fn new(
+        cores: usize,
+        clock: Clock,
+        limit: u64,
+        boundary: fujimod_perf::EngineEndReason,
+    ) -> Self {
         Self {
             clock,
             limit,
+            boundary,
             progress: vec![0; cores],
             advanced: 0,
         }
@@ -28,19 +35,50 @@ impl Epoch {
         timeline: &Timeline,
         until: Option<u64>,
     ) -> Result<(), String> {
-        let deadline = timeline
-            .next_event()
-            .map_or(u64::MAX, |event| event.at)
-            .min(until.unwrap_or(u64::MAX));
-        self.limit = self.limit.min(self.clock.ratio.budget(
-            self.clock.now,
-            self.clock.phase,
-            deadline,
-        )?);
+        let event = timeline.next_event();
+        let event_budget = event
+            .map(|event| {
+                self.clock
+                    .ratio
+                    .budget(self.clock.now, self.clock.phase, event.at)
+            })
+            .transpose()?
+            .unwrap_or(u64::MAX);
+        let until_budget = until
+            .map(|until| {
+                self.clock
+                    .ratio
+                    .budget(self.clock.now, self.clock.phase, until)
+            })
+            .transpose()?
+            .unwrap_or(u64::MAX);
+        if event_budget <= self.limit && event_budget <= until_budget {
+            self.boundary = match event.map(|event| event.target) {
+                Some(
+                    fujimod_emulator_cpu::timeline::Target::DeviceEvent(_)
+                    | fujimod_emulator_cpu::timeline::Target::DeviceDeadline(_),
+                ) => fujimod_perf::EngineEndReason::DeviceDeadline,
+                _ => fujimod_perf::EngineEndReason::OtherExit,
+            };
+        } else if until_budget <= self.limit {
+            self.boundary = fujimod_perf::EngineEndReason::OtherExit;
+        }
+        self.limit = self.limit.min(event_budget.min(until_budget));
         Ok(())
     }
     pub(super) fn room(&self, core: usize) -> u64 {
         self.limit.saturating_sub(self.progress[core])
+    }
+    /// Whether the cohort runs another segment. It ends when its first core
+    /// reaches the limit: a peer that executed less does not run on alone,
+    /// because shared memory shows it every store the exhausted cores made
+    /// while those cores cannot answer. A core that leaves a flag rendezvous
+    /// and clears the flags for its next round would then strand a peer that
+    /// set its flag but had not yet read the others, as firmware cross-core
+    /// cache maintenance does. The shortfall is forfeited, as by a slower
+    /// core; the next epoch starts every core together at the frontier.
+    pub(super) fn open(&self, cores: &[usize]) -> bool {
+        cores.iter().all(|&core| self.room(core) > 0)
     }
     fn clock(&self, core: usize) -> Result<Clock, String> {
         self.clock.after(self.progress[core])
@@ -60,8 +98,15 @@ struct Entry {
     core: usize,
     pc: u64,
     token: RunToken,
+    start_instructions: u64,
+    instruction_limit: u64,
+    boundary: fujimod_perf::EngineEndReason,
+    engine_run: fujimod_perf::EngineRunGuard,
     done: bool,
     pending: bool,
+    watch_or_observer_stop: bool,
+    interrupted_by_scheduler: bool,
+    failed: bool,
     exit: Option<Exit>,
 }
 
@@ -73,6 +118,7 @@ impl Board {
         cores: &[usize],
         budget: usize,
         quantum: usize,
+        boundary: fujimod_perf::EngineEndReason,
     ) -> Result<(), String> {
         let started = Instant::now();
         {
@@ -87,6 +133,7 @@ impl Board {
                     ratio: state.timeline.ratio(),
                 },
                 budget as u64,
+                boundary,
             ));
             state.code_run = None;
         }
@@ -127,12 +174,12 @@ impl Board {
                 {
                     return Ok(());
                 }
+                if !state.parallel.as_ref().unwrap().open(cores) {
+                    return Ok(());
+                }
                 for &core in cores {
                     let epoch = state.parallel.as_ref().unwrap();
                     let room = epoch.room(core);
-                    if room == 0 {
-                        continue;
-                    }
                     let cpu = &self.cpus[core];
                     if cpu.features().guest_clock {
                         cpu.set_guest_clock(epoch.clock(core)?)?;
@@ -144,10 +191,15 @@ impl Board {
                     } else {
                         pc
                     };
+                    let boundary = epoch.boundary;
                     state.accounted[core] = 0;
+                    let start_instructions = state.instructions[core];
                     prepared.push((
                         core,
                         pc,
+                        start_instructions,
+                        room,
+                        boundary,
                         Run {
                             begin,
                             until: None,
@@ -167,23 +219,32 @@ impl Board {
     // Every segment joins all its workers before returning, including errors.
     fn interactive_segment(
         &mut self,
-        prepared: Vec<(usize, u64, Run)>,
+        prepared: Vec<(usize, u64, u64, u64, fujimod_perf::EngineEndReason, Run)>,
         quantum: usize,
     ) -> Result<(), String> {
         let mut entries = Vec::with_capacity(prepared.len());
         let mut error = None;
-        for (core, pc, request) in prepared {
+        for (core, pc, start_instructions, instruction_limit, boundary, request) in prepared {
             let cpu = &self.cpus[core];
+            let engine_run = fujimod_perf::engine_run(u8::try_from(core).unwrap_or(u8::MAX), true);
             match cpu.start_run(request) {
                 Ok(token) => entries.push(Entry {
                     core,
                     pc,
                     token,
+                    start_instructions,
+                    instruction_limit,
+                    boundary,
+                    engine_run,
                     done: false,
                     pending: false,
+                    watch_or_observer_stop: false,
+                    interrupted_by_scheduler: false,
+                    failed: false,
                     exit: None,
                 }),
                 Err(e) => {
+                    engine_run.cancel();
                     error = Some(e.to_string());
                     break;
                 }
@@ -203,9 +264,16 @@ impl Board {
                     Ok(RunStatus::Complete(result)) => {
                         entry.done = true;
                         entry.pending = false;
+                        entry.engine_run.stop();
+                        entry.engine_run.set_instructions(
+                            self.cpus[entry.core].instruction_progress().unwrap_or(0),
+                        );
+                        entry.watch_or_observer_stop = self.host_pause.get()
+                            || self.state.borrow().continuation.borrow().fired;
                         match result {
                             Ok(exit) => entry.exit = Some(exit),
                             Err(e) => {
+                                entry.failed = true;
                                 error.get_or_insert_with(|| e.to_string());
                             }
                         }
@@ -213,14 +281,23 @@ impl Board {
                     Err(e) => {
                         entry.done = true;
                         entry.pending = false;
+                        entry.engine_run.stop();
+                        entry.engine_run.set_instructions(
+                            self.cpus[entry.core].instruction_progress().unwrap_or(0),
+                        );
+                        entry.watch_or_observer_stop = self.host_pause.get()
+                            || self.state.borrow().continuation.borrow().fired;
+                        entry.failed = true;
                         error.get_or_insert_with(|| e.to_string());
                     }
                 }
             }
             if !barrier && (error.is_some() || entries.iter().any(|e| e.done || e.pending)) {
                 barrier = true;
-                for entry in entries.iter().filter(|e| !e.done) {
+                for entry in entries.iter_mut().filter(|e| !e.done) {
+                    entry.interrupted_by_scheduler = true;
                     if let Err(e) = self.cpus[entry.core].request_pause(entry.token) {
+                        entry.failed = true;
                         error.get_or_insert_with(|| e.to_string());
                     }
                 }
@@ -272,14 +349,27 @@ impl Board {
             }
         }
         state.active_slice = None;
-        for entry in entries {
-            if let Some(exit) = entry.exit {
-                if let Err(e) =
+        for mut entry in entries {
+            if let Some(exit) = entry.exit
+                && let Err(e) =
                     state.finish_exit(&*self.cpus[entry.core], entry.core, entry.pc, exit)
-                {
-                    error.get_or_insert(e);
-                }
+            {
+                entry.failed = true;
+                error.get_or_insert(e);
             }
+            let instructions =
+                state.instructions[entry.core].saturating_sub(entry.start_instructions);
+            let reason = super::engine_end_reason(
+                entry.exit,
+                instructions,
+                entry.instruction_limit,
+                entry.boundary,
+                entry.watch_or_observer_stop,
+                entry.failed,
+                entry.interrupted_by_scheduler,
+            );
+            entry.engine_run.set_instructions(instructions);
+            entry.engine_run.finish(reason);
         }
         if let Err(e) = state.apply_memory(&self.cpus) {
             error.get_or_insert(e);

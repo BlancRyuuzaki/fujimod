@@ -1,6 +1,7 @@
+use fujimod_catalog_configuration::RunEngine;
 use super::*;
 use decoder::{Choice, Decoder};
-use factory::{Engine, Graph, MemoryMap, Options, Peripheral, Processor, Ram};
+use factory::{Graph, MemoryMap, Options, Peripheral, Processor, Ram};
 use fujimod_emulator_cpu::{Model, arm};
 use fujimod_emulator_cpu_unicorn::rprofile;
 use fujimod_emulator_devices::{Cx, Device};
@@ -52,7 +53,7 @@ fn graph(private_peer: bool) -> Graph {
             .map(|core| Processor {
                 model: Model::CortexR5F,
                 mprofile: None,
-                released: true,
+                released: true, parked_until_sgi: false,
                 rprofile: Some(rprofile::core::Options {
                     tcm: if private_peer && core == 1 {
                         rprofile::tcm::Options {
@@ -201,7 +202,7 @@ fn board_from_graph(graph: Graph, timed_selection: Option<(u64, usize)>) -> (Boa
     .unwrap();
     let board = graph
         .build(
-            Options::new(Engine::Unicorn).with_translation_cache_size_bytes(1024 * 1024),
+            Options::new(RunEngine::Unicorn).with_translation_cache_size_bytes(1024 * 1024),
             bus,
             None,
         )

@@ -15,6 +15,8 @@ export function testCameraModule(shared = false) {
     failed = false,
     createError = '',
     commandError = '',
+    restoreError = '',
+    supplyOn = true,
     frameEnabled = false,
     prepared: (request: string, camera?: Uint8Array) => void = () => {};
   const calls: { action: string; options: Record<string, unknown>; bytes: number[] }[] = [];
@@ -45,6 +47,7 @@ export function testCameraModule(shared = false) {
   const point = () => ({ tick: String(ticks), instructions: [String(ticks * 2n)] });
   const created = () => {
     if (createError) throw Error(createError);
+    calls.push({ action: 'create', options: {}, bytes: [] });
     return new TestCamera() as unknown as Camera;
   };
   const disposable = { free() {}, [Symbol.dispose]() {} };
@@ -87,7 +90,7 @@ export function testCameraModule(shared = false) {
       calls.push({ action: 'input', options: { key, pressed, at }, bytes: [] });
     }
     status() {
-      return { ticks, instructions: ticks * 2n, failed, ...disposable };
+      return { ticks, instructions: ticks * 2n, failed, supplyOn, ...disposable };
     }
     frame(output: number) {
       if (!frameEnabled) return undefined;
@@ -174,12 +177,14 @@ export function testCameraModule(shared = false) {
     }
     power(on: boolean) {
       record('power', { on });
+      supplyOn = on;
       state.poweredOn = on;
       ticks = 0n;
       return state;
     }
     powerCycle(inputs: BootInput[]) {
       record('power_cycle', { inputs });
+      supplyOn = true;
       state.poweredOn = true;
       ticks = 0n;
       return state;
@@ -227,6 +232,7 @@ export function testCameraModule(shared = false) {
         translation_cache_size_bytes: 0,
         scanout_instance: null,
         failure: null,
+        discovery_callee_stubs: null,
       };
     }
     preview() {
@@ -238,6 +244,7 @@ export function testCameraModule(shared = false) {
       return { ticksPerSecond: '12000000', frames: Number(ticks / 1200000n), state: {} };
     }
     checkpoint() {
+      if (!supplyOn) throw Error('cannot checkpoint during power-off reconstruction');
       record('checkpoint');
       return { id: String(ticks), ...point(), retainedIds: [String(ticks)] };
     }
@@ -265,9 +272,9 @@ export function testCameraModule(shared = false) {
       record('replay', {}, log);
       return point();
     }
-    fingerprint() {
-      record('fingerprint');
-      return { sha256: 'a'.repeat(64) };
+    completeState() {
+      record('complete_state');
+      return new Uint8Array();
     }
     profile(limit?: number | null) {
       record('profile', { limit });
@@ -304,6 +311,7 @@ export function testCameraModule(shared = false) {
     }
     restoreDurable(durable: Uint8Array) {
       record('restore_durable', {}, durable);
+      if (restoreError) throw Error(restoreError);
       return state;
     }
   }
@@ -325,9 +333,15 @@ export function testCameraModule(shared = false) {
     commandError(value: string) {
       commandError = value;
     },
+    restoreError(value: string) {
+      restoreError = value;
+    },
     /** Observe the prepared construction request text. */
     prepared(hook: (request: string, camera?: Uint8Array) => void) {
       prepared = hook;
+    },
+    supply(on: boolean) {
+      supplyOn = on;
     },
     fail() {
       failed = true;

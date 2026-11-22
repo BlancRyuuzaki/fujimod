@@ -6,8 +6,9 @@
 //!
 //! This models causal transfers, with no bus-arbitration timing claim: a ready
 //! beat runs at `now`. No timer is invented while waiting for a peripheral.
+use fujimod_emulator_devices::checkpoint::Checkpoint;
 use fujimod_emulator_devices::bus::InterruptLine;
-use fujimod_emulator_devices::dma::{Direction, SharedPort};
+use fujimod_emulator_devices::dma::{self, Direction, ReadWindow, SharedPort};
 use fujimod_emulator_devices::{Cx, Device};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -75,6 +76,12 @@ struct Channel {
     status: u8,
     remaining: u64,
     counter_exhausted: bool,
+    /// Count, source and destination as programmed for the last enabled transfer.
+    /// Re-enabling an exhausted channel without new values repeats that transfer:
+    /// the X-T5 4.31 M-core restarts its per-tick capture-table stream (DMA handle
+    /// `0x4000d`, routine `0x1fa90`) by setting only the enable bit.
+    #[serde(default)]
+    programmed: Option<[u32; 3]>,
     started: bool,
     irq_published: bool,
 }
@@ -100,8 +107,38 @@ pub struct Pair {
     routing: SharedRouting,
     connections: BTreeMap<u8, Connection>,
     interrupts: [Vec<InterruptLine>; 2],
+    /// Device-backed memory the channels may read where the bus has no RAM (board wiring).
+    read_windows: Vec<ReadWindow>,
 }
 impl Pair {
+    fn validate_state(&self, state: &State, routing: &Routing) -> Result<(), String> {
+        if state.control & !ENABLE != 0 || routing.requests.iter().any(|&r| r >= 64) {
+            return Err("XDMAC checkpoint global state differs".into());
+        }
+        let candidate = Self::new(
+            self.base,
+            Arc::new(Mutex::new(routing.clone())),
+            self.connections.clone(),
+            self.interrupts.clone(),
+        )?;
+        for (lane, c) in state.channels.iter().enumerate() {
+            if !matches!(c.status, 0 | 2 | 8)
+                || c.remaining > 1 << 32
+                || c.started && (!c.enabled() || state.control & ENABLE == 0)
+                || c.counter_exhausted && (c.remaining != 0 || c.enabled())
+            {
+                return Err("invalid XDMAC checkpoint state".into());
+            }
+            if c.enabled() {
+                candidate.validate(lane, c)?;
+                if c.remaining == 0 || c.remaining != c.count as u64 + 1 {
+                    return Err("invalid XDMAC checkpoint progress".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn new(
         base: u64,
         routing: SharedRouting,
@@ -117,7 +154,19 @@ impl Pair {
             routing,
             connections,
             interrupts,
+            read_windows: Vec::new(),
         })
+    }
+    /// Let the channels read these device-backed windows, such as the serial-flash aperture.
+    /// Writes into them still refuse.
+    pub fn with_read_windows(mut self, windows: Vec<ReadWindow>) -> Self {
+        self.read_windows = windows;
+        self
+    }
+    /// Global control reset state with the enable bit set (session assumption).
+    pub fn with_global_enable_at_reset(mut self) -> Self {
+        self.state.control = ENABLE;
+        self
     }
     fn connection(&self, lane: usize, c: &Channel) -> Result<Option<&Connection>, String> {
         let routing = self.routing.lock().map_err(|_| "XDMAC routing poisoned")?;
@@ -240,17 +289,17 @@ impl Pair {
         match self.connection(lane, c)? {
             Some(p) if p.direction == Direction::Receive => {
                 // Check destination before consuming an irreversible FIFO word.
-                cx.ram_read(c.destination as u64, &mut bytes[..width as usize])?;
+                dma::bus_read(&self.read_windows, cx, c.destination as u64, &mut bytes[..width as usize])?;
                 let word = p
                     .port
                     .lock()
                     .map_err(|_| "XDMAC port poisoned")?
                     .receive(cx.now(), width)?;
                 bytes = word.to_le_bytes();
-                cx.ram_write(c.destination as u64, &bytes[..width as usize])?;
+                dma::bus_write(&self.read_windows, cx, c.destination as u64, &bytes[..width as usize])?;
             }
             Some(p) => {
-                cx.ram_read(c.source as u64, &mut bytes[..width as usize])?;
+                dma::bus_read(&self.read_windows, cx, c.source as u64, &mut bytes[..width as usize])?;
                 p.port.lock().map_err(|_| "XDMAC port poisoned")?.transmit(
                     cx.now(),
                     width,
@@ -258,8 +307,8 @@ impl Pair {
                 )?;
             }
             None => {
-                cx.ram_read(c.source as u64, &mut bytes[..width as usize])?;
-                cx.ram_write(c.destination as u64, &bytes[..width as usize])?;
+                dma::bus_read(&self.read_windows, cx, c.source as u64, &mut bytes[..width as usize])?;
+                dma::bus_write(&self.read_windows, cx, c.destination as u64, &bytes[..width as usize])?;
             }
         }
         let c = &mut self.state.channels[lane];
@@ -329,10 +378,19 @@ impl Pair {
         }
         if register == 0x28 && value & ENABLE != 0 {
             let mut candidate = c.clone();
+            if candidate.counter_exhausted
+                && let Some([count, source, destination]) = candidate.programmed
+            {
+                candidate.count = count;
+                candidate.source = source;
+                candidate.destination = destination;
+                candidate.counter_exhausted = false;
+            }
             candidate.control = value;
             self.validate(lane, &candidate)?;
             candidate.remaining = candidate.count as u64 + 1;
             candidate.counter_exhausted = false;
+            candidate.programmed = Some([candidate.count, candidate.source, candidate.destination]);
             candidate.started = false;
             self.state.channels[lane] = candidate;
             self.routing.lock().unwrap().enabled[lane] = true;
@@ -414,6 +472,13 @@ impl Device for Pair {
                         self.state.channels[lane].control &= !(ENABLE | SOFTWARE);
                         self.state.channels[lane].started = false;
                         self.routing.lock().unwrap().enabled[lane] = false;
+                        // Name the failed transfer: a bare bus error does not say which copy it was.
+                        let c = &self.state.channels[lane];
+                        let request = self.routing.lock().unwrap().requests[lane];
+                        let e = format!(
+                            "{e}; lane={lane} request={request} control={:#x} source={:#x} destination={:#x} remaining={:#x}",
+                            c.control, c.source, c.destination, c.remaining
+                        );
                         cx.unsupported(e);
                     }
                 }
@@ -433,6 +498,21 @@ impl Device for Pair {
     }
     fn pollable(&self, address: u64, size: u8) -> bool {
         self.offset(address, size).is_some()
+    }
+    fn checkpoint(&self) -> Result<Checkpoint, String> {
+        Checkpoint::encode(self.name(), &(&self.state, &*self.routing.lock().unwrap()))
+    }
+    fn validate_checkpoint(&self, saved: &Checkpoint) -> Result<(), String> {
+        let (state, routing): (State, Routing) = saved.decode(self.name())?;
+        self.validate_state(&state, &routing)
+    }
+    fn restore_checkpoint(&mut self, saved: &Checkpoint) -> Result<(), String> {
+        let (state, mut routing): (State, Routing) = saved.decode(self.name())?;
+        self.validate_state(&state, &routing)?;
+        routing.enabled = state.channels.each_ref().map(|channel| channel.enabled());
+        *self.routing.lock().unwrap() = routing;
+        self.state = state;
+        Ok(())
     }
     fn save(&self) -> Value {
         let ports: Vec<_> = self
@@ -463,27 +543,7 @@ impl Device for Pair {
         {
             return Err("XDMAC checkpoint wiring or global state differs".into());
         }
-        let candidate = Self::new(
-            self.base,
-            Arc::new(Mutex::new(routing.clone())),
-            self.connections.clone(),
-            interrupts,
-        )?;
-        for (lane, c) in state.channels.iter().enumerate() {
-            if !matches!(c.status, 0 | 2 | 8)
-                || c.remaining > 1 << 32
-                || c.started && (!c.enabled() || state.control & ENABLE == 0)
-                || c.counter_exhausted && (c.remaining != 0 || c.enabled())
-            {
-                return Err("invalid XDMAC checkpoint state".into());
-            }
-            if c.enabled() {
-                candidate.validate(lane, c)?;
-                if c.remaining == 0 || c.remaining != c.count as u64 + 1 {
-                    return Err("invalid XDMAC checkpoint progress".into());
-                }
-            }
-        }
+        self.validate_state(&state, &routing)?;
         routing.enabled = state.channels.each_ref().map(|c| c.enabled());
         *self.routing.lock().unwrap() = routing;
         self.state = state;

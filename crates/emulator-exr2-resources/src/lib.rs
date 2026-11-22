@@ -15,10 +15,13 @@ use std::{
 
 mod images;
 pub use images::{
-    Edge, ImagePreparation, ImageResources, ImageSnapshot, ImageSpec, SensorFrame,
-    SensorFrameCodec, SensorRecord, SensorSnapshot, SensorState, install_image_preparation,
-    install_sensor_frame_codec, prepare_images,
+    Edge, ImagePreparation, ImageResources, ImageSnapshot, ImageSnapshotJson, ImageSpec,
+    SensorFrame, SensorFrameCodec, SensorRecord, SensorSnapshot, SensorState,
+    install_image_preparation, install_sensor_frame_codec, install_snapshot_json, prepare_images,
 };
+
+/// Host card files staged for FAT formatting, shared by handle.
+pub type CardFiles = BTreeMap<String, Vec<(String, Arc<[u8]>)>>;
 
 /// Prepared external media inputs. Firmware/file verification belongs to the
 /// frontend; these values contain bytes only.
@@ -26,7 +29,7 @@ pub use images::{
 pub struct Inputs {
     pub cards: BTreeMap<String, Card>,
     pub nands: BTreeMap<String, fujimod_emulator_devices::parts::nand::Nand>,
-    pub files: BTreeMap<String, Vec<(String, Vec<u8>)>>,
+    pub files: CardFiles,
 }
 
 /// A shared wire is declared once and has one concrete type. Every consumer
@@ -100,6 +103,7 @@ pub struct Resources {
     pub users: BTreeMap<String, BTreeSet<usize>>,
     pub image_users: BTreeMap<String, BTreeSet<usize>>,
     pub gpio: BTreeMap<String, gpio::Pads>,
+    pub analog: BTreeMap<String, fujimod_emulator_devices::parts::analog::Samples>,
     pub pulses: BTreeMap<String, pulse::PulsePins>,
     pub encoders: BTreeMap<String, fujimod_emulator_devices::parts::encoder_input::EncoderInput>,
     pub hdmi_sinks: BTreeMap<String, HdmiSink>,
@@ -136,9 +140,9 @@ impl Resources {
             json!({"wires":wires,"users":self.users,"image_users":self.image_users,"software_sources":self.software_sources,
                 "images":images,
                 "statistics":statistics,
-                "sensors":sensors,"cards":self.inputs.cards.iter().map(|(k,v)|(k,v.fingerprint())).collect::<BTreeMap<_,_>>(),
-                "nands":self.inputs.nands.iter().map(|(k,v)|(k,v.fingerprint())).collect::<BTreeMap<_,_>>(),
-                "files":self.inputs.files.iter().map(|(k,v)|(k,v.iter().map(|(path,data)|json!({"path":path,"contents":fujimod_emulator_devices::fingerprint::bytes(data)})).collect::<Vec<_>>())).collect::<BTreeMap<_,_>>()
+                "sensors":sensors,"cards":self.inputs.cards.iter().map(|(k,v)|(k,v.state())).collect::<BTreeMap<_,_>>(),
+                "nands":self.inputs.nands.iter().map(|(k,v)|(k,v.state())).collect::<BTreeMap<_,_>>(),
+                "files":self.inputs.files.iter().map(|(k,v)|(k,v.iter().map(|(path,data)|json!({"path":path,"contents":fujimod_emulator_devices::state::bytes(data)})).collect::<Vec<_>>())).collect::<BTreeMap<_,_>>()
             }),
         )
     }
@@ -166,7 +170,11 @@ impl Resources {
             .ok_or_else(|| format!("{name} has no connected models"))
     }
     pub fn image_users(&self, name: &str) -> Result<Vec<usize>, String> {
-        if !self.images.as_ref().is_some_and(|part| part.has_image(name)) {
+        if !self
+            .images
+            .as_ref()
+            .is_some_and(|part| part.has_image(name))
+        {
             return Err(format!("no such image input {name}"));
         }
         Ok(self

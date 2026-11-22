@@ -21,7 +21,9 @@ fn medium(page_bytes: usize, pages_per_block: u32, spare_bytes: usize) -> Nand {
 
 #[test]
 fn committed_state_cold_import_preserves_inputs_programs_and_erases_for_board_geometries() {
-    for (page_bytes, pages_per_block, spare_bytes) in [(512, 32, 16), (2048, 64, 512)] {
+    for (page_bytes, pages_per_block, spare_bytes) in
+        [(512, 32, 16), (2048, 64, 512), (4096, 64, 128)]
+    {
         let mut written = medium(page_bytes, pages_per_block, spare_bytes);
         written.erase(pages_per_block).unwrap();
         written
@@ -81,7 +83,7 @@ fn committed_output_is_deterministic_across_equivalent_program_order() {
 }
 
 #[test]
-fn committed_import_rejects_other_base_and_geometry_without_mutating_receiver() {
+fn committed_import_uses_the_receiver_base_and_rejects_other_geometry_without_mutation() {
     let source = medium(512, 32, 16);
     let export = source.committed_image().unwrap();
     let changed_base = Nand::new(
@@ -92,9 +94,11 @@ fn committed_import_rejects_other_base_and_geometry_without_mutating_receiver() 
     )
     .unwrap();
     let changed_geometry = medium(2048, 64, 64);
-    for receiver in [changed_base, changed_geometry] {
-        let before = receiver.committed_image().unwrap();
-        assert!(receiver.restore_committed(&export).is_err());
-        assert_eq!(receiver.committed_image().unwrap(), before);
-    }
+    let restored = changed_base.restore_committed(&export).unwrap();
+    let mut data = [0; 512];
+    restored.read(0, &mut data).unwrap();
+    assert_eq!(data, [0x76; 512]);
+    let before = changed_geometry.committed_image().unwrap();
+    assert!(changed_geometry.restore_committed(&export).is_err());
+    assert_eq!(changed_geometry.committed_image().unwrap(), before);
 }

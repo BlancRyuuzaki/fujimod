@@ -11,6 +11,7 @@ pub struct TestHost {
     pub effects: Vec<&'static str>,
     pub irqs: Vec<(usize, u32)>,
     pub levels: std::collections::BTreeMap<(usize, u32), bool>,
+    pub scanouts: Vec<crate::graphics::scanout::Frame>,
 }
 impl TestHost {
     pub fn new() -> Self {
@@ -26,6 +27,10 @@ impl TestHost {
 impl Host for TestHost {
     fn now(&self) -> u64 {
         self.now
+    }
+    fn power_off(&mut self) -> Result<(), String> {
+        self.effects.push("power-off");
+        Ok(())
     }
     fn schedule(&mut self, _: usize, _: u64, _: u64) {}
     fn set_irq(&mut self, _: u32, _: bool) {}
@@ -57,6 +62,10 @@ impl Host for TestHost {
             .ok_or("unmapped write")?
             .copy_from_slice(b);
         self.effects.push("dma");
+        Ok(())
+    }
+    fn scanout(&mut self, frame: crate::graphics::scanout::Frame) -> Result<(), String> {
+        self.scanouts.push(frame);
         Ok(())
     }
     fn record(&mut self, _: Record) {}
@@ -134,23 +143,18 @@ pub fn assert_exact_restore(
     d: &mut dyn Device,
     mutate: impl FnOnce(&mut dyn Device),
 ) -> crate::checkpoint::Checkpoint {
-    let before = d.fingerprint().unwrap();
+    let before = d.checkpoint().unwrap();
     let saved = d.checkpoint().unwrap();
-    assert_eq!(d.checkpoint().unwrap().fingerprint(), saved.fingerprint());
+    assert_eq!(d.checkpoint().unwrap(), before);
     mutate(d);
-    assert_ne!(
-        d.fingerprint().unwrap(),
-        before,
-        "the mutation changed nothing"
-    );
+    assert_ne!(d.checkpoint().unwrap(), before, "the mutation changed nothing");
     d.validate_checkpoint(&saved).unwrap();
     d.restore_checkpoint(&saved).unwrap();
-    assert_eq!(d.fingerprint().unwrap(), before);
-    assert_eq!(d.checkpoint().unwrap().fingerprint(), saved.fingerprint());
+    assert_eq!(d.checkpoint().unwrap(), before);
     let envelope = crate::checkpoint::Checkpoint::encode("envelope", &saved).unwrap();
     let decoded: crate::checkpoint::Checkpoint = envelope.decode("envelope").unwrap();
     d.restore_checkpoint(&decoded).unwrap();
-    assert_eq!(d.fingerprint().unwrap(), before);
+    assert_eq!(d.checkpoint().unwrap(), before);
     saved
 }
 

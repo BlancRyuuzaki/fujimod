@@ -61,6 +61,18 @@
           "id": "disp_back_button"
         }
       ]
+    },
+    "service": {
+      "usb": true,
+      "hold": [
+        {
+          "id": "selector.up"
+        },
+        {
+          "id": "shutter_button",
+          "stage": "full"
+        }
+      ]
     }
   },
   "controls": {
@@ -221,7 +233,9 @@
       "manual_page": 60,
       "face": "DRIVE",
       "icon": null,
-      "connection_ids": [],
+      "connection_ids": [
+        "controls-adc-6"
+      ],
       "assignable": false,
       "default_function": "Displays drive options; in playback, zooms in.",
       "role": null,
@@ -230,7 +244,7 @@
         "kind": "button",
         "press": {
           "kind": "debug_key",
-          "name": "DRIVE"
+          "name": "ISO"
         }
       },
       "pushable": true,
@@ -547,13 +561,21 @@
       "manual_page": 6,
       "face": "Fn2",
       "icon": null,
-      "connection_ids": [],
+      "connection_ids": [
+        "controls-gpio-2-9"
+      ],
       "assignable": true,
       "default_function": "Turns auto mode on or off by default; function-button roles are assignable. In playback, deletes pictures.",
       "role": null,
       "mechanical": false,
-      "behavior": null,
-      "pushable": false,
+      "behavior": {
+        "kind": "button",
+        "press": {
+          "kind": "debug_key",
+          "name": "DELETE"
+        }
+      },
+      "pushable": true,
       "positions": []
     },
     "fn7_button": {

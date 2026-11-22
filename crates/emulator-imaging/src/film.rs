@@ -2,13 +2,15 @@
 //! and coefficients.
 //! All image loops use slices; 4096-entry Bezier LUTs rebuild only on change.
 use serde::{Deserialize, Serialize};
-const GROUPS: [(usize, usize); 6] = [
+const GROUPS: [(usize, usize); 8] = [
     (0x304, 11),
     (0x400, 6),
     (0x500, 16),
     (0x604, 2),
     (0x640, 1),
     (0x644, 5),
+    (0x628, 2),
+    (0x63c, 1),
 ];
 
 fn signed(v: u32, bits: u32) -> i32 {
@@ -43,6 +45,18 @@ pub struct Film {
     chroma: [i32; 4],
     bounds: [i32; 4],
     bands: [(i32, i32); 5],
+    /// The still hue stage, when its enable bit is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hue: Option<HueStage>,
+    /// Constant chroma toning (Cb, Cr) in chroma units, added before the luma band
+    /// gain (so shadows stay neutral where the bands fade chroma). SEPIA programs a signed
+    /// 13-bit pair at 0x62C (low: Cr, high: Cb) and its scale at 0x628 (1024 = 1);
+    /// the other film simulations leave both zero (X100T 1.11 captures).
+    tone: [i32; 2],
+    /// Luma ramps (shadow, highlight) over which the toning fades in from neutral
+    /// black/white: 0x63C (SEPIA: 16, 16). Inferred from the X100T's SEPIA program
+    /// (the only film that sets it), not measured.
+    tone_fade: [i32; 2],
 }
 impl Default for Film {
     fn default() -> Self {
@@ -54,6 +68,9 @@ impl Default for Film {
             chroma: [0; 4],
             bounds: [0; 4],
             bands: [(0, 0); 5],
+            hue: None,
+            tone: [0; 2],
+            tone_fade: [0; 2],
         }
     }
 }
@@ -90,8 +107,8 @@ impl Film {
             return Err("film luma bounds are not ordered".into());
         }
         self.bounds = bounds;
-        for row in 0..3 {
-            self.matrix[row] = [
+        for (row, values) in self.matrix.iter_mut().enumerate().take(3) {
+            *values = [
                 signed(r(0x400 + row * 8), 13),
                 signed(r(0x400 + row * 8) >> 16, 13),
                 signed(r(0x404 + row * 8), 13),
@@ -103,6 +120,12 @@ impl Film {
             signed(r(0x608), 13),
             signed(r(0x608) >> 16, 13),
         ];
+        let scale = (r(0x628) & 0xffff) as i32;
+        self.tone = [
+            (signed(r(0x62c) >> 16, 13) * scale) >> 10,
+            (signed(r(0x62c), 13) * scale) >> 10,
+        ];
+        self.tone_fade = [(r(0x63c) & 255) as i32, (r(0x63c) >> 16 & 255) as i32];
         self.bands = std::array::from_fn(|i| {
             (
                 signed(r(0x644 + i * 4), 11),
@@ -114,8 +137,8 @@ impl Film {
         let widths: [usize; 9] = std::array::from_fn(|i| {
             16 << ((r(if i < 8 { 0x500 } else { 0x504 }) >> (if i < 8 { i * 4 } else { 0 })) & 7)
         });
-        for x in 0..4096 {
-            self.gain[x] = bezier(&table, &[64, 64, 128, 256, 512, 1024, 2048], x) as u16;
+        for (x, gain) in self.gain.iter_mut().enumerate().take(4096) {
+            *gain = bezier(&table, &[64, 64, 128, 256, 512, 1024, 2048], x) as u16;
         }
         for (channel, curve) in self.curves.iter_mut().enumerate() {
             let slot: [i64; 28] =
@@ -183,11 +206,20 @@ impl Film {
             band += 1;
         }
         let (shift, gain) = self.bands[band];
-        let f = gain + ((shift * y) >> 8);
+        let mut f = gain + ((shift * y) >> 8);
+        let mut tint = [0, 0];
+        if let Some(hue) = &self.hue {
+            f = (f * hue.gain(cb, cr)) >> 10;
+            tint = hue.tint;
+        }
+        let fade = |n: i32, d: i32| if d > 0 { n.clamp(0, d) } else { 1 };
+        let [lo, hi] = self.tone_fade;
+        let (wn, wd) = (fade(y, lo) * fade(255 - y, hi), lo.max(1) * hi.max(1));
+        let tone = [self.tone[0] * wn / wd, self.tone[1] * wn / wd];
         [
             y as u8,
-            (128 + ((cb * f + 512) >> 10)).clamp(0, 255) as u8,
-            (128 + ((cr * f + 512) >> 10)).clamp(0, 255) as u8,
+            (128 + (((cb + tone[0]).clamp(-512, 511) * f + 512) >> 10) + tint[0]).clamp(0, 255) as u8,
+            (128 + (((cr + tone[1]).clamp(-512, 511) * f + 512) >> 10) + tint[1]).clamp(0, 255) as u8,
         ]
     }
     #[inline(always)]
@@ -201,6 +233,73 @@ impl Film {
     }
 }
 
+/// X70/X-E2S still hue stage (FFF44500 bit 12, FFF44544..5c). An approximate
+/// fit to X-E2S 1.11 camera measurements of card ÷ stock chroma on a 120-patch
+/// hue target, not a recovered law. Luma and chroma direction are kept; chroma
+/// magnitude is scaled by
+/// `sqrt(cos^2(p) b0^2 + sin^2(p) b1^2) / 16 + window`, `p = d + 41 deg`,
+/// with `d` the hue `atan2(Cr, Cb)` minus bank 0's axis: byte 0 governs two
+/// opposite lobes and byte 1 the hues between them. `window` is a triangle of
+/// height 0.45 and half-width 15 deg at `d = 3 deg`, whatever the bytes.
+///
+/// With no bank 0 axis, the stage's form for Sepia (`0, 0, 512, 136, -120`),
+/// bank 0's vector (`FFF4454c`, Cr low, Cb high) is also added to the output
+/// chroma in eighths of a level: an assumed law, chosen so that Sepia's
+/// constants give a sepia-strength warm tint, not a measured one.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HueStage {
+    axis: f64,
+    window: f64,
+    bytes: [f64; 2],
+    /// Output (Cb, Cr) offset in levels.
+    #[serde(default)]
+    tint: [i32; 2],
+}
+impl HueStage {
+    /// From FFF44000-relative still words, or None when the stage is off.
+    pub fn from_still(r: impl Fn(usize) -> u32) -> Option<Self> {
+        if r(0x500) & 1 << 12 == 0 {
+            return None;
+        }
+        let vector = |w: u32| (signed(w, 10), signed(w >> 16, 10));
+        let (cr, cb) = vector(r(0x544));
+        let bytes = [f64::from(r(0x55c) & 31), f64::from(r(0x55c) >> 16 & 31)];
+        if cr == 0 && cb == 0 {
+            // Bank 1 alone keeps nothing at bytes 0, 0: without an axis,
+            // byte 1 applies everywhere.
+            let eighths = |v: i32| (v + 4).div_euclid(8);
+            let w = r(0x54c);
+            return Some(Self {
+                axis: 0.0,
+                window: 0.0,
+                bytes: [bytes[1]; 2],
+                tint: [eighths(signed(w >> 16, 13)), eighths(signed(w, 13))],
+            });
+        }
+        // Bank 0 alone keeps 1.7 times the window of both factory banks, and
+        // the window scales by (bank 0 width word / 515)^2.5.
+        let banks = if vector(r(0x550)) == (0, 0) { 1.7 } else { 1.0 };
+        let width = f64::from(r(0x548) & 0x7ff) / 515.0;
+        Some(Self {
+            axis: libm::atan2(f64::from(cr), f64::from(cb)).to_degrees(),
+            window: 0.45 * banks * libm::pow(width, 2.5),
+            bytes,
+            tint: [0, 0],
+        })
+    }
+    /// Q10 chroma gain for chroma (cb, cr).
+    pub fn gain(&self, cb: i32, cr: i32) -> i32 {
+        let hue = libm::atan2(f64::from(cr), f64::from(cb)).to_degrees();
+        let d = (hue - self.axis + 180.0).rem_euclid(360.0) - 180.0;
+        let p = (d + 41.0).to_radians();
+        let (s, c) = (libm::sin(p), libm::cos(p));
+        let [b0, b1] = self.bytes;
+        let g = libm::sqrt(c * c * b0 * b0 + s * s * b1 * b1) / 16.0
+            + self.window * (1.0 - (d - 3.0).abs() / 15.0).max(0.0);
+        libm::rint(g * 1024.0) as i32
+    }
+}
+
 /// Exact, bounded reuse within one raster. Sensor upsampling often reconstructs
 /// the same RGB triplet many times. Entries compare all input bits, so hash
 /// collisions only cost a film evaluation. Nothing survives a parameter change
@@ -209,17 +308,20 @@ pub struct FilmPixels<'a> {
     film: &'a Film,
     entries: Vec<(u64, [u8; 3])>,
 }
+// A full-resolution still exhausts a 4K-entry memo, while another 960K slots
+// add no measurable hits and introduce a 16 MiB cache footprint per replay.
+const FILM_CACHE_ENTRIES: usize = 1 << 16;
 impl<'a> FilmPixels<'a> {
     pub fn new(film: &'a Film) -> Self {
         Self {
             film,
-            entries: vec![(u64::MAX, [0; 3]); 4096],
+            entries: vec![(u64::MAX, [0; 3]); FILM_CACHE_ENTRIES],
         }
     }
     #[inline(always)]
     pub fn develop(&mut self, rgb: [u16; 3]) -> [u8; 3] {
         let key = u64::from(rgb[0]) | (u64::from(rgb[1]) << 16) | (u64::from(rgb[2]) << 32);
-        let index = (key.wrapping_mul(0x9e3779b97f4a7c15) >> 52) as usize;
+        let index = (key.wrapping_mul(0x9e3779b97f4a7c15) >> 48) as usize;
         let entry = &mut self.entries[index];
         if entry.0 != key {
             *entry = (key, self.film.develop(rgb));
@@ -231,7 +333,7 @@ impl<'a> FilmPixels<'a> {
     #[inline(always)]
     pub fn luma(&mut self, rgb: [u16; 3]) -> u8 {
         let key = u64::from(rgb[0]) | (u64::from(rgb[1]) << 16) | (u64::from(rgb[2]) << 32);
-        let index = (key.wrapping_mul(0x9e3779b97f4a7c15) >> 52) as usize;
+        let index = (key.wrapping_mul(0x9e3779b97f4a7c15) >> 48) as usize;
         let entry = &mut self.entries[index];
         if entry.0 != key && entry.0 != (key | 1 << 63) {
             *entry = (key | 1 << 63, [self.film.luma(rgb), 0, 0]);
@@ -280,8 +382,17 @@ mod tests {
         let band = f.bounds.iter().filter(|&&b| i64::from(b) <= luma).count();
         let (shift, gain) = f.bands[band];
         let factor = i64::from(gain) + ((i64::from(shift) * luma) >> 8);
+        // Constant toning, faded in over the shadow and highlight ramps.
+        let ramp = |n: i64, d: i64| if d > 0 { n.clamp(0, d) } else { 1 };
+        let [lo, hi] = f.tone_fade.map(i64::from);
+        let weight = ramp(luma, lo) * ramp(255 - luma, hi);
+        let span = lo.max(1) * hi.max(1);
+        let tone = f.tone.map(|t| i64::from(t) * weight / span);
+        let mut index = 0;
         let chroma = chroma.map(|v| {
-            (128 + ((((v >> 10).clamp(-512, 511)) * factor + 512) >> 10)).clamp(0, 255) as u8
+            let toned = ((v >> 10).clamp(-512, 511) + tone[index]).clamp(-512, 511);
+            index += 1;
+            (128 + ((toned * factor + 512) >> 10)).clamp(0, 255) as u8
         });
         [luma as u8, chroma[0], chroma[1]]
     }
@@ -426,6 +537,98 @@ mod tests {
     }
 
     #[test]
+    fn hue_stage_matches_the_camera_hue_map() {
+        // Factory Partial Color red banks 7 and 1 turned to 131 deg.
+        let words = |enable: u32, bytes: u32| {
+            move |o: usize| match o {
+                0x500 => enable,
+                0x544 => 0x033c_00e2,
+                0x548 => 515,
+                0x550 => 0x02bd_0174,
+                0x554 => 1736,
+                0x55c => bytes,
+                _ => 0,
+            }
+        };
+        assert!(HueStage::from_still(words(0, 0x0010_0010)).is_none());
+        let at = |stage: &HueStage, offset: f64| {
+            let (s, c) = (131.0 + offset).to_radians().sin_cos();
+            f64::from(stage.gain((100.0 * c) as i32, (100.0 * s) as i32)) / 1024.0
+        };
+        let half = HueStage::from_still(words(1 << 12, 0x0008_0008)).unwrap();
+        let byte0 = HueStage::from_still(words(1 << 12, 0x0000_0010)).unwrap();
+        let equal = HueStage::from_still(words(1 << 12, 0x0010_0010)).unwrap();
+        // Card 4 medians at these offsets from the axis.
+        for (offset, measured) in [(-130.4, 0.03), (-54.3, 0.99), (39.7, 0.18), (144.9, 1.0)] {
+            assert!((at(&half, offset) - 0.5).abs() < 0.01);
+            assert!((at(&byte0, offset) - measured).abs() < 0.04, "{offset}");
+        }
+        assert!((at(&equal, 8.8) - 1.21).abs() < 0.08 && (at(&equal, 90.0) - 1.0).abs() < 0.01);
+        let mut film = Film {
+            chroma: [1024, 0, 1024, 0],
+            bands: [(0, 256); 5],
+            bounds: [255; 4],
+            curves: std::array::from_fn(|_| (0..4096).map(|x| (x * 4) as u16).collect()),
+            matrix: [[1024, 0, 0], [0, 1024, 0], [0, 0, 1024]],
+            gain: vec![2048; 4096],
+            ..Default::default()
+        };
+        let plain = film.develop([9000, 5000, 3000]);
+        film.hue = Some(half);
+        let staged = film.develop([9000, 5000, 3000]);
+        assert_eq!(plain[0], staged[0]);
+        for c in 1..3 {
+            assert!(((i32::from(plain[c]) - 128) / 2 - (i32::from(staged[c]) - 128)).abs() <= 1);
+        }
+    }
+    #[test]
+    fn hue_stage_without_an_axis_tints_gray() {
+        // Sepia's code constants: no axis, width 512, vector (136, -120).
+        let sepia = |o: usize| match o {
+            0x500 => 1 << 12,
+            0x548 => 512,
+            0x54c => (136 & 0x1fff) | (-120i32 as u32 & 0x1fff) << 16,
+            0x55c => 0x0010_0010,
+            _ => 0,
+        };
+        let stage = HueStage::from_still(sepia).unwrap();
+        assert_eq!(stage.tint, [-15, 17]);
+        let mut film = Film {
+            bands: [(0, 256); 5],
+            bounds: [255; 4],
+            curves: std::array::from_fn(|_| (0..4096).map(|x| (x * 4) as u16).collect()),
+            matrix: [[1024, 0, 0], [0, 1024, 0], [0, 0, 1024]],
+            gain: vec![2048; 4096],
+            ..Default::default()
+        };
+        let gray = film.develop([6000, 6000, 6000]);
+        film.hue = Some(stage);
+        let toned = film.develop([6000, 6000, 6000]);
+        assert_eq!((gray[1], gray[2]), (128, 128));
+        assert_eq!((toned[0], toned[1], toned[2]), (gray[0], 113, 145));
+    }
+    #[test]
+    fn sepia_toning_registers_decode_and_fade_to_neutral_black() {
+        // X100T SEPIA: scale 0x628 (1024 = 1), signed 13-bit pair at 0x62C (high: Cb,
+        // low: Cr) and fade ramps at 0x63C (shadow 16, highlight 16).
+        let regs = |o: usize| match o {
+            0x628 => 512,
+            0x62c => (0x1fc0u32 << 16) | 0x0060, // Cb -64, Cr +96
+            0x63c => (16 << 16) | 16,
+            _ => 0,
+        };
+        let mut f = Film::default();
+        f.update(regs).unwrap();
+        assert_eq!(f.tone, [-32, 48]); // scaled by 512/1024
+        assert_eq!(f.tone_fade, [16, 16]);
+        // Black has zero shadow weight: the toning fades out, chroma stays neutral.
+        assert_eq!(f.develop([16383; 3]), [0, 128, 128]);
+        // Without toning programmed, the other film simulations are unchanged.
+        let mut plain = Film::default();
+        plain.update(|_| 0).unwrap();
+        assert_eq!((plain.tone, plain.tone_fade), ([0, 0], [0, 0]));
+    }
+    #[test]
     fn zero_and_signed_matrix_law() {
         let mut f = Film::default();
         f.update(|_| 0).unwrap();
@@ -554,6 +757,20 @@ impl RgbFilm {
 #[cfg(test)]
 pub(crate) mod color_tests {
     use super::*;
+    #[test]
+    fn checkpoint_without_toning_is_refused() {
+        // A film checkpointed before the toning registers holds fewer words than
+        // GROUPS reads; it must be refused, not loaded and then indexed past its end.
+        let r = fujimod_emulator_devices::test_host::film_words();
+        let mut f = Film::default();
+        f.update(|o| r[o / 4]).unwrap();
+        let mut old = serde_json::to_value(&f).unwrap();
+        let fields = old.as_object_mut().unwrap();
+        fields.remove("tone");
+        fields.remove("tone_fade");
+        fields["words"].as_array_mut().unwrap().truncate(41);
+        assert!(serde_json::from_value::<Film>(old).is_err());
+    }
     #[test]
     fn neutral_matrix_tone_and_chroma() {
         let r = fujimod_emulator_devices::test_host::film_words();

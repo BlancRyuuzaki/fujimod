@@ -4,13 +4,13 @@
 //! snapshot and throughput laws
 //! remain declared software assumptions, not measured hardware semantics.
 //! Command validation, records and completion tokens live here.
+
+#![recursion_limit = "256"]
 pub mod construct;
 pub mod recording;
 pub mod replay;
 #[cfg(not(target_os = "emscripten"))]
 mod ui_paint;
-#[cfg(not(target_os = "emscripten"))]
-use fujimod_emulator_gpu::CoverageKernel;
 use fujimod_emulator_graphics::{batch, clear, init, regs::Registers, render, stream};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -39,10 +39,9 @@ impl Profile {
 }
 use fujimod_emulator_devices::record::Result;
 use fujimod_emulator_devices::{Action, Record, Unsupported, Value, WordMap};
+use fujimod_perf::{DeviceWorkCounter, add_work};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
-#[cfg(not(target_os = "emscripten"))]
-use std::sync::OnceLock;
 
 pub const BASE: u64 = 0xfff78000;
 pub const SIZE: u64 = 0x5000;
@@ -77,7 +76,7 @@ impl GlesLatency {
     }
 }
 /// X70 1.10 3D list latency at the 12 MHz tick (12,000 ticks per ms). Camera
-/// run of 2026-10-31: 106 GL GUI frames, touch scrolling plus key and tab
+/// run of 2026-10-31: 106 Focalized UI frames, touch scrolling plus key and tab
 /// updates. Least squares over all frames, submission to the first completion
 /// interrupt, gave 4.82 ms + 13.2 ns per filled pixel + 9.5 ns per blended
 /// pixel + 0.026 ms per draw call, maximum error 1.9 ms. That interval already
@@ -478,6 +477,11 @@ pub fn offset(address: u64, size: u32) -> Result<u32> {
     Ok(logical)
 }
 impl CommandProcessor {
+    fn job_started(&mut self) {
+        self.jobs_started += 1;
+        add_work(DeviceWorkCounter::GpuCommandStarts, 1);
+    }
+
     pub fn new_job(&mut self, fields: Fields) -> Job {
         self.new_job_with_receipts(true, || fields)
     }
@@ -743,12 +747,12 @@ impl CommandProcessor {
     /// DMA must succeed before this method commits status and logs/raises IRQ.
     /// The runtime applies output() first, then complete(), preserving the
     /// memory-write-before-state order, including callback failures.
-    pub fn output(&self, token: u64) -> Result<(i64, DmaOutput)> {
+    pub fn output(&self, token: u64) -> Result<&DmaOutput> {
         let c = self
             .completions
             .get(&token)
             .ok_or_else(|| Unsupported("Unknown graphics completion token".into()))?;
-        Ok((c.cpu, c.output.clone()))
+        Ok(&c.output)
     }
     pub fn complete_webgpu_request(
         &mut self,
@@ -973,7 +977,7 @@ impl CommandProcessor {
         actions.push(Action::QueueIrq(c.irq_cpu as u8, IRQ));
         Ok(c.job)
     }
-    /// Commit replay state after the recorder's independent output digest check.
+    /// Commit replay state after the recorder's independent output byte check.
     /// Replay discards diagnostic records, so it does not build another receipt.
     pub(crate) fn complete_for_replay(&mut self, token: u64, _now: u64) -> Result<()> {
         let c = self
@@ -1037,7 +1041,7 @@ impl CommandProcessor {
                 });
                 self.last_job = if receipts { Some(job.clone()) } else { None };
                 self.busy = true;
-                self.jobs_started += 1;
+                self.job_started();
                 self.clear_ack_offsets.clear();
                 self.store(GLES_SUBMIT, trigger);
                 self.gpu_gles_lists += 1;
@@ -1104,7 +1108,7 @@ impl CommandProcessor {
         });
         self.last_job = if receipts { Some(job.clone()) } else { None };
         self.busy = true;
-        self.jobs_started += 1;
+        self.job_started();
         self.clear_ack_offsets.clear();
         self.store(GLES_SUBMIT, trigger);
         self.schedule(
@@ -1182,7 +1186,7 @@ impl CommandProcessor {
         let delay = self.delay(count);
         self.busy = true;
         self.store(0x1c, control);
-        self.jobs_started += 1;
+        self.job_started();
         let j = self.new_job_with_receipts(record_receipts, || {
             vec![
                 ("cpu", num(cpu)),
@@ -1343,7 +1347,7 @@ impl CommandProcessor {
         let delay = 2.max(destination_count.div_ceil(self.copy_bytes_per_tick));
         self.busy = true;
         self.store(0xc18, trigger);
-        self.jobs_started += 1;
+        self.job_started();
         let profile = self
             .copy_profile
             .map_or_else(|| Value::constant("native-pixmap"), Profile::value);
@@ -1460,7 +1464,7 @@ impl CommandProcessor {
             ]
         });
         self.busy = true;
-        self.jobs_started += 1;
+        self.job_started();
         self.store(0xc18, trigger);
         self.schedule(
             Completion {
@@ -1786,7 +1790,7 @@ impl CommandProcessor {
         merge(&mut self.fill, &fb);
         self.clear_ack_offsets.clear();
         self.busy = true;
-        self.jobs_started += 1;
+        self.job_started();
         if self.ui() {
             c.compact();
         }
@@ -1883,7 +1887,7 @@ impl CommandProcessor {
                 replace(&mut self.fill, &banks.fill);
                 self.clear_ack_offsets.clear();
                 self.busy = true;
-                self.jobs_started += 1;
+                self.job_started();
                 c.compact();
                 self.last_job = if record_receipts {
                     Some(c.job.clone())
@@ -1928,7 +1932,7 @@ impl CommandProcessor {
         replace(&mut self.fill, &banks.fill);
         self.clear_ack_offsets.clear();
         self.busy = true;
-        self.jobs_started += 1;
+        self.job_started();
         c.compact();
         if record_receipts {
             update(
@@ -2078,15 +2082,6 @@ impl Capture {
             }
         }
         self.job.revision += 1;
-    }
-}
-
-#[cfg(not(target_os = "emscripten"))]
-fn coverage_kernel() -> Result<&'static CoverageKernel> {
-    static KERNEL: OnceLock<std::result::Result<CoverageKernel, String>> = OnceLock::new();
-    match KERNEL.get_or_init(|| fujimod_emulator_gpu::context().map(CoverageKernel::new)) {
-        Ok(kernel) => Ok(kernel),
-        Err(error) => fail(format!("Graphics UI GPU coverage {error}")),
     }
 }
 
@@ -2329,6 +2324,19 @@ impl CommandProcessor {
     }
 }
 
+/// Compile reusable native graphics pipelines before interactive execution.
+pub fn prepare_host_gpu() -> std::result::Result<(), String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        fujimod_emulator_ip_dmp::gles::prepare_host_gpu()?;
+        ui_paint::prepare().map_err(|error| error.0)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        Err("Native host GPU preparation requires a desktop target".into())
+    }
+}
+
 #[cfg(test)]
 mod send_tests {
     #[test]
@@ -2338,19 +2346,5 @@ mod send_tests {
         require_send::<fujimod_emulator_devices::Value>();
         require_send::<fujimod_emulator_devices::Record>();
         require_send::<fujimod_emulator_devices::Action>();
-    }
-}
-
-/// Compile reusable native graphics pipelines before interactive execution.
-pub fn prepare_host_gpu() -> std::result::Result<(), String> {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        fujimod_emulator_ip_dmp::gles::prepare_host_gpu()?;
-        coverage_kernel().map_err(|error| error.0)?;
-        ui_paint::prepare().map_err(|error| error.0)
-    }
-    #[cfg(target_arch = "wasm32")]
-    {
-        Err("Native host GPU preparation requires a desktop target".into())
     }
 }

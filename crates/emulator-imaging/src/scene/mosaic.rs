@@ -214,12 +214,10 @@ mod tests {
             let original: Vec<_> = (0..=u16::MAX)
                 .flat_map(|raw| ((f64::from(raw) / norm) as f32).to_le_bytes())
                 .collect();
-            let identity = fujimod_emulator_devices::fingerprint::float32s(radiance.values());
+            let identity = fujimod_emulator_devices::state::float32s(radiance.values());
             assert_eq!(identity["floats"], 65536);
-            assert_eq!(
-                identity["sha256"],
-                fujimod_emulator_devices::fingerprint::bytes(&original)["sha256"]
-            );
+            let actual: Vec<_> = radiance.values().flat_map(f32::to_le_bytes).collect();
+            assert_eq!(actual, original);
         }
         assert!(Radiance::from_bytes(Arc::from([0u8]), 1.).is_err());
     }

@@ -1,8 +1,8 @@
 import { releaseFilename, releaseTag } from './releases.ts';
 import { inspectPatch, sha256 } from './patcher.ts';
 export interface ReleaseDownloads {
-  sd_card: boolean;
-  installable: boolean;
+  sd_boot_v1: boolean;
+  sd_boot_v1_installable: boolean;
 }
 export interface ReleaseNotes {
   name: string;
@@ -19,7 +19,24 @@ export interface PatchFirmware {
   patch_sha256: string;
   patch_bytes: number;
   boot_instructions: string[];
-  mods?: string[];
+  /** The body's stock update file name, required for installable downloads. */
+  update_filename?: string;
+  /** The mods built into this firmware's release. */
+  mods: string[];
+}
+/** A file the release offers for the SD card, published as a release asset. */
+export interface SdCardFile {
+  /** Path on the card, in upper-case 8.3 names: `FUJIMOD/RECIPES/AGFAOPT.JSN`. */
+  path: string;
+  asset: string;
+  sha256: string;
+  bytes: number;
+  /** Boot files belong to one processor and are written only for its cameras. */
+  processor?: string;
+  title?: string;
+  author?: string;
+  /** The recipe or film's published source page. */
+  source?: string;
 }
 export interface PatchIndex {
   schema: 2;
@@ -28,8 +45,45 @@ export interface PatchIndex {
   patches: Record<string, string>;
   firmwares: PatchFirmware[];
   notes?: ReleaseNotes;
+  sd_card_files?: SdCardFile[];
 }
 const hash = /^[0-9a-f]{64}$/;
+const shortName = '[A-Z0-9_~-]{1,8}(?:\\.[A-Z0-9_~-]{1,3})?';
+/** Card paths use the 8.3 names the camera's file system reads. */
+export const sdCardPath = new RegExp(`^(?:${shortName}/)*${shortName}$`);
+const httpsUrl = (value: unknown) => {
+  try {
+    return typeof value === 'string' && new URL(value).protocol === 'https:';
+  } catch {
+    return false;
+  }
+};
+const optionalText = (value: unknown) =>
+  value === undefined || (typeof value === 'string' && value.length > 0 && value.length < 200);
+function validateCard(value: unknown): SdCardFile[] {
+  if (!Array.isArray(value)) throw new Error('The release card files are invalid.');
+  const paths = new Set<string>();
+  for (const file of value as SdCardFile[]) {
+    if (
+      !file ||
+      typeof file.path !== 'string' ||
+      !sdCardPath.test(file.path) ||
+      typeof file.asset !== 'string' ||
+      !releaseFilename.test(file.asset) ||
+      typeof file.sha256 !== 'string' ||
+      !hash.test(file.sha256) ||
+      !Number.isSafeInteger(file.bytes) ||
+      file.bytes < 0 ||
+      ![file.processor, file.title, file.author].every(optionalText) ||
+      (file.source !== undefined && !httpsUrl(file.source))
+    )
+      throw new Error('A release card file is invalid.');
+    const key = `${file.processor ?? ''}\n${file.path}`;
+    if (paths.has(key)) throw new Error('A release card file is listed twice.');
+    paths.add(key);
+  }
+  return value as SdCardFile[];
+}
 const calendarDate = (value: unknown) => {
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
   const date = new Date(value + 'T00:00:00Z');
@@ -78,6 +132,8 @@ export function validateIndex(value: unknown): PatchIndex {
       !entry.boot_instructions.every(
         (step) => typeof step === 'string' && step.length && step.length < 2000,
       ) ||
+      !Array.isArray(entry.mods) ||
+      !entry.mods.every((name) => typeof name === 'string' && name.length > 0) ||
       !Number.isSafeInteger(entry.patch_bytes) ||
       entry.patch_bytes <= 0 ||
       entry.patch_bytes > 64 * 1024 * 1024 ||
@@ -91,15 +147,22 @@ export function validateIndex(value: unknown): PatchIndex {
       (!downloads ||
         typeof downloads !== 'object' ||
         Array.isArray(downloads) ||
-        (downloads.sd_card !== undefined && typeof downloads.sd_card !== 'boolean') ||
-        (downloads.installable !== undefined && typeof downloads.installable !== 'boolean'))
+        (downloads.sd_boot_v1 !== undefined && typeof downloads.sd_boot_v1 !== 'boolean') ||
+        (downloads.sd_boot_v1_installable !== undefined && typeof downloads.sd_boot_v1_installable !== 'boolean'))
     )
       throw new Error('The release download switches are invalid.');
+    if (
+      (entry.update_filename !== undefined &&
+        (typeof entry.update_filename !== 'string' ||
+          !/^[A-Z0-9]{1,8}\.DAT$/.test(entry.update_filename))) ||
+      (downloads?.sd_boot_v1_installable && entry.update_filename === undefined)
+    )
+      throw new Error('The release update file name is invalid.');
     firmwares.push({
       ...entry,
       downloads: {
-        sd_card: downloads?.sd_card ?? false,
-        installable: downloads?.installable ?? false,
+        sd_boot_v1: downloads?.sd_boot_v1 ?? false,
+        sd_boot_v1_installable: downloads?.sd_boot_v1_installable ?? false,
       },
     });
     seen.add(entry.sha256);
@@ -109,7 +172,11 @@ export function validateIndex(value: unknown): PatchIndex {
     new Set(Object.values(index.patches)).size !== seen.size
   )
     throw new Error('The release patch map is inconsistent.');
-  return { ...index, firmwares };
+  return {
+    ...index,
+    firmwares,
+    ...(index.sd_card_files === undefined ? {} : { sd_card_files: validateCard(index.sd_card_files) }),
+  };
 }
 
 export async function verifyPatch(index: PatchIndex, entry: PatchFirmware, data: Uint8Array) {
@@ -121,7 +188,7 @@ export async function verifyPatch(index: PatchIndex, entry: PatchFirmware, data:
     meta.source.bytes !== entry.bytes ||
     meta.firmware !== entry.id ||
     meta.release !== index.release ||
-    (entry.downloads.installable && !meta.outputs.fpupdate) ||
+    (entry.downloads.sd_boot_v1_installable && !meta.outputs.fpupdate) ||
     !Array.isArray(meta.mods) ||
     !meta.mods.every((name) => typeof name === 'string') ||
     (await sha256(program)) !== meta.program_sha256

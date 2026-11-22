@@ -1,8 +1,7 @@
-//! Generated bring-up progress for one firmware.
+//! Recorded bring-up progress for one firmware.
 //!
 //! Each stage holds the latest recorded result of that stage for the firmware.
-//! A result whose inputs changed since it was recorded is `stale` and does not
-//! count as progress.
+//! A result whose inputs changed is marked `stale`. Its last recorded count is retained.
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -32,7 +31,7 @@ pub struct FirmwareProgress {
     pub tracks: Vec<TrackProgress>,
     /// Stock camera features the emulator is graded on, by feature; only features the body has.
     pub stock: BTreeMap<String, StockProgress>,
-    /// Walkthrough result of every shipped mod, by mod name.
+    /// Walkthrough result of every shipped mod, by mod name; a mod the body cannot run is `inapplicable`.
     pub mods: BTreeMap<String, ModProgress>,
 }
 
@@ -45,8 +44,12 @@ pub struct TrackProgress {
     pub id: String,
     /// Track title as the bring-up runner prints it.
     pub title: String,
+    /// CSS phase identifier used by the website's progress bars.
+    pub phase: String,
     /// The track's stages, in order.
     pub stages: Vec<StageEntry>,
+    /// The outcomes resolved from the graph, excluding inapplicable outcomes.
+    pub steps: Vec<StepProgress>,
 }
 
 /// One bring-up stage and its latest result.
@@ -59,6 +62,30 @@ pub struct StageEntry {
     /// Stage title as the bring-up runner prints it.
     pub title: String,
     pub result: StageProgress,
+}
+
+/// One outcome within a bring-up track.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct StepProgress {
+    /// Stable step identifier, including a stock feature or mod suffix.
+    pub id: String,
+    /// Step label shown in the progress bar.
+    pub label: String,
+    /// Graph stage that owns this step.
+    pub stage: String,
+    pub result: StepResult,
+    /// Include this outcome in the public progress count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub milestone: Option<bool>,
+    /// Graded parts that pass.
+    pub passed: u32,
+    /// Graded parts in total.
+    pub total: u32,
+    /// Human-readable detail for a partial step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// How many of a firmware's facts were located.
@@ -107,9 +134,26 @@ pub enum StageProgress {
     /// Some of the stage's graded parts pass (stock features, mod walkthroughs).
     Partial,
     Fail,
+    /// The stage cannot pass on this body's processor or hardware.
+    Inapplicable,
     /// Recorded, but its inputs changed since.
     Stale,
     NotRun,
+}
+
+/// Latest result of one rendered step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum StepResult {
+    Pass,
+    /// Some graded parts pass.
+    Partial,
+    Fail,
+    Stale,
+    NotRun,
+    /// The mod cannot be built for this firmware.
+    Unavailable,
 }
 
 /// Latest walkthrough result of one mod.
@@ -121,6 +165,8 @@ pub enum ModProgress {
     Fail,
     /// The mod cannot be built for this firmware.
     Unavailable,
+    /// The camera's hardware or stock settings cannot support this mod.
+    Inapplicable,
     /// Recorded, but its inputs changed since.
     Stale,
     NotRun,

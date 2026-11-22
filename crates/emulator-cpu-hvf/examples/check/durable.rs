@@ -1,4 +1,5 @@
 //! Destroy the source VM and rebind a whole-board archive to fresh vCPUs.
+use fujimod_catalog_configuration::RunEngine;
 use fujimod_emulator::board::{
     Board, InterruptMap,
     bus::{Bus, Mode},
@@ -13,6 +14,7 @@ fn board() -> Result<Board, String> {
         processors: vec![Processor {
             model: Model::ArmV8A,
             released: true,
+            parked_until_sgi: false,
             registers: vec![
                 (Register::Pc, 0x10000),
                 (Register::Pstate, 0x3c5),
@@ -38,7 +40,7 @@ fn board() -> Result<Board, String> {
         instructions_per_tick: Ratio::new(7, 3)?,
     }
     .build(
-        Options::new(Engine::Hypervisor).with_translation_cache_size_bytes(1 << 20),
+        Options::new(RunEngine::Hypervisor).with_translation_cache_size_bytes(1 << 20),
         Bus::new(Mode::Strict),
         Some(InterruptMap {
             cores: 1,

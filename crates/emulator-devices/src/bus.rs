@@ -113,6 +113,10 @@ pub trait Host {
     fn request_pause(&mut self) -> Result<(), String> {
         Err("host cannot pause guest execution for asynchronous work".into())
     }
+    /// Stop the powered processors because the board's supply was released.
+    fn power_off(&mut self) -> Result<(), String> {
+        Err("host cannot model supply removal".into())
+    }
     /// Worker count for pure host computation. Zero selects the exact serial
     /// path; workers never receive guest state or publish device effects.
     fn compute_workers(&self) -> usize {
@@ -168,6 +172,15 @@ pub struct Cx<'a> {
     refusal: Option<String>,
     unmodeled: bool,
     tick_override: Option<u64>,
+    posted_writes: Vec<PostedWrite>,
+}
+
+/// A register write that a bus-master device issues to another device's MMIO window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PostedWrite {
+    pub address: u64,
+    pub size: u8,
+    pub value: u64,
 }
 
 impl<'a> Cx<'a> {
@@ -180,6 +193,7 @@ impl<'a> Cx<'a> {
             refusal: None,
             unmodeled: false,
             tick_override: None,
+            posted_writes: Vec::new(),
         }
     }
     pub fn now(&self) -> u64 {
@@ -187,6 +201,10 @@ impl<'a> Cx<'a> {
     }
     pub fn request_pause(&mut self) -> Result<(), String> {
         self.host.request_pause()
+    }
+    /// Signal that the connected board supply has actually turned off.
+    pub fn power_off(&mut self) -> Result<(), String> {
+        self.host.power_off()
     }
     /// Bounded strategy for pure, deterministic raster work. The owner still
     /// applies every resulting device effect on this context's thread.
@@ -233,6 +251,23 @@ impl<'a> Cx<'a> {
     }
     pub fn ram_write(&mut self, address: u64, bytes: &[u8]) -> Result<(), String> {
         self.host.ram_write(address, bytes)
+    }
+    /// Queue an MMIO write to another device, issued by this device as a bus master
+    /// (for example a register-list DMA). The runtime bus performs the queued writes in
+    /// order, after this device call returns and before the accessing instruction
+    /// continues. The board bus drains the queue after guest accesses and device
+    /// events and refuses it on other paths; standalone test hosts must drain it
+    /// themselves with [`Cx::take_posted_writes`].
+    pub fn post_mmio_write(&mut self, address: u64, size: u8, value: u64) {
+        self.posted_writes.push(PostedWrite {
+            address,
+            size,
+            value,
+        });
+    }
+    /// The MMIO writes this call queued, oldest first.
+    pub fn take_posted_writes(&mut self) -> Vec<PostedWrite> {
+        std::mem::take(&mut self.posted_writes)
     }
     pub fn scanout(&mut self, frame: crate::graphics::scanout::Frame) -> Result<(), String> {
         self.host.scanout(frame)
@@ -283,11 +318,28 @@ impl<'a> Cx<'a> {
 /// A register-level device behind one or more address windows.
 pub trait Device: Send + std::any::Any {
     fn name(&self) -> &'static str;
+    /// Host publication stamp, advanced only when `save()` would change.
+    /// Devices without a stamp retain the serialized publication comparison.
+    fn publication_generation(&self) -> Option<u64> {
+        None
+    }
+    /// Frame count for a display timing output, when provided by this device.
+    fn display_frame_count(&self, _output: usize) -> Result<u64, String> {
+        Err("device does not provide display frame counts".into())
+    }
     // Capabilities the model offers sessions (`crate::capability`).
     fn analog_inputs(&self) -> Option<&(dyn crate::capability::AnalogInputs + 'static)> {
         None
     }
     fn analog_inputs_mut(&mut self) -> Option<&mut (dyn crate::capability::AnalogInputs + 'static)> {
+        None
+    }
+    fn gravity_input(&self) -> Option<&(dyn crate::capability::GravityInput + 'static)> {
+        None
+    }
+    fn gravity_input_mut(
+        &mut self,
+    ) -> Option<&mut (dyn crate::capability::GravityInput + 'static)> {
         None
     }
     fn serial_status(&self) -> Option<&(dyn crate::capability::SerialStatus + 'static)> {
@@ -401,6 +453,15 @@ pub trait Device: Send + std::any::Any {
     /// True only for side-effect-free reads. Used for host polling backoff;
     /// checking this predicate must itself be observational.
     fn pollable(&self, _address: u64, _size: u8) -> bool {
+        false
+    }
+    /// True only for a read that has no effect at all and whose value changes
+    /// only at this model's own accesses and at device events the timeline
+    /// delivers (deadlines of this or another model): never with guest time
+    /// alone. The execution core may then leave out reads of a poll loop that
+    /// repeats without change, up to the next event. Checking this predicate
+    /// must itself be observational.
+    fn poll_stable(&self, _address: u64, _size: u8) -> bool {
         false
     }
     /// Observational checkpoint state; restoring does not perform guest work.

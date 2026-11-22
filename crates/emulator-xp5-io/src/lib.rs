@@ -1,11 +1,13 @@
 //! XP5 GPIO, serial, ADC, timers, mailbox, clocks and gates.
 pub mod adc;
 pub mod boot_control;
+pub mod bringup_stub;
 pub mod clocks;
+pub mod completion_stub;
+pub mod connection_status;
 pub mod discarded_read;
 pub mod gates;
 pub mod gpio;
-pub mod i2c;
 pub mod input_capture;
 pub mod mailbox;
 pub mod memory_configuration;
@@ -17,5 +19,6 @@ pub mod sd_interface;
 pub mod spi;
 pub mod temperature;
 pub mod timer;
-pub mod usb_connection_status;
+pub mod usb_phy;
 pub mod write_only_registers;
+pub mod x_mount;

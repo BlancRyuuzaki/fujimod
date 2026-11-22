@@ -114,7 +114,7 @@ impl Receiver {
         if enabled && !self.state.armed {
             self.state.armed = true;
             self.state.generation = self.state.generation.wrapping_add(1);
-            let at = anchor.saturating_add(self.period_ticks);
+            let at = anchor.saturating_add(self.sensor.frame_ticks(self.period_ticks));
             self.state.frame_deadline = Some(at);
             cx.schedule(at, self.state.generation);
         } else if !enabled && self.state.armed {
@@ -234,11 +234,11 @@ impl Device for Receiver {
             }
             if end && self.state.active {
                 self.state.active = false;
-                if let Some(input) = &self.input_buffer {
-                    if let Err(error) = input.frame(cx) {
-                        cx.fail(error);
-                        return;
-                    }
+                if let Some(input) = &self.input_buffer
+                    && let Err(error) = input.frame(cx)
+                {
+                    cx.fail(error);
+                    return;
                 }
                 if self.wiring.timing_output {
                     self.sensor.timing(cx, false);
@@ -264,6 +264,9 @@ impl Device for Receiver {
                 if self.wiring.timing_output {
                     self.sensor.timing(cx, true);
                 }
+                for &channel in &self.wiring.output_channels {
+                    self.sensor.frame_start(channel);
+                }
                 for link in 0..self.links() {
                     if self.enabled(link) {
                         let cause = 0x108 + link as u64 * 0x100;
@@ -271,17 +274,25 @@ impl Device for Receiver {
                     }
                 }
                 self.irq(cx);
-                let deadline = at.saturating_add(self.active_ticks);
+                // A frame of a decoded readout may be shorter than the stand-in's active
+                // phase (see `Sensor::frame_ticks`): the frame ends within its own period.
+                let active = self
+                    .active_ticks
+                    .min(self.sensor.frame_ticks(self.period_ticks) / 2)
+                    .max(1);
+                let deadline = at.saturating_add(active);
                 self.state.end_deadline = Some(deadline);
                 cx.schedule(deadline, self.state.generation | (1 << 63));
             }
             if !end {
-                let deadline = at.saturating_add(self.period_ticks);
+                let deadline = at.saturating_add(self.sensor.frame_ticks(self.period_ticks));
                 self.state.frame_deadline = Some(deadline);
                 cx.schedule(deadline, self.state.generation);
             }
         }
     }
+    // The sensor command device retains the shared sensor state.
+    fujimod_emulator_devices::checkpoint_fields!(state: State, period_ticks: u64, active_ticks: u64);
     fn save(&self) -> Value {
         serde_json::json!({"state":self.state,"period_ticks":self.period_ticks,"active_ticks":self.active_ticks})
     }
@@ -386,6 +397,8 @@ mod tests {
             Some(super::super::sensor::ImageRoutes {
                 dma: Some([162, 163]),
                 timing: [166, 164],
+                line_stride: false,
+                frame_start_pulse: Some(165),
             }),
             (0x59, 4),
         );
@@ -442,6 +455,92 @@ mod tests {
         receiver.write(&mut cx, BASE + 0x10c, 4, 3);
         receiver.write(&mut cx, BASE, 4, 0x11);
         assert!(cx.refusal().is_none());
+    }
+    #[test]
+    fn no_standby_gate_option_arms_without_register_zero_write() {
+        // Sensor programmed (writes != 0) but register 0 never written (reset value 1 = standby).
+        for (option, armed) in [(false, false), (true, true)] {
+            let (sensor, mut receiver, mut host) = rig(false);
+            sensor.0.lock().unwrap().writes = 1;
+            sensor.set_no_standby_gate(option);
+            enable(&mut receiver, &mut host);
+            assert_eq!(receiver.next_deadline(0).is_some(), armed, "option {option}");
+        }
+        // The option does not stream an unprogrammed sensor.
+        let (sensor, mut receiver, mut host) = rig(false);
+        sensor.set_no_standby_gate(true);
+        enable(&mut receiver, &mut host);
+        assert_eq!(receiver.next_deadline(0), None);
+    }
+
+    #[test]
+    fn frames_of_the_decoded_readout_follow_the_frame_length_register() {
+        // X-T5 4.31: readout 0x07 (sensor register 0x01) lasts (0x18/0x19 + 2) x 2 lines.
+        let sensor =
+            Sensor::new(None, (0x59, 4)).with_frame_timing(super::super::sensor::FrameTiming {
+                readout: 7,
+                line_ticks: 6000,
+            });
+        {
+            let mut s = sensor.0.lock().unwrap();
+            s.registers
+                .extend([(0, 0x14), (0x01, 0x23), (0x18, 0x21), (0x19, 0x05)]);
+            s.writes = 1;
+        }
+        let wiring = || Wiring {
+            base: BASE,
+            normal_irqs: vec![158],
+            error_irqs: vec![159],
+            output_channels: vec![],
+            timing_output: false,
+            control: Control {
+                run_mask: 0x11,
+                run_value: 0x11,
+                reset_pulse: 0,
+                reset_ticks: 0,
+            },
+        };
+        let mut receiver = Receiver::new(sensor.clone(), wiring(), PERIOD, ACTIVE).unwrap();
+        let mut host = RecordingHost::default();
+        receiver.write(&mut Cx::new(&mut host, 0, 0, 0), BASE + 0x10c, 4, 3);
+        receiver.write(&mut Cx::new(&mut host, 0, 0, 0), BASE, 4, 0x11);
+        // Live-view readout: its line length is not decoded, so the stand-in period holds.
+        assert_eq!(receiver.next_deadline(0), Some(PERIOD));
+        host.now = PERIOD;
+        receiver.advance(&mut Cx::new(&mut host, 0, 0, 0));
+        assert_eq!(receiver.next_deadline(PERIOD), Some(PERIOD + ACTIVE));
+        // The AF readout with the 432-line frame (214 + 2 line pairs of 6 us): the next frame
+        // starts 2592 us after this one, and each frame ends within its own period.
+        sensor
+            .0
+            .lock()
+            .unwrap()
+            .registers
+            .extend([(0x01, 0x07), (0x18, 214), (0x19, 0)]);
+        assert_eq!(sensor.frame_ticks(PERIOD), 2_592_000);
+        host.now = PERIOD + ACTIVE;
+        receiver.advance(&mut Cx::new(&mut host, 0, 0, 0));
+        host.now = 2 * PERIOD;
+        receiver.advance(&mut Cx::new(&mut host, 0, 0, 0));
+        assert_eq!(
+            receiver.next_deadline(host.now),
+            Some(2 * PERIOD + 1_296_000)
+        );
+        host.now = 2 * PERIOD + 1_296_000;
+        receiver.advance(&mut Cx::new(&mut host, 0, 0, 0));
+        assert_eq!(
+            receiver.next_deadline(host.now),
+            Some(2 * PERIOD + 2_592_000)
+        );
+        // Without the opt-in the same registers keep the stand-in period.
+        let plain = Sensor::new(None, (0x59, 4));
+        plain
+            .0
+            .lock()
+            .unwrap()
+            .registers
+            .extend([(0x01, 0x07), (0x18, 214)]);
+        assert_eq!(plain.frame_ticks(PERIOD), PERIOD);
     }
     #[test]
     fn standby_dma_high_address_irq_ack_and_cancel() {

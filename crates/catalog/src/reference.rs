@@ -218,15 +218,14 @@ impl Soc {
                     self.id, block.id
                 ));
             }
-            if let Some(core_id) = &block.processor_core_id {
-                if block.kind != SocBlockKind::InterruptController
-                    || !self.processors.iter().any(|core| core.id == *core_id)
-                {
-                    return Err(format!(
-                        "SoC {} block {} has an invalid processor-core attachment",
-                        self.id, block.id
-                    ));
-                }
+            if let Some(core_id) = &block.processor_core_id
+                && (block.kind != SocBlockKind::InterruptController
+                    || !self.processors.iter().any(|core| core.id == *core_id))
+            {
+                return Err(format!(
+                    "SoC {} block {} has an invalid processor-core attachment",
+                    self.id, block.id
+                ));
             }
         }
         for mapping in &self.mappings {
@@ -371,6 +370,27 @@ pub struct RProfileState {
     pub atcm: TcmState,
     /// BTCM state after reset.
     pub btcm: TcmState,
+    /// Private, non-coherent write-back L1 data cache, as CCSIDR reports it.
+    pub data_cache: Option<DataCacheGeometry>,
+}
+
+/// L1 data-cache geometry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schema", schemars(deny_unknown_fields))]
+#[cfg_attr(
+    all(target_arch = "wasm32", not(target_os = "emscripten")),
+    derive(tsify::Tsify),
+    tsify(hashmap_as_object, missing_as_null)
+)]
+pub struct DataCacheGeometry {
+    /// Line size in bytes.
+    pub line_bytes: u32,
+    /// Number of sets.
+    pub sets: u32,
+    /// Associativity.
+    pub ways: u32,
 }
 
 /// A tightly coupled memory reset state.
@@ -1874,6 +1894,23 @@ pub enum PartModel {
         /// Closed protocol model for the endpoint.
         interface: crate::assembly::PeripheralPart,
     },
+    /// A motor-driven contact cam with a release latch. The attachment's
+    /// initial position is its run time at reset.
+    ContactCam {
+        /// Drive value that runs the motor.
+        run_drive: u32,
+        /// Drive values that hold the cam still.
+        hold_drives: Vec<u32>,
+        /// Hold drives under which a release input edge releases the latch.
+        release_drives: Vec<u32>,
+        /// Contact states along motor run time, ascending from 0; the last
+        /// is the release latch.
+        positions: Vec<ContactCamPosition>,
+        /// Run time past the latch tolerated before the drive stops.
+        latch_overrun_ticks: u64,
+        /// Release input edge to the return to run time 0.
+        release_ticks: u64,
+    },
 }
 
 /// A supported lens serial protocol.
@@ -2088,6 +2125,23 @@ pub struct ContactPosition {
     pub contacts: Vec<bool>,
 }
 
+/// A contact cam position along motor run time and its contact states.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schema", schemars(deny_unknown_fields))]
+#[cfg_attr(
+    all(target_arch = "wasm32", not(target_os = "emscripten")),
+    derive(tsify::Tsify),
+    tsify(hashmap_as_object, missing_as_null)
+)]
+pub struct ContactCamPosition {
+    /// Motor run time at which these contact states begin.
+    pub run_ticks: u64,
+    /// Resulting contact states.
+    pub contacts: Vec<bool>,
+}
+
 /// A serial bus route to a physical endpoint.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -2273,18 +2327,17 @@ impl Firmware {
                     ));
                 }
             }
-            if let Some(loader) = &installation.loader_validation {
-                if loader.sections.is_empty()
+            if let Some(loader) = &installation.loader_validation
+                && (loader.sections.is_empty()
                     || loader
                         .sections
                         .iter()
-                        .any(|name| !section_names.contains(name.as_str()))
-                {
-                    return Err(format!(
-                        "firmware {} loader validation refers to missing sections",
-                        self.id
-                    ));
-                }
+                        .any(|name| !section_names.contains(name.as_str())))
+            {
+                return Err(format!(
+                    "firmware {} loader validation refers to missing sections",
+                    self.id
+                ));
             }
             for (address, label) in &installation.entry_labels {
                 let address = u64::from_str_radix(address.trim_start_matches("0x"), 16)
@@ -2297,22 +2350,19 @@ impl Firmware {
                 }
             }
         }
-        if let Some(facts) = &self.generated_facts {
-            if let Some(remote) = &facts.remote {
-                if remote
-                    .get("firmware_id")
+        if let Some(facts) = &self.generated_facts
+            && let Some(remote) = &facts.remote
+            && (remote
+                .get("firmware_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(&self.id)
+                || remote.get("body_id").and_then(serde_json::Value::as_str) != Some(&self.body_id)
+                || remote
+                    .get("firmware_sha256")
                     .and_then(serde_json::Value::as_str)
-                    != Some(&self.id)
-                    || remote.get("body_id").and_then(serde_json::Value::as_str)
-                        != Some(&self.body_id)
-                    || remote
-                        .get("firmware_sha256")
-                        .and_then(serde_json::Value::as_str)
-                        != self.update.as_ref().map(|content| content.sha256.as_str())
-                {
-                    return Err("remote facts differ from firmware identity".into());
-                }
-            }
+                    != self.update.as_ref().map(|content| content.sha256.as_str()))
+        {
+            return Err("remote facts differ from firmware identity".into());
         }
         if let Some(layouts) = &self.layouts {
             for (profile_name, profile) in &layouts.profiles {
@@ -2549,6 +2599,9 @@ pub struct ResolvedSelection {
     /// Stock diagnostic bulk reads, when located for this firmware.
     #[serde(default)]
     pub bulk: Option<fujimod_catalog_bulk::FirmwareBulk>,
+    /// Stock runtime allocation, cache and callback mechanisms.
+    #[serde(default)]
+    pub execution: Option<fujimod_catalog_execution::FirmwareExecution>,
     /// Stock restart over debug USB, when located for this firmware.
     #[serde(default)]
     pub restart: Option<fujimod_catalog_restart::FirmwareRestart>,
@@ -2583,7 +2636,12 @@ pub struct ReferenceCatalog {
     ui_setting_names: BTreeMap<String, crate::ui_setting_names::UiSettingNames>,
     ui_event_codes: BTreeMap<String, crate::ui_event_codes::UiEventCodes>,
     bulk: BTreeMap<String, fujimod_catalog_bulk::FirmwareBulk>,
+    execution: BTreeMap<String, fujimod_catalog_execution::FirmwareExecution>,
+    nand_boot: BTreeMap<String, crate::nand_boot::FirmwareNandBoot>,
+    boot_patch: BTreeMap<String, crate::boot_patch::FirmwareBootPatch>,
+    boot_roms: BTreeMap<String, crate::boot_rom::BootRom>,
     restart: BTreeMap<String, fujimod_catalog_restart::FirmwareRestart>,
+    memory_reservations: BTreeMap<String, fujimod_catalog_memory_reservations::FirmwareMemoryReservations>,
     card_files: BTreeMap<String, fujimod_catalog_card::FirmwareCard>,
     settings: BTreeMap<String, fujimod_catalog_settings::FirmwareSettings>,
     flash: BTreeMap<String, crate::capture::FirmwareFlash>,
@@ -2615,6 +2673,9 @@ impl ReferenceCatalog {
         for (path, bytes) in read_json_files(&root.join("bodies"))? {
             catalog.insert_document(ReferenceKind::of_body_file(&path)?, &bytes, &path)?;
         }
+        for (path, bytes) in read_json_files(&root.join("boot-roms"))? {
+            catalog.insert_document(ReferenceKind::BootRom, &bytes, &path)?;
+        }
         for (path, bytes) in read_json_files(&root.join("firmware"))? {
             catalog.insert_document(ReferenceKind::of_firmware_file(&path)?, &bytes, &path)?;
         }
@@ -2624,21 +2685,41 @@ impl ReferenceCatalog {
 
     /// Load the normalized reference catalog compiled into this library.
     pub fn bundled() -> Result<Self, String> {
-        let mut catalog = Self::default();
-        catalog.firmware_versions = crate::firmware_versions::FirmwareVersions::bundled()?.releases;
-        for (kind, path, bytes) in bundled_documents() {
+        let mut catalog = Self {
+            firmware_versions: crate::firmware_versions::FirmwareVersions::bundled()?.releases,
+            ..Self::default()
+        };
+        #[cfg(target_os = "emscripten")]
+        let mut packed = {
+            let bytes = include_bytes!(concat!(env!("OUT_DIR"), "/bundled_catalog.zst"));
+            ruzstd::decoding::StreamingDecoder::new(bytes.as_slice())
+                .map_err(|error| format!("cannot open bundled catalog: {error}"))?
+        };
+        #[cfg(target_os = "emscripten")]
+        let mut document = Vec::new();
+        for &(kind, path, source) in BUNDLED_CATALOG {
+            #[cfg(target_os = "emscripten")]
+            let bytes = {
+                use std::io::Read;
+                document.resize(source, 0);
+                packed.read_exact(&mut document)
+                    .map_err(|error| format!("cannot decompress bundled catalog record {path}: {error}"))?;
+                document.as_slice()
+            };
+            #[cfg(not(target_os = "emscripten"))]
+            let bytes = source.as_bytes();
             match kind {
                 ReferenceKind::Soc => {
-                    let value: Soc = decode(bytes.as_bytes(), Path::new(path))?;
+                    let value: Soc = decode(bytes, Path::new(path))?;
                     value.validate(&value.id)?;
                     insert_unique(&mut catalog.socs, value.id.clone(), value, Path::new(path))?;
                 }
                 ReferenceKind::Part => {
-                    let value: Part = decode(bytes.as_bytes(), Path::new(path))?;
+                    let value: Part = decode(bytes, Path::new(path))?;
                     value.validate(&value.id)?;
                     insert_unique(&mut catalog.parts, value.id.clone(), value, Path::new(path))?;
                 }
-                kind => catalog.insert_document(kind, bytes.as_bytes(), Path::new(path))?,
+                kind => catalog.insert_document(kind, bytes, Path::new(path))?,
             }
         }
         catalog.validate_references()?;
@@ -2686,6 +2767,7 @@ impl ReferenceCatalog {
             ui_setting_names: self.ui_setting_names.get(&firmware.id).cloned(),
             ui_event_codes: self.ui_event_codes.get(&firmware.id).cloned(),
             bulk: self.bulk.get(&firmware.id).cloned(),
+            execution: self.execution.get(&firmware.id).cloned(),
             restart: self.restart.get(&firmware.id).cloned(),
             card_files: self.card_files.get(&firmware.id).cloned(),
             settings: self.settings.get(&firmware.id).cloned(),
@@ -2755,6 +2837,48 @@ impl ReferenceCatalog {
     /// Return the bulk profile for a firmware release.
     pub fn bulk(&self, firmware_id: &str) -> Option<&fujimod_catalog_bulk::FirmwareBulk> {
         self.bulk.get(firmware_id)
+    }
+
+    /// Runtime execution profiles, independent of a feature using them.
+    pub fn execution_profiles(
+        &self,
+    ) -> impl Iterator<Item = &fujimod_catalog_execution::FirmwareExecution> {
+        self.execution.values()
+    }
+
+    /// Return the runtime-execution profile for a firmware release.
+    pub fn execution(
+        &self,
+        firmware_id: &str,
+    ) -> Option<&fujimod_catalog_execution::FirmwareExecution> {
+        self.execution.get(firmware_id)
+    }
+
+    /// Located NAND bootloader facts, independent of a body or execution profile.
+    pub fn nand_boot_profiles(&self) -> impl Iterator<Item = &crate::nand_boot::FirmwareNandBoot> {
+        self.nand_boot.values()
+    }
+
+    /// Return the NAND bootloader facts for a firmware release.
+    pub fn nand_boot(&self, firmware_id: &str) -> Option<&crate::nand_boot::FirmwareNandBoot> {
+        self.nand_boot.get(firmware_id)
+    }
+
+    /// Located boot-patch facts, independent of a body or execution profile.
+    pub fn boot_patch_profiles(
+        &self,
+    ) -> impl Iterator<Item = &crate::boot_patch::FirmwareBootPatch> {
+        self.boot_patch.values()
+    }
+
+    /// Return the boot-patch facts for a firmware release.
+    pub fn boot_patch(&self, firmware_id: &str) -> Option<&crate::boot_patch::FirmwareBootPatch> {
+        self.boot_patch.get(firmware_id)
+    }
+
+    /// Located boot-ROM card facts, keyed by the ROM's SHA-256.
+    pub fn boot_rom(&self, sha256: &str) -> Option<&crate::boot_rom::BootRom> {
+        self.boot_roms.get(sha256)
     }
 
     /// Located restart profiles, independent of a body or execution profile.
@@ -2830,10 +2954,41 @@ impl ReferenceCatalog {
                 value.validate()?;
                 insert_unique(&mut self.bulk, value.firmware_id.clone(), value, path)
             }
+            ReferenceKind::Execution => {
+                let value: fujimod_catalog_execution::FirmwareExecution = decode(bytes, path)?;
+                value.validate()?;
+                insert_unique(&mut self.execution, value.firmware_id.clone(), value, path)
+            }
+            ReferenceKind::NandBoot => {
+                let value: crate::nand_boot::FirmwareNandBoot = decode(bytes, path)?;
+                value.validate()?;
+                insert_unique(&mut self.nand_boot, value.firmware_id.clone(), value, path)
+            }
+            ReferenceKind::BootPatch => {
+                let value: crate::boot_patch::FirmwareBootPatch = decode(bytes, path)?;
+                value.validate()?;
+                insert_unique(&mut self.boot_patch, value.firmware_id.clone(), value, path)
+            }
+            ReferenceKind::BootRom => {
+                let value: crate::boot_rom::BootRom = decode(bytes, path)?;
+                value.validate()?;
+                insert_unique(&mut self.boot_roms, value.sha256.clone(), value, path)
+            }
             ReferenceKind::Restart => {
                 let value: fujimod_catalog_restart::FirmwareRestart = decode(bytes, path)?;
                 value.validate()?;
                 insert_unique(&mut self.restart, value.firmware_id.clone(), value, path)
+            }
+            ReferenceKind::MemoryReservations => {
+                let value: fujimod_catalog_memory_reservations::FirmwareMemoryReservations =
+                    decode(bytes, path)?;
+                value.validate()?;
+                insert_unique(
+                    &mut self.memory_reservations,
+                    value.firmware_id.clone(),
+                    value,
+                    path,
+                )
             }
             ReferenceKind::CardFiles => {
                 let value: fujimod_catalog_card::FirmwareCard = decode(bytes, path)?;
@@ -2915,7 +3070,10 @@ impl ReferenceCatalog {
         for firmware_id in self
             .bulk
             .keys()
+            .chain(self.nand_boot.keys())
+            .chain(self.boot_patch.keys())
             .chain(self.restart.keys())
+            .chain(self.memory_reservations.keys())
             .chain(self.card_files.keys())
         {
             if !self.firmwares.contains_key(firmware_id)
@@ -2925,7 +3083,34 @@ impl ReferenceCatalog {
                     .any(|release| &release.firmware_id == firmware_id)
             {
                 return Err(format!(
-                    "bulk or restart facts refer to missing firmware {firmware_id}"
+                    "bulk, NAND-boot or restart facts refer to missing firmware {firmware_id}"
+                ));
+            }
+        }
+        for (firmware_id, facts) in &self.nand_boot {
+            let rom = self.boot_roms.get(&facts.boot_rom).ok_or_else(|| {
+                format!(
+                    "NAND-boot facts for {firmware_id} refer to missing boot ROM {}",
+                    facts.boot_rom
+                )
+            })?;
+            if facts.stage1.load_address != rom.load_address {
+                return Err(format!(
+                    "NAND-boot facts for {firmware_id} disagree with boot ROM {} on the handoff address",
+                    facts.boot_rom
+                ));
+            }
+        }
+        for (firmware_id, facts) in &self.boot_patch {
+            let firmware = self.firmwares.get(firmware_id).ok_or_else(|| {
+                format!("boot-patch facts refer to missing firmware {firmware_id}")
+            })?;
+            if let Some(update) = &firmware.update
+                && update.sha256 != facts.update_sha256
+            {
+                return Err(format!(
+                    "boot-patch facts for {firmware_id} name update {} instead of {}",
+                    facts.update_sha256, update.sha256
                 ));
             }
         }
@@ -2986,38 +3171,35 @@ impl ReferenceCatalog {
             }
         }
         for release in &self.firmware_versions {
-            if let Some(firmware) = self.firmwares.get(&release.firmware_id) {
-                if release.version != firmware.version
+            if let Some(firmware) = self.firmwares.get(&release.firmware_id)
+                && (release.version != firmware.version
                     || firmware
                         .update
                         .as_ref()
-                        .is_none_or(|update| update.sha256 != release.update_sha256)
-                {
-                    return Err(format!(
-                        "firmware version map differs for {}",
-                        release.firmware_id
-                    ));
-                }
+                        .is_none_or(|update| update.sha256 != release.update_sha256))
+            {
+                return Err(format!(
+                    "firmware version map differs for {}",
+                    release.firmware_id
+                ));
             }
-            if let Some(bulk) = self.bulk.get(&release.firmware_id) {
-                if release.product != bulk.product
-                    || release.internal_version != bulk.internal_version
-                {
-                    return Err(format!(
-                        "bulk identity differs from firmware version map for {}",
-                        release.firmware_id
-                    ));
-                }
+            if let Some(bulk) = self.bulk.get(&release.firmware_id)
+                && (release.product != bulk.product
+                    || release.internal_version != bulk.internal_version)
+            {
+                return Err(format!(
+                    "bulk identity differs from firmware version map for {}",
+                    release.firmware_id
+                ));
             }
-            if let Some(restart) = self.restart.get(&release.firmware_id) {
-                if release.product != restart.product
-                    || release.internal_version != restart.internal_version
-                {
-                    return Err(format!(
-                        "restart identity differs from firmware version map for {}",
-                        release.firmware_id
-                    ));
-                }
+            if let Some(restart) = self.restart.get(&release.firmware_id)
+                && (release.product != restart.product
+                    || release.internal_version != restart.internal_version)
+            {
+                return Err(format!(
+                    "restart identity differs from firmware version map for {}",
+                    release.firmware_id
+                ));
             }
         }
         self.validate_controls()?;
@@ -3243,25 +3425,25 @@ impl ReferenceCatalog {
                     ));
                 }
             }
-            if let Some(display) = &body.display {
-                if let Some(route) = &display.route {
-                    block_kind(
-                        &route.controller_id,
-                        SocBlockKind::SerialController,
-                        "display",
-                    )?;
-                    if !body.connections.iter().any(|connection| {
-                        connection.id == route.select_connection_id
-                            && connection
-                                .signals
-                                .iter()
-                                .any(|signal| matches!(signal, ConnectionSignal::Gpio { .. }))
-                    }) {
-                        return Err(format!(
-                            "body {} display route has no GPIO chip-select connection",
-                            body.id
-                        ));
-                    }
+            if let Some(display) = &body.display
+                && let Some(route) = &display.route
+            {
+                block_kind(
+                    &route.controller_id,
+                    SocBlockKind::SerialController,
+                    "display",
+                )?;
+                if !body.connections.iter().any(|connection| {
+                    connection.id == route.select_connection_id
+                        && connection
+                            .signals
+                            .iter()
+                            .any(|signal| matches!(signal, ConnectionSignal::Gpio { .. }))
+                }) {
+                    return Err(format!(
+                        "body {} display route has no GPIO chip-select connection",
+                        body.id
+                    ));
                 }
             }
             if let Some(mcu) = &body.microcontroller {
@@ -3474,8 +3656,13 @@ enum ReferenceKind {
     UiSettingNames,
     UiEventCodes,
     Bulk,
+    Execution,
+    NandBoot,
+    BootPatch,
+    BootRom,
     CardFiles,
     Restart,
+    MemoryReservations,
     Settings,
     Flash,
     State,
@@ -3499,8 +3686,12 @@ impl ReferenceKind {
             Some("ui-setting-names.generated.json") => Ok(Self::UiSettingNames),
             Some("ui-event-codes.generated.json") => Ok(Self::UiEventCodes),
             Some("bulk.generated.json") => Ok(Self::Bulk),
+            Some("execution.generated.json") => Ok(Self::Execution),
+            Some("sd-boot-v2-autostart.generated.json") => Ok(Self::NandBoot),
+            Some("boot-patch.generated.json") => Ok(Self::BootPatch),
             Some("card-files.generated.json") => Ok(Self::CardFiles),
             Some("restart.generated.json") => Ok(Self::Restart),
+            Some("memory-reservations.generated.json") => Ok(Self::MemoryReservations),
             Some("settings.generated.json") => Ok(Self::Settings),
             Some("flash.generated.json") => Ok(Self::Flash),
             Some("state.generated.json") => Ok(Self::State),
@@ -3510,10 +3701,6 @@ impl ReferenceKind {
 }
 
 include!(concat!(env!("OUT_DIR"), "/bundled_catalog.rs"));
-
-fn bundled_documents() -> impl Iterator<Item = (ReferenceKind, &'static str, &'static str)> {
-    BUNDLED_CATALOG.iter().copied()
-}
 
 #[cfg(test)]
 mod tests;

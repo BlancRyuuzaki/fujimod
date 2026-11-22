@@ -1,10 +1,17 @@
 //! XP5 polled SPI controller. GPIO selection routes wire frames to attached
 //! parts; FIFO readiness follows serial clock edges on the guest timeline.
+use fujimod_emulator_devices::checkpoint::Checkpoint;
 use fujimod_emulator_devices::xp5::pins::SharedPins;
 use fujimod_emulator_parts_io::serial::{Endpoint, Frame};
+use fujimod_emulator_devices::bus::FastReadWord;
 use fujimod_emulator_devices::{Cx, Device};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Status while a word is shifting: busy, no FIFO flags.
+const STATUS_BUSY: u32 = 0x10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -47,6 +54,24 @@ pub struct GpioWire {
     attachments: Vec<Attachment>,
     state: WireState,
 }
+fn attachment_checkpoints(attachments: &[Attachment]) -> Result<Vec<Checkpoint>, String> {
+    attachments.iter().map(|part| part.endpoint.checkpoint()).collect()
+}
+
+fn validate_attachments(
+    attachments: &[Attachment], selects: &[Select], saved: &[Checkpoint],
+) -> Result<(), String> {
+    if selects.iter().copied().ne(attachments.iter().map(|part| part.select))
+        || saved.len() != attachments.len()
+    {
+        return Err("SPI checkpoint endpoint wiring differs".into());
+    }
+    for (part, state) in attachments.iter().zip(saved) {
+        part.endpoint.validate_checkpoint(state)?;
+    }
+    Ok(())
+}
+
 impl GpioWire {
     pub fn new(pins: SharedPins, attachments: Vec<Attachment>) -> Result<Self, String> {
         if attachments.is_empty()
@@ -127,6 +152,41 @@ impl fujimod_emulator_parts_io::serial::Wire for GpioWire {
         let endpoint = self.state.active.take().unwrap().endpoint;
         Ok(self.attachments[endpoint].endpoint.transfer(frame, now))
     }
+    fn checkpoint(&self) -> Result<Checkpoint, String> {
+        let selects: Vec<_> = self.attachments.iter().map(|part| part.select).collect();
+        Ok(Checkpoint::encode("gpio-serial-wire", &(&self.state, selects))?
+            .with_children(attachment_checkpoints(&self.attachments)?))
+    }
+    fn validate_checkpoint(&self, saved: &Checkpoint) -> Result<(), String> {
+        let (state, selects): (WireState, Vec<Select>) = saved.decode("gpio-serial-wire")?;
+        validate_attachments(&self.attachments, &selects, saved.children())?;
+        let count = self.attachments.len();
+        if state.last_endpoint.is_some_and(|index| index >= count)
+            || state.active.as_ref().is_some_and(|frame| {
+                frame.endpoint >= count || state.generation == 0
+                    || state.last_endpoint != Some(frame.endpoint) || state.last_epoch != frame.epoch
+            })
+        {
+            return Err("invalid serial wire checkpoint".into());
+        }
+        Ok(())
+    }
+    fn validate_pending(&self, saved: &Checkpoint, token: u64, frame: Frame) -> Result<(), String> {
+        let (state, _): (WireState, Vec<Select>) = saved.decode("gpio-serial-wire")?;
+        if state.generation != token || !state.active.is_some_and(|active| active.frame == frame) {
+            return Err("PL022 pending frame differs from its GPIO serial wire".into());
+        }
+        Ok(())
+    }
+    fn restore_checkpoint(&mut self, saved: &Checkpoint) -> Result<(), String> {
+        self.validate_checkpoint(saved)?;
+        let (state, _): (WireState, Vec<Select>) = saved.decode("gpio-serial-wire")?;
+        for (part, checkpoint) in self.attachments.iter_mut().zip(saved.children()) {
+            part.endpoint.restore_checkpoint(checkpoint)?;
+        }
+        self.state = state;
+        Ok(())
+    }
     fn save(&self) -> Value {
         json!({"state":self.state,"parts":self.attachments.iter().map(|a|json!({"select":a.select,"kind":a.endpoint.name(),"state":a.endpoint.save()})).collect::<Vec<_>>()})
     }
@@ -199,8 +259,41 @@ pub struct Spi {
     pins: SharedPins,
     source_hz: u64,
     attachments: Vec<Attachment>,
+    /// Guest tick of the shifting word's last clock edge, 0 when idle. It
+    /// publishes the status register's busy interval: until that edge the
+    /// status reads busy whatever the guest does, so an interactive CPU may
+    /// answer polls without the owner. It is derived from `state.pending`.
+    shifting_until: Arc<AtomicU64>,
 }
 impl Spi {
+    fn publish(&self) {
+        let at = self.state.pending.as_ref().map_or(0, |p| p.at);
+        self.shifting_until.store(at, Ordering::Release);
+    }
+    fn validate_state(&self, decoded: &State) -> Result<(), String> {
+        if decoded
+            .last_endpoint
+            .is_some_and(|i| i >= self.attachments.len())
+            || decoded.pending.as_ref().is_some_and(|p| {
+                p.endpoint >= self.attachments.len() || p.token != decoded.generation
+            })
+            || decoded.rx.is_some() && decoded.pending.is_some()
+            || decoded.control & !0xffcf != 0
+            || decoded.control != 0 && decoded.control & 15 < 3
+            || decoded.enable & !0xa != 0
+            || decoded.divider != 0
+                && (!(2..=254).contains(&decoded.divider) || decoded.divider & 1 != 0)
+            || decoded.irq_enable & !3 != 0
+            || decoded.causes != 0
+        {
+            return Err("invalid SPI checkpoint transfer state".into());
+        }
+        if decoded.pending.is_some() && (decoded.enable & 2 == 0 || decoded.divider == 0) {
+            return Err("SPI checkpoint has a transfer without a serial clock".into());
+        }
+        Ok(())
+    }
+
     pub fn new(
         base: u64,
         pins: SharedPins,
@@ -224,7 +317,20 @@ impl Spi {
             pins,
             source_hz,
             attachments,
+            shifting_until: Arc::new(AtomicU64::new(0)),
         })
+    }
+    /// Drive external input bits of the one attached part named `part` (an
+    /// external line into that part, not a serial transfer).
+    pub fn set_part_input(&mut self, part: &str, register: u8, mask: u16, value: u16) -> Result<(), String> {
+        let mut parts = self.attachments.iter_mut().filter(|a| a.endpoint.name() == part);
+        match (parts.next(), parts.next()) {
+            (Some(attachment), None) => attachment.endpoint.set_input_bits(register, mask, value),
+            _ => Err(format!("SPI controller {:#x} has no single {part} part", self.base)),
+        }
+    }
+    pub fn has_part(&self, part: &str) -> bool {
+        self.attachments.iter().any(|a| a.endpoint.name() == part)
     }
     fn frame(&self, word: u16) -> Frame {
         Frame {
@@ -236,6 +342,11 @@ impl Spi {
     fn start(&mut self, cx: &mut Cx<'_>, value: u64) -> Result<(), String> {
         if self.state.enable & 2 == 0 || self.state.divider == 0 {
             return Err("SPI transfer requires an enabled master and divider".into());
+        }
+        if self.state.irq_enable != 0 {
+            // The interrupt output is not wired: an enabled mask is retained, but no cause bit
+            // or line is ever raised, so an interrupt-driven transfer must not silently proceed.
+            return Err("interrupt-driven SPI transfer is not modeled".into());
         }
         if self.state.pending.is_some() || self.state.rx.is_some() {
             return Err("SPI streaming beyond one polled word is not modeled".into());
@@ -261,6 +372,11 @@ impl Spi {
         let select = self.attachments[endpoint].select;
         let epoch = pins.output_rising_edges(select.port, select.pin);
         drop(pins);
+        // A new select period ends the endpoint's previous transaction before
+        // the first word of the next one is checked against it.
+        if self.state.last_endpoint != Some(endpoint) || self.state.last_cs_epoch != epoch {
+            self.attachments[endpoint].endpoint.reset_transaction();
+        }
         self.attachments[endpoint].endpoint.validate(frame)?;
         let cycles = u128::from(frame.bits)
             * u128::from(self.state.divider)
@@ -270,9 +386,6 @@ impl Spi {
             .now()
             .checked_add(u64::try_from(ns).map_err(|_| "SPI period overflow")?)
             .ok_or("SPI deadline overflow")?;
-        if self.state.last_endpoint != Some(endpoint) || self.state.last_cs_epoch != epoch {
-            self.attachments[endpoint].endpoint.reset_transaction();
-        }
         self.state.last_endpoint = Some(endpoint);
         self.state.last_cs_epoch = epoch;
         self.state.generation += 1;
@@ -283,6 +396,7 @@ impl Spi {
             cs_epoch: epoch,
             word: frame.word,
         });
+        self.publish();
         cx.schedule(at, self.state.generation);
         Ok(())
     }
@@ -303,7 +417,7 @@ impl Device for Spi {
             8 => self.state.rx.take().unwrap_or(0) as u64,
             0xc => {
                 if self.state.pending.is_some() {
-                    0x10
+                    STATUS_BUSY.into()
                 } else {
                     3 | (u64::from(self.state.rx.is_some()) << 2)
                 }
@@ -344,7 +458,7 @@ impl Device for Spi {
                 self.state.divider = value as u32
             }
             0x14 if value & !15 == 0 => self.state.causes &= !(value as u32),
-            0x24 if value == 0 => self.state.irq_enable = 0,
+            0x24 if value & !3 == 0 => self.state.irq_enable = value as u32,
             0x20 if value & !3 == 0 => {
                 if value & 1 != 0 {
                     self.state.rx = None;
@@ -384,6 +498,7 @@ impl Device for Spi {
         let reply = self.attachments[p.endpoint].endpoint.transfer(frame, p.at);
         self.state.pending = None;
         self.state.rx = Some(reply);
+        self.publish();
     }
     fn next_deadline(&self, _: u64) -> Option<u64> {
         self.state.pending.as_ref().map(|p| p.at)
@@ -400,6 +515,47 @@ impl Device for Spi {
     }
     fn pollable(&self, address: u64, size: u8) -> bool {
         size == 4 && address == self.base + 0xc
+    }
+    /// The status register while a word shifts. A shift completes only at
+    /// its scheduled clock edge, so before that tick the register reads
+    /// busy with no other effect; at or after it the read declines and the
+    /// ordinary read settles the word.
+    fn fast_reads(&self, window_base: u64, window_size: u64) -> Vec<FastReadWord> {
+        let address = self.base + 0xc;
+        if address < window_base || address + 4 > window_base.saturating_add(window_size) {
+            return Vec::new();
+        }
+        let shifting_until = self.shifting_until.clone();
+        vec![FastReadWord::clocked_u32(
+            address - window_base,
+            Arc::new(move |tick| {
+                let at = shifting_until.load(Ordering::Acquire);
+                (tick < at).then_some(STATUS_BUSY)
+            }),
+        )]
+    }
+    fn checkpoint(&self) -> Result<Checkpoint, String> {
+        let selects: Vec<_> = self.attachments.iter().map(|part| part.select).collect();
+        Ok(Checkpoint::encode(self.name(), &(self.base, self.source_hz, &self.state, selects))?
+            .with_children(attachment_checkpoints(&self.attachments)?))
+    }
+    fn validate_checkpoint(&self, saved: &Checkpoint) -> Result<(), String> {
+        let (base, clock, state, selects): (u64, u64, State, Vec<Select>) = saved.decode(self.name())?;
+        if base != self.base || clock != self.source_hz {
+            return Err("SPI checkpoint clock/address differs".into());
+        }
+        self.validate_state(&state)?;
+        validate_attachments(&self.attachments, &selects, saved.children())
+    }
+    fn restore_checkpoint(&mut self, saved: &Checkpoint) -> Result<(), String> {
+        self.validate_checkpoint(saved)?;
+        let (_, _, state, _): (u64, u64, State, Vec<Select>) = saved.decode(self.name())?;
+        for (part, checkpoint) in self.attachments.iter_mut().zip(saved.children()) {
+            part.endpoint.restore_checkpoint(checkpoint)?;
+        }
+        self.state = state;
+        self.publish();
+        Ok(())
     }
     fn save(&self) -> Value {
         json!({"base":self.base,"source_hz":self.source_hz,"controller":self.state,
@@ -422,23 +578,7 @@ impl Device for Spi {
         }
         let decoded: State =
             serde_json::from_value(state["controller"].clone()).map_err(|e| e.to_string())?;
-        if decoded
-            .last_endpoint
-            .is_some_and(|i| i >= self.attachments.len())
-            || decoded.pending.as_ref().is_some_and(|p| {
-                p.endpoint >= self.attachments.len() || p.token != decoded.generation
-            })
-            || decoded.rx.is_some() && decoded.pending.is_some()
-            || decoded.control & !0xffcf != 0
-            || decoded.control != 0 && decoded.control & 15 < 3
-            || decoded.enable & !0xa != 0
-            || decoded.divider != 0
-                && (!(2..=254).contains(&decoded.divider) || decoded.divider & 1 != 0)
-            || decoded.irq_enable != 0
-            || decoded.causes != 0
-        {
-            return Err("invalid SPI checkpoint transfer state".into());
-        }
+        self.validate_state(&decoded)?;
         if let Some(p) = &decoded.pending {
             if decoded.enable & 2 == 0 || decoded.divider == 0 {
                 return Err("SPI checkpoint has a transfer without a serial clock".into());
@@ -453,6 +593,7 @@ impl Device for Spi {
             a.endpoint.restore(&s["state"])?;
         }
         self.state = decoded;
+        self.publish();
         Ok(())
     }
 }
@@ -564,6 +705,38 @@ mod tests {
         }
     }
     #[test]
+    fn each_select_period_starts_a_new_endpoint_transaction() {
+        let shared = Pins::shared();
+        let mut gpio = Gpio::new(0xff907000, shared.clone(), false, vec![]).unwrap();
+        let mut host = RecordingHost::default();
+        use fujimod_emulator_parts_io::serial_command_registers::{CommandRegisters, Wiring};
+        let part = CommandRegisters::new(Wiring {
+            bits: 16,
+            mode: 0,
+            read_flag: Some(0x8000),
+            data_words: Some(1),
+            miso_high: false,
+        })
+        .unwrap();
+        let select = Select {
+            port: 12,
+            pin: 8,
+            active_high: false,
+        };
+        let mut spi = Spi::new(BASE, shared, 48_000_000, vec![Attachment::new(select, Box::new(part))])
+            .unwrap();
+        setup(&mut spi, &mut host, 15, 6);
+        for (register, value) in [(0x0019, 0x1234), (0x001d, 0x8001)] {
+            pins(&mut gpio, &mut host, false, true);
+            transfer(&mut spi, &mut host, register);
+            transfer(&mut spi, &mut host, value);
+            pins(&mut gpio, &mut host, false, false);
+        }
+        let state = &spi.save()["endpoints"][0]["state"]["registers"];
+        assert_eq!(state["registers"], json!({"25": [0x1234], "29": [0x8001]}));
+        assert_eq!(state["writes"], 2);
+    }
+    #[test]
     fn controller_without_an_attached_peer_refuses_a_transfer() {
         let (_, _, mut host) = fixture(false);
         let mut spi = Spi::new(BASE, Pins::shared(), 48_000_000, vec![]).unwrap();
@@ -617,6 +790,48 @@ mod tests {
         assert!(cx.refusal().unwrap().contains("chip select changed"));
         assert_eq!(spi.save(), before);
     }
+    fn published_status(spi: &Spi) -> Arc<dyn Fn(u64) -> Option<u32> + Send + Sync> {
+        use fujimod_emulator_devices::bus::FastReadValue;
+        match spi.fast_reads(BASE, 0x1000).as_slice() {
+            [FastReadWord { offset: 0xc, value: FastReadValue::ClockedU32(read) }] => read.clone(),
+            _ => panic!("SPI publishes only its status register"),
+        }
+    }
+    #[test]
+    fn published_status_reads_busy_on_guest_time_until_the_last_clock_edge() {
+        let (mut spi, mut gpio, mut host) = fixture(false);
+        assert!(spi.fast_reads(BASE + 0x10, 0xff0).is_empty());
+        let status = published_status(&spi);
+        // Idle and finished words keep their FIFO flags on the ordinary read.
+        assert_eq!(status(0), None);
+        pins(&mut gpio, &mut host, false, true);
+        setup(&mut spi, &mut host, 15 | (3 << 8), 6);
+        write(&mut spi, &mut host, 8, 0x2280);
+        let at = spi.next_deadline(0).unwrap();
+        assert_eq!(at, 8_000);
+        // Polling the published value has no effect and agrees with the
+        // register at every tick before the edge, however often it is read.
+        let saved = spi.save();
+        for tick in [0, 1, at / 2, at - 1] {
+            for _ in 0..3 {
+                assert_eq!(status(tick), Some(STATUS_BUSY));
+            }
+            host.now = tick;
+            assert_eq!(spi.read(&mut Cx::new(&mut host, 0, 0, 6), BASE + 0xc, 4), 0x10);
+        }
+        assert_eq!(spi.save(), saved);
+        // At the edge the published read declines; the ordinary read
+        // settles the word and reports the received data.
+        assert_eq!(status(at), None);
+        let (mut restored, _, _) = fixture(false);
+        let restored_status = published_status(&restored);
+        restored.restore(&saved).unwrap();
+        assert_eq!(restored_status(at - 1), Some(STATUS_BUSY));
+        host.now = at;
+        assert_eq!(spi.read(&mut Cx::new(&mut host, 0, 0, 6), BASE + 0xc, 4), 7);
+        assert_eq!(status(at - 1), None);
+        assert_eq!(status(0), None);
+    }
     #[test]
     fn pending_checkpoint_preserves_clock_phase_and_endpoint_state() {
         let (mut spi, mut gpio, mut host) = fixture(false);
@@ -634,6 +849,24 @@ mod tests {
             0xa0
         );
         assert!(spi.restore(&json!({})).is_err());
+        assert!(host.irqs.is_empty());
+    }
+    #[test]
+    fn interrupt_enable_mask_is_retained_but_an_interrupt_driven_transfer_refuses() {
+        let (mut spi, mut gpio, mut host) = fixture(false);
+        pins(&mut gpio, &mut host, false, true);
+        setup(&mut spi, &mut host, 15, 6);
+        write(&mut spi, &mut host, 0x24, 3);
+        assert_eq!(spi.read(&mut Cx::new(&mut host, 0, 0, 6), BASE + 0x24, 4), 3);
+        let saved = spi.save();
+        spi.restore(&saved).unwrap();
+        let mut cx = Cx::new(&mut host, 0, 0, 6);
+        spi.write(&mut cx, BASE + 8, 4, 0x2280);
+        assert!(cx.refusal().unwrap().contains("interrupt-driven"));
+        let mut cx = Cx::new(&mut host, 0, 0, 6);
+        spi.write(&mut cx, BASE + 0x24, 4, 4);
+        assert!(cx.refusal().unwrap().contains("unsupported SPI register"));
+        write(&mut spi, &mut host, 0x24, 0);
         assert!(host.irqs.is_empty());
     }
 }

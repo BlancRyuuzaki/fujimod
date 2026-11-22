@@ -1,3 +1,4 @@
+use fujimod_catalog_configuration::RunEngine;
 use super::*;
 
 fn board() -> Board {
@@ -9,9 +10,9 @@ fn board() -> Board {
         "dma_mappings":[{"address":65536,"physical":65536,"size":4096,"permissions":3}],
         "peripherals":[],"decoders":[],"instructions_per_tick":[1,1]
     })).unwrap();
-    let mut board = graph
+    let board = graph
         .build(
-            factory::Options::new(factory::Engine::Unicorn)
+            factory::Options::new(RunEngine::Unicorn)
                 .with_translation_cache_size_bytes(1 << 20),
             Bus::new(bus::Mode::Strict),
             None,
@@ -28,24 +29,24 @@ fn worker_preference_is_host_only_and_exact_stays_inline() {
     let mut board = board();
     assert_eq!(board.device_worker_preference(), 0);
     assert_eq!(board.device_worker_count(), 0);
-    let before = board.fingerprint().unwrap();
+    let before = board.complete_state().unwrap();
     board.set_device_workers(2).unwrap();
     assert_eq!(board.device_worker_preference(), 2);
     assert_eq!(board.device_worker_count(), 0);
     assert_eq!(fujimod_emulator_devices::work::worker_count(), 0);
-    assert_eq!(board.fingerprint().unwrap(), before);
+    assert_eq!(board.complete_state().unwrap(), before);
     assert!(board.set_device_workers(1).is_err());
     board
         .set_execution_policy(ExecutionPolicy::Interactive)
         .unwrap();
     assert_eq!(board.device_worker_count(), 2);
     assert_eq!(fujimod_emulator_devices::work::worker_count(), 2);
-    let before = board.fingerprint().unwrap();
+    let before = board.complete_state().unwrap();
     let saved = board.checkpoint(None).unwrap();
     board.set_device_workers(0).unwrap();
     board.restore_keyframe(&saved).unwrap();
     assert_eq!(board.device_worker_preference(), 0);
-    assert_eq!(board.fingerprint().unwrap(), before);
+    assert_eq!(board.complete_state().unwrap(), before);
 }
 
 #[test]
@@ -67,8 +68,8 @@ fn alternating_boards_apply_their_preference_before_each_run() {
         threaded.run_until(tick, 8).unwrap();
         assert_eq!(fujimod_emulator_devices::work::worker_count(), 2);
         assert_eq!(
-            inline.fingerprint().unwrap(),
-            threaded.fingerprint().unwrap()
+            inline.complete_state().unwrap(),
+            threaded.complete_state().unwrap()
         );
     }
     fujimod_emulator_devices::work::configure(0).unwrap();

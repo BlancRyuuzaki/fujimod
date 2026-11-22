@@ -1,5 +1,6 @@
 //! Recovered reset/gate latches and request/status mirrors. Initial values
 //! are explicitly zero session assumptions, not hardware reset measurements.
+use fujimod_emulator_devices::checkpoint::Checkpoint;
 use fujimod_emulator_devices::{Cx, Device};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -37,15 +38,14 @@ impl Gates {
         self
     }
     fn drive_reset(&self, cx: &mut Cx<'_>) {
-        if !self.power {
-            if let Some(cpu) = self.companion_cpu {
-                if let Err(e) = cx.reset_core(
-                    cpu,
-                    self.regs.get(&0x928).copied().unwrap_or(0) & 0x200000 == 0,
-                ) {
-                    cx.fail(e);
-                }
-            }
+        if !self.power
+            && let Some(cpu) = self.companion_cpu
+            && let Err(e) = cx.reset_core(
+                cpu,
+                self.regs.get(&0x928).copied().unwrap_or(0) & 0x200000 == 0,
+            )
+        {
+            cx.fail(e);
         }
     }
     fn latch(&self, o: u64) -> bool {
@@ -55,9 +55,12 @@ impl Gates {
                 0x510 | 0xb00 | 0xb04 | 0xb08 | 0xb0c | 0xb10 | 0xb1c | 0xb44
             )
         } else {
+            // 0x110: the fourth register write of the X-T5 boot header (0xff90c110 = 0xc, after
+            // 0xff90c150 and 0xff90c154), which an SD card stage repeats. A latch like those two;
+            // its meaning is not known.
             (0x300..=0x334).contains(&o)
                 || (0x900..=0x944).contains(&o)
-                || matches!(o, 0x150 | 0x154 | 0x600 | 0x604 | 0x608 | 0x700)
+                || matches!(o, 0x110 | 0x150 | 0x154 | 0x600 | 0x604 | 0x608 | 0x700)
         }
     }
     fn status(&self, o: u64) -> Option<u64> {
@@ -109,11 +112,30 @@ impl Device for Gates {
         if !self.power && o == 0x928 && (previous ^ v as u32) & 0x200000 != 0 {
             self.drive_reset(cx);
         }
-        if !self.power && o == 0x608 {
-            if let Some(clocks) = &self.panel_clocks {
-                clocks.selector(v as u32);
-            }
+        if !self.power
+            && o == 0x608
+            && let Some(clocks) = &self.panel_clocks
+        {
+            clocks.selector(v as u32);
         }
+    }
+    fn checkpoint(&self) -> Result<Checkpoint, String> {
+        Checkpoint::encode(self.name(), &self.regs)
+    }
+    fn validate_checkpoint(&self, saved: &Checkpoint) -> Result<(), String> {
+        let registers: BTreeMap<u64, u32> = saved.decode(self.name())?;
+        if registers.keys().any(|&offset| !self.latch(offset)) {
+            return Err("clock gate snapshot has an unknown latch".into());
+        }
+        Ok(())
+    }
+    fn restore_checkpoint(&mut self, saved: &Checkpoint) -> Result<(), String> {
+        self.validate_checkpoint(saved)?;
+        self.regs = saved.decode(self.name())?;
+        if !self.power && let Some(clocks) = &self.panel_clocks {
+            clocks.selector(self.regs.get(&0x608).copied().unwrap_or(0));
+        }
+        Ok(())
     }
     fn save(&self) -> Value {
         serde_json::to_value(&self.regs).unwrap()
@@ -122,10 +144,10 @@ impl Device for Gates {
         self.regs = serde_json::from_value(v.clone())
             .map_err(|e| format!("invalid gate checkpoint: {e}"))?;
         // CPU reset state is restored by the framework with its CPU snapshot.
-        if !self.power {
-            if let Some(clocks) = &self.panel_clocks {
-                clocks.selector(self.regs.get(&0x608).copied().unwrap_or(0));
-            }
+        if !self.power
+            && let Some(clocks) = &self.panel_clocks
+        {
+            clocks.selector(self.regs.get(&0x608).copied().unwrap_or(0));
         }
         Ok(())
     }
@@ -147,6 +169,26 @@ mod tests {
         gates.restore(&state).unwrap();
         assert_eq!(state, gates.save());
         assert_eq!(host.resets, [(4, false), (4, true)]);
+    }
+
+    #[test]
+    fn boot_header_register_writes_latch_and_other_offsets_stay_unmodeled() {
+        let mut gates = Gates::new(false);
+        let mut host = RecordingHost::default();
+        for (offset, value) in [(0x150u64, 0x1fu64), (0x154, 0x1f), (0x110, 0xc)] {
+            let mut cx = Cx::new(&mut host, 0, 0, 0);
+            gates.write(&mut cx, 0xff90c000 + offset, 4, value);
+            assert!(!cx.is_unmodeled(), "{offset:#x}");
+            let mut cx = Cx::new(&mut host, 0, 0, 0);
+            assert_eq!(gates.read(&mut cx, 0xff90c000 + offset, 4), value);
+            assert!(!cx.is_unmodeled(), "{offset:#x}");
+        }
+        let mut cx = Cx::new(&mut host, 0, 0, 0);
+        gates.write(&mut cx, 0xff90c114, 4, 1);
+        assert!(cx.is_unmodeled());
+        let state = gates.save();
+        gates.restore(&state).unwrap();
+        assert_eq!(state, gates.save());
     }
 
     #[test]

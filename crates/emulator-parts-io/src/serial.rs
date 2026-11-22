@@ -1,4 +1,5 @@
 //! Wire frames delivered by a serial controller to a selected attached part.
+use fujimod_emulator_devices::checkpoint::Checkpoint;
 use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -16,8 +17,22 @@ pub trait Endpoint: Send {
     fn reset_transaction(&mut self);
     /// The last serial clock edge arrived while chip select remained active.
     fn transfer(&mut self, frame: Frame, now_ns: u64) -> u16;
+    fn checkpoint(&self) -> Result<Checkpoint, String> {
+        Err(format!("{} has no exact checkpoint implementation", self.name()))
+    }
+    fn validate_checkpoint(&self, _: &Checkpoint) -> Result<(), String> {
+        Err(format!("{} has no exact checkpoint implementation", self.name()))
+    }
+    fn restore_checkpoint(&mut self, _: &Checkpoint) -> Result<(), String> {
+        Err(format!("{} has no exact checkpoint implementation", self.name()))
+    }
     fn save(&self) -> Value;
     fn restore(&mut self, state: &Value) -> Result<(), String>;
+    /// An external line that sets bits of one part register (for example a
+    /// cable's supply detection). Parts without such inputs refuse it.
+    fn set_input_bits(&mut self, _register: u8, _mask: u16, _value: u16) -> Result<(), String> {
+        Err(format!("{} has no external register inputs", self.name()))
+    }
 }
 
 /// A wire transaction may latch chip selection at the first serial edge.
@@ -26,10 +41,16 @@ pub trait Wire: Send {
     fn checkpoint(&self) -> Result<fujimod_emulator_devices::checkpoint::Checkpoint, String> {
         Err("serial wire has no exact checkpoint implementation".into())
     }
-    fn validate_checkpoint(&self, _: &fujimod_emulator_devices::checkpoint::Checkpoint) -> Result<(), String> {
+    fn validate_checkpoint(
+        &self,
+        _: &fujimod_emulator_devices::checkpoint::Checkpoint,
+    ) -> Result<(), String> {
         Err("serial wire has no exact checkpoint implementation".into())
     }
-    fn restore_checkpoint(&mut self, saved: &fujimod_emulator_devices::checkpoint::Checkpoint) -> Result<(), String> {
+    fn restore_checkpoint(
+        &mut self,
+        saved: &fujimod_emulator_devices::checkpoint::Checkpoint,
+    ) -> Result<(), String> {
         self.validate_checkpoint(saved)
     }
     fn validate_pending(
@@ -47,13 +68,19 @@ pub trait Wire: Send {
     /// Validate before changing state; restoration does not perform transfers.
     fn restore(&mut self, state: &Value) -> Result<(), String>;
 }
+fn unconnected(frame: Frame) -> String {
+    format!(
+        "serial wire input is unconnected ({}-bit mode {} word {:#x})",
+        frame.bits, frame.mode, frame.word
+    )
+}
 pub struct Unconnected;
 impl Wire for Unconnected {
-    fn begin(&mut self, _: Frame) -> Result<u64, String> {
-        Err("serial wire input is unconnected".into())
+    fn begin(&mut self, frame: Frame) -> Result<u64, String> {
+        Err(unconnected(frame))
     }
-    fn finish(&mut self, _: u64, _: Frame, _: u64) -> Result<u16, String> {
-        Err("serial wire input is unconnected".into())
+    fn finish(&mut self, _: u64, frame: Frame, _: u64) -> Result<u16, String> {
+        Err(unconnected(frame))
     }
     fn save(&self) -> Value {
         Value::Null
@@ -67,6 +94,30 @@ impl Wire for Unconnected {
     }
 }
 
+/// A wire whose one part is always selected: the link has no chip select.
+pub struct Dedicated(pub Box<dyn Endpoint>);
+impl Wire for Dedicated {
+    fn begin(&mut self, frame: Frame) -> Result<u64, String> {
+        self.0.validate(frame)?;
+        Ok(0)
+    }
+    fn finish(&mut self, token: u64, frame: Frame, now: u64) -> Result<u16, String> {
+        if token != 0 {
+            return Err("invalid dedicated serial token".into());
+        }
+        Ok(self.0.transfer(frame, now))
+    }
+    fn save(&self) -> Value {
+        serde_json::json!({"kind": "dedicated", "part": self.0.name(), "state": self.0.save()})
+    }
+    fn restore(&mut self, state: &Value) -> Result<(), String> {
+        if state["kind"] != "dedicated" || state["part"] != self.0.name() {
+            return Err("dedicated serial wire differs from checkpoint".into());
+        }
+        self.0.restore(&state["state"])
+    }
+}
+
 /// An explicitly fixed electrical input for a serial-wire scenario. This is
 /// neither a peripheral protocol nor a response chosen from transmitted data.
 pub struct InputLevel(pub bool);
@@ -74,7 +125,10 @@ impl Wire for InputLevel {
     fn checkpoint(&self) -> Result<fujimod_emulator_devices::checkpoint::Checkpoint, String> {
         fujimod_emulator_devices::checkpoint::Checkpoint::encode("fixed-serial-input", &self.0)
     }
-    fn validate_checkpoint(&self, saved: &fujimod_emulator_devices::checkpoint::Checkpoint) -> Result<(), String> {
+    fn validate_checkpoint(
+        &self,
+        saved: &fujimod_emulator_devices::checkpoint::Checkpoint,
+    ) -> Result<(), String> {
         let high: bool = saved.decode("fixed-serial-input")?;
         if high != self.0 || !saved.children().is_empty() || !saved.blobs().is_empty() {
             return Err("fixed serial input checkpoint differs".into());

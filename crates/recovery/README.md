@@ -1,4 +1,4 @@
-# SD recovery cards
+# SD card startup and recovery
 
 `fujimod-recovery` constructs SD startup files from an official update supplied
 by the caller. It checks the complete DAT identity, decoded source hashes,
@@ -9,7 +9,8 @@ The official DAT is included unchanged at its required card-root name.
 
 Switch the camera OFF, then remove and reinsert the battery before switching it
 on with the model's SD boot buttons held. Follow the body's USB connection
-instructions too.
+instructions too. Hold the buttons only while turning the power switch on;
+once the switch is in the ON position, release them.
 
 High-performance modes can leave a camera asleep after the OFF
 switch is used. Resuming from that state can skip SD card boot. This has been
@@ -68,11 +69,17 @@ CRC32 before entering the stock RAM image. The extra file avoids the ROM's
 checked against `ffuser.bin`. The runtime indexed reader opens this same file
 and reads the firmware namespace appended after its initialized RAM image.
 
-EXR II's remaining preloaded section-5 read uses the source bytes appended to
-`ffboot.bin`. Construction checks the section selector, callback-free call,
-16 KiB or 128 KiB block geometry, section descriptor, and code reservation before
-redirecting that call. The stock indexed reader and per-camera storage calls
-retain their original code.
+EXR II's preloaded section-5 read keeps only its status, so the card replaces
+the call with success after checking the section selector, callback-free call
+and 16 KiB or 128 KiB block geometry. A recipe can also name startup reads the
+card serves itself, each checked against its code, table row and update bytes:
+flash-loader service reads (the message bank and font) whose bytes the card
+places at their RAM destinations, service reloads of sections the image already
+holds, and the configuration-defaults fallback, which copies the update's
+defaults appended after the image. The flash-loader reads
+always load the recipe's bank and font, so the card's interface uses that
+language. The stock indexed reader and per-camera storage calls retain their
+original code.
 
 X-T1 5.52 cards light the green status LED at entry to the SD-loaded image,
 before the stock loader starts. Checked GPIO defaults and endpoint-call hooks
@@ -83,8 +90,9 @@ to the stock LED driver. ROM loading precedes this marker.
 XP4 recovery cards (`Recipe::build`) contain `ffinit.bin`, one full RAM image
 in `ffboot.bin` and the update file. This is the layout that has booted X-S10,
 X100V and X-Pro3 cameras from the card. The stock loader's GPIO table holds the
-green lamp on, so it lights once `ffboot.bin` has loaded and the loader starts;
-then hold DISP/BACK until the update screen appears.
+green lamp on, so it lights once `ffboot.bin` has loaded and the loader starts.
+Switch ON while holding DISP/BACK, then release it once the switch is in the ON
+position; the update screen appears when the updater starts.
 
 X-T1 5.52 also supplies the loader's footer header from the verified update
 embedded in the SD image. Only the footer checker's read call is redirected;
@@ -145,36 +153,38 @@ so the paired official DAT needs no version change. The recipe pins those
 code spans and verifies them against the constructed RAM image. `Recipe::build_startup` constructs boot files
 separately for execution and transfer tests.
 
-JavaScript uses `recovery.availability(firmwareId)` and
-`recovery.build(firmwareId, datBytes)`. Call `card.takeFiles()` to obtain file
+JavaScript uses `sdCardTools.availability(firmwareId)` and
+`sdCardTools.build(firmwareId, datBytes)`. Call `card.takeFiles()` to obtain file
 objects with `name`, `size`, and `bytes: Uint8Array`. Free the file objects and
 card after copying their contents to downloads or an archive. Construction has
 no filesystem, USB, camera, or network access.
 
 The native CLI exposes `list`, `build FIRMWARE DAT NEW_DIRECTORY`, and
-`startup FIRMWARE DAT NEW_DIRECTORY`, and `stage-one FIRMWARE DAT NEW_DIRECTORY`.
-For an XP5 transport check, `read-check FIRMWARE DAT NEW_DIRECTORY` builds the
-same card image as `startup` but makes its first stage stop after the complete
-`ffboot.bin` read and CRC32 match. The status lamp starts green, changes to
+`sd-boot-v1-startup FIRMWARE DAT NEW_DIRECTORY`, and `sd-boot-v1-stage-one FIRMWARE DAT NEW_DIRECTORY`.
+For an XP5 transport check, `sd-boot-v1-read-check FIRMWARE DAT NEW_DIRECTORY` builds
+the same card image as `sd-boot-v1-startup` but makes its first stage stop after the
+complete `ffboot.bin` read and CRC32 match. The status lamp starts green, changes to
 orange when the card entry prelude hands off to stock setup, and turns steady
 red after the read and CRC32 match. It does not release the other cores or
 execute the loaded image, so red identifies successful card transport
 independently of image handoff. If the lamp remains green or orange, inspect
 the earlier prelude, initial card mount, stock setup and card-read stages.
-`card-init-check FIRMWARE DAT NEW_DIRECTORY` stops with a steady red lamp
-after the initial card mount, before stock setup. `setup-check FIRMWARE DAT
+`sd-boot-v1-card-init-check FIRMWARE DAT NEW_DIRECTORY` stops with a steady red lamp
+after the initial card mount, before stock setup. `sd-boot-v1-setup-check FIRMWARE DAT
 NEW_DIRECTORY` stops with steady red after stock setup returns, before the
 second card initialization and `ffboot.bin` read. Orange without red in the
 setup check does not distinguish the first card mount from stock setup.
 Neither diagnostic executes the loaded image.
-`card-error-check FIRMWARE DAT NEW_DIRECTORY` also stops after the initial
+`sd-boot-v1-card-error-check FIRMWARE DAT NEW_DIRECTORY` also stops after the initial
 card mount. It shows steady red on success, or repeatedly blinks the red lamp
 for the failed step: two blinks for board setup, four for card initialization,
 and five for the FAT32 mount. Host setup gives six blinks for invalid
 arguments, seven for a clock timeout, or eight for a handshake timeout. A
 single blink means the first-stage request or card configuration was rejected
 before setup.
-For XP5 `startup`, `card-init-check`, `card-error-check`, `setup-check` and `read-check`, `--prepare-installed-flash` runs the
+For XP5 `sd-boot-v1-startup`, `sd-boot-v1-card-init-check`, `sd-boot-v1-card-error-check`,
+`sd-boot-v1-setup-check`, `sd-boot-v1-read-check` and `sd-boot-v1-card-read-check`,
+`--prepare-installed-flash` runs the
 checked installed-flash controller initialization and timing scan before
 continuing stock setup. It changes only that entry-source choice; the SD image
 and its CRC remain the same. Use it when the stock setup needs that installed
@@ -184,7 +194,7 @@ flash state, and keep its dependency on readable installed flash explicit.
 pair before firmware-reader redirection. `Recipe::build_rescue_baseline` exposes
 the same construction for regression comparisons.
 
-`card-startup FIRMWARE DAT STORAGE_IMAGE NEW_DIRECTORY` accepts an explicit
+`sd-boot-v1-sd-card-startup FIRMWARE DAT STORAGE_IMAGE NEW_DIRECTORY` accepts an explicit
 unit storage image for recipes with retained setup data. It checks the storage
 size and complete update pages, carries the retained cache in SRAM, and appends
 the storage namespace to the OS file. It defaults to zero success hold. The
@@ -192,7 +202,246 @@ optional runtime binding initializes the card and serves checked descriptor
 reads from that namespace; it uses the card’s retained training data and
 does not initialize the serial NOR controller.
 
-`startup` and `stage-one` accept `--success-hold-seconds N` (default `0`).
+A recipe whose body does not boot the preloaded reset stage names a **stock-selector startup**
+(`xp5.stock_selector`, `xp5::StockSelector`), and `sd-boot-v1-startup` and `Recipe::build_startup`
+then build that one (X-T5 4.31). The installed flash stays attached and the image keeps the
+update's own selector word (1), so the stock reset stage loads its section table and sections
+from the flash as on a flash boot. The loader is the default card loader; the prelude sets up
+and scans the installed flash as in stage one, and the card start's setup tables are not put in
+SRAM. The loader keeps the card host as the boot ROM left it after reading the loader from this
+card: none of the recipe's board operations run. They are the stock driver's bring-up of a slot it
+finds unconfigured, and on a body with a UHS-II slot they also enable the slot's UHS-II interface,
+which the stock driver turns off again before its first command on the UHS-I host and the loader
+does not. A recipe's `transfer_clock_divider` replaces the loader's SD clock divider 1 for the card
+read (the packager changes the one `mov w1, #0x101` of the loader's clock control write and refuses
+a loader without exactly that write). The loader holds, gates and wakes no core. Under selector 1 the reset stage's
+secondary-core entry returns at once and the core goes on into the stage's own work, so the stage
+wakes the parked cores itself when it is ready; a wake at the hand-off (what the internal-flash
+build below does for the preloaded selector) ran them beside core 0 too early in the emulator.
+The packager first checks the image against the stock reset image as for every startup, then
+zeroes the recipe's `cleared` extents (whole words after the reset stage, inside the image,
+overlapping neither each other nor an edit), applies its `ram_edits` (each old word checked, none
+on the selector) and puts the stock selector back; the CRC the loader checks covers the result.
+For X-T5 4.31 the one edit sends the reset stage's decode of section 4 to scratch DRAM, so the
+card's copy of section 4 stays and runs; the cleared extents are the erased tail of the reset
+stage's flash region, the controller payload cache and the overlays; and the divider is 4, the
+stock driver's step for a default-speed card. The `ffboot.bin` this builds is byte for byte the
+image that booted an X-T5 body from an SD card (SHA-256 `4aa12ffc...85cb7aa1`). That card's loader
+was hand-made: it ran no board operations, read at divider 4, set up the flash at entry and woke no
+core. An earlier build of this startup, which ran the recipe's board operations and read at
+divider 1, left an X-T5 body black with the same image; which of the two it was is not separated.
+The `marble_init.bin` this builder writes has run in the emulator only.
+
+`sd-boot-v1-ram-startup FIRMWARE DAT NEW_DIRECTORY [--fallback-wait-seconds N]` (XP5) writes only
+the two files the boot ROM and the loader read, `marble_init.bin` and `ffboot.bin`, and never the
+update. The installed flash stays attached: the prelude initializes and scans it as
+`sd-boot-v1-stage-one` does, the card carries only the RAM image, and the card-resident setup
+tables, namespace and unit cache are not used, so no unit storage image is involved and none of
+the unit's data reaches the output (`StartupOptions::internal_flash` and `Recipe::build_boot_files`
+are the library forms). Without that option, a recipe that carries a card-resident setup (X100VI
+1.31) refuses to build a startup without a unit storage image. A recipe's
+`internal_flash_ram_edits` are applied to the image (and covered by the CRC the loader checks).
+
+This startup uses its own build of the post-DDR loader,
+`assets/sd-boot-v1-xp5-internal-flash-loader.generated.{bin,json}`: the same C sources as the
+card-resident loader, compiled with `-DXP5_INTERNAL_FLASH` by the pinned Arm GCC 9.2.1. The
+default `sd-boot-v1-xp5-loader.generated.*` is unchanged. The internal-flash build keeps what
+the card-resident one does while it loads: the cores the boot ROM parks in WFI are held (their
+SGI enables masked), RAM 0 holds a gate stub that sends any stray arrival to the bootstrap's
+wait, and the first 16 bytes of the image (the reset entry) are kept back until the CRC has
+passed. RAM 0's first 16 bytes are written as single-copy-atomic 32-bit stores (`b .` first, the
+entry's final word last), which relies on the other cores being held. Only after the CRC does it write the entry, publish the image and wake
+the cores with SGI0 (after a `dsb sy`), which the image's preloaded reset stage expects to be awake.
+
+The loader reads its binding from `setup_sd_internal_flash`, which the packager fills after
+checking the empty template (`bind_internal_flash` in `src/xp5.rs`): the parked cores' interrupt
+frames, taken from the recipe's card-resident setup, and the fallback. The frames must lie in the
+redistributor window `0xfa000000..0xfb000000`, be the second page of a `0x20000`-aligned
+redistributor, follow each other at that stride and avoid the flash aperture and the flash
+controller's page (a write to either is a flash command). The card-resident setup's frames
+(`card_boot.rs`) are held to the window, alignment and stride clauses, which also keep them out of
+the aperture. The loader repeats the window, alignment and stride check (`-104`) before it touches
+a frame and then compares one byte of each redistributor's `GICR_TYPER` (Aff0 of the affinity)
+with its core number (`-105`), which is a check of one byte. A recipe with no card-resident setup
+has no frames to name, so the internal-flash startup refuses it.
+
+With `--fallback-wait-seconds N` (at most 86,400) the loader also continues from the installed
+flash after a failed load (no file, a length or CRC mismatch, a read error, a card
+initialization failure) instead of halting. The packager binds the CRC-32 of the stock reset
+image (`reset_copy_size` bytes at the update's reset offset, flash `0x40000` in the X100VI 1.31
+update). Before the loader gates RAM 0 it reads that image through the flash aperture with 32-bit
+loads, as the prelude's flash scan does, and compares the CRC: a different installed firmware
+turns the fallback off for the boot and a failed load halts. Otherwise a failed load waits N
+seconds and puts the stock reset image back at RAM 0 (only the 16 bytes saved before the gate when
+nothing beyond the held entry was written; else the image from offset 16 on, from the aperture).
+The gate stays in RAM 0 while the result is checked: the CRC of the entry about to be written and
+RAM `[16, restore_bytes)` must equal the bound one, and only then is the entry written and read
+back; a mismatch halts. It then gives the parked cores their interrupt enables back without waking
+them (the stock reset stage wakes them itself), publishes `a64_boot_ready = 2` and returns to the
+stock bootstrap, whose gate releases to RAM 0. After an aperture-path restore, what FFBOOT wrote
+above `restore_bytes` stays in DDR unverified; the stock reset stage reloads it.
+
+What halts: a bad request or binding (`-100`, `-104`) or frames that are not the cores'
+redistributors (`-105`) halt before anything is held or gated, with the DDR untrained; an
+unexpected exception level or MMU state (`-101`, `-102`) halts with the cores held and no gate;
+every other failure without an armed fallback halts with the cores held and the gate in place; a
+restore that does not verify (`-106`) halts with the gate still in place. The loader records the status of the fallback and
+the CRCs it measured in the last words of its binding.
+
+`sd-boot-v1-read-only-startup FIRMWARE DAT NEW_DIRECTORY --destination ADDRESS` (XP5) writes the same two
+files, `marble_init.bin` and `ffboot.bin`, and never the update, for a card that only *reads*
+`ffboot.bin`. `ffboot.bin` is the RAM image as the update installs it: the recipe's plan with its
+preloaded-selector edit undone and no RAM edits, so its reset-image prefix is byte for byte the
+stock reset image in the flash (the image is never run). The loader
+(`assets/sd-boot-v1-xp5-read-only-loader.generated.{bin,json}`, the same sources compiled with
+`-DXP5_READ_ONLY_STARTUP`) runs in place of the stock initializer's call: the stock initializer
+runs first and unchanged, then the loader streams the whole file into DRAM at `ADDRESS` (decimal or
+`0x`; `StartupOptions::read_only_destination` in the library), checks its length and CRC-32, reads
+the DRAM back and checks that, quiesces the SD host and returns, and the stock bootstrap goes on from
+the installed flash exactly as on a normal boot. The bootstrap's continuation (`ldr x30,
+=0xf0027110; ret`, into the flash) is not touched, RAM 0 is never written, no core is held or woken
+and nothing read is run. The destination must be 4 KiB aligned with the whole file inside
+`0x24459000..0x3e408000` (the loader refuses a bound outside that and so does the packager). The
+loader takes the CRC-32 of RAM `[0, reset_copy_size)` and the selector word before and after the
+read and **halts** (error `-900`, the lamp alternating red and green for ever) if either changed.
+Any other failure (no file, a length or CRC mismatch, a read error, a read-back mismatch) is
+recorded in the loader's progress words and shown as red lamp blinks, and the stock boot continues.
+The command excludes `--fallback-wait-seconds`, takes no storage image and needs no card-resident
+setup in the recipe.
+
+`sd-boot-v1-checked-redirect-startup FIRMWARE DAT NEW_DIRECTORY --destination ADDRESS (--verify-only | --apply)` (XP5)
+is the read-only startup plus one **checked redirect** (`StartupOptions::checked_redirect`; loader
+`assets/sd-boot-v1-xp5-checked-redirect-loader.generated.{bin,json}`, the same sources compiled with
+`-DXP5_READ_ONLY_STARTUP -DXP5_CHECKED_REDIRECT`). The stock reset stage loads its first raw section
+with a function of its own that copies it from the installed flash; the packager finds that function
+in the stock reset image by its instructions (every word is checked, the match must be unique and
+the function must have exactly one caller, `src/xp5/redirect.rs`) and plans the one word that makes
+it copy from the DRAM copy at `ADDRESS` instead. `ffboot.bin` is the unedited image cut after that
+section (the file is read in a fraction of a second), the section's bytes in it must equal the update's, and both section tables the stage may read must name the same
+section. The loader proves all of it against the installed flash before it writes anything (both tables
+and the range by CRC-32, the DRAM copy against the flash word for word, RAM 0 against the stock
+reset image) and with `--apply` then stores the one word, reads RAM 0 back and takes the word back
+if the read-back differs; an unproven redirect is never made and the stock boot goes on from the
+flash. `--verify-only` binds the same proof and never writes RAM 0 (and halts, `-902`, if RAM 0 is not the
+stock image at the end). The lamp is steady orange (red and green) while the loader reads the flash
+aperture, so a hang there is told from a plain read. A failure is shown as red lamp blinks (7 not
+proven, 8 changed and taken back, 9 the DRAM copy or RAM 0 changed after the check), success as green
+blinks (2 verified, 3 armed); after the green blinks, right before the hand-off, an armed redirect is
+checked once more (the DRAM copy's CRC-32 and RAM 0) and taken back if either changed (`-841`). A
+change that cannot be verified or taken back halts (`-901`). The binding must carry
+`orr x0, x20, #destination` as its word, which the loader decodes.
+
+`sd-boot-v1-copy-stub-startup FIRMWARE DAT NEW_DIRECTORY --destination ADDRESS (--verify-only | --apply)` (XP5)
+takes the same inputs as the checked redirect and replaces its one-word source change by a **copy stub**
+(`StartupOptions::copy_stub`; loader `assets/sd-boot-v1-xp5-copy-stub-loader.generated.{bin,json}`, the stub itself
+`assets/sd-boot-v1-xp5-copy-stub.generated.{bin,json}`). The packager finds the run of `nop` words between the
+reset entry's last helper (ending in `ret`) and the first exception vector table of the stock reset image, refuses the image
+unless nothing in it refers to that padding, binds the position-independent stub into it and a `bl` to the stub in
+place of the stage's copy call (the function the two section-table copies also call). With `--apply` the loader
+proves what the checked redirect proves, that the padding holds only `nop` words and that the stub bytes have the
+bound CRC-32, writes the stub first and the call word last, reads RAM 0 back against the packager's patched image
+(stock image, stub and call word) and takes everything back on any difference. At the moment of the call the stub
+checks the CRC-32 of the DRAM copy, copies from it with the stage's own copy function, checks the CRC-32 of the
+destination and copies from the flash instead on any difference, showing the path on the lamp (orange while it
+verifies, then one green pulse, or one, two or three red pulses) and leaving a status word in its parameter block.
+It never reads the flash aperture and writes nothing but its own block, the lamp pins, the stage's stack and, through
+the stage's copy function, the destination. The armed loader shows four green blinks (verified-only two).
+
+`sd-boot-v1-marker-startup FIRMWARE DAT NEW_DIRECTORY --destination ADDRESS (--verify-only | --apply)` (XP5)
+takes the copy-stub startup's inputs and writes the same two files (`ffboot.bin` is byte for byte the copy stub's:
+the stock-derived image cut after the first section), but binds a **change to that section** which the loader makes
+itself (`StartupOptions::marker`; loader `assets/sd-boot-v1-xp5-marker-loader.generated.{bin,json}`, the program
+`assets/sd-boot-v1-xp5-marker.generated.{bin,json}`). The packager finds the section's entry point in the
+section's own header, replaces its first instruction by a branch to a short program and writes that program into
+the run of zero words in front of the section's first exception vector table (refusing the image unless the
+section has exactly one such run and nothing in it refers to the run). It names every changed word (offset, stock
+word, new word; none at or above the section's declared size) and binds the CRC-32 of the changed section. The loader
+proves the flash range, that every named word holds its bound stock word in the flash, that the file's copy equals the
+flash word for word and that applying the names gives the bound CRC-32; with `--apply` it then writes the names into
+the DRAM copy, reads the copy against the flash again (equal but for the names) and takes them back otherwise. The
+copy stub of the copy-stub startup then checks the changed copy and the destination against the changed section's
+CRC-32 at the moment of use and copies the flash's section on any difference. The program lights the lamp orange,
+green, orange on core 0 and returns to the instruction after the hook. The armed loader shows five green blinks
+(verified-only two).
+
+`sd-boot-v1-os-startup FIRMWARE DAT NEW_DIRECTORY --destination ADDRESS (--verify-only | --apply)` (XP5)
+writes the same two files for the stage's load of its OS section (id 6, stored compressed in the flash and decoded into
+the section's DRAM address by a hardware engine; `StartupOptions::os`, loader
+`assets/sd-boot-v1-xp5-os-loader.generated.{bin,json}`, stub `assets/sd-boot-v1-xp5-os-stub.generated.{bin,json}`).
+`ffboot.bin` is the section's initialized bytes alone (the software decode of the flash's compressed bytes, which the
+packager checks equal to the RAM image's section and zero after them), which the loader streams to `--destination`.
+The packager finds the section's load function by its words (found once, three callers, exactly one of which passes
+the OS id) and refuses the image unless both section tables, the compressed flash range and the decode agree. The
+loader proves the section tables and the compressed flash range against bound CRC-32s and the file against its CRC-32
+(read back from DRAM), and with `--apply` writes a stub into the stage's nop padding and replaces the stage's call
+of the load function by a call to it. At the moment of the call the stub runs the stage's own load (the hardware
+decode of the installed flash, unchanged), compares the decode with the DRAM copy word for word, copies the DRAM copy
+over the destination with the stage's own copy function only if they are equal and compares again; if the copy does
+not verify it decodes again, and if the copy differs from the decode it leaves the decode where it is. The lamp
+shows the path (orange, then two green pulses or four, five or six red pulses); the armed loader shows six green
+blinks (verified-only two). It writes nothing but its own block, the lamp pins, the stage's stack and, through
+the stage's functions, the destination; it never writes the flash.
+
+`sd-boot-v1-exif-startup FIRMWARE DAT NEW_DIRECTORY --destination ADDRESS (--verify-only | --apply)` (XP5)
+binds the same call (the stage's load of its OS section) to a stub that writes **a few named words** of the section's
+decode and nothing else (`StartupOptions::exif`, loader `assets/sd-boot-v1-xp5-exif-loader.generated.{bin,json}`, stub
+`assets/sd-boot-v1-xp5-exif-stub.generated.{bin,json}`). The words are the 16 bytes of one constant string that the OS
+copies into the Software field of the Exif block it writes with every image (`Digital Camera ` becomes `FUJIMOD Camera `: the
+same length, the NUL in the same place; two words change, six check-only words around them anchor the decode). No OS bytes
+come from the card: `ffboot.bin` is a 4 KiB placeholder (a one-line note and zeros) because the read-only startup reads a file
+before it checks the flash. The packager finds the section's load function by its words, finds the string exactly once in the
+decode, checks that exactly two places in the OS build its address (each as an `adrp` and an `add` right after `mov w2, #15`),
+and that nothing else refers to it. The loader proves the section tables and the compressed flash range against bound CRC-32s,
+that the stage's call passes the bound section id, that the flash table's row for the section says what the binding says
+(destination, initialized bytes, flash offset, compressed length), that the named words are ascending, lie inside the section and
+change only inside the 16-byte window, that the window's bytes before and after (assembled from the table) have the bound CRC-32s
+and are fifteen printable characters and a NUL, and every word of the stub's parameter block (including the table). With `--apply`
+it writes the stub into the stage's nop padding and replaces the call by a call to it. The stub runs the stage's own load (the
+hardware decode of the installed flash, unchanged), checks every named word of the fresh decode against its bound stock value,
+and only if all match writes the new values with 32-bit stores and reads them back; on any difference it writes nothing, if a
+store does not read back it writes the stock values again and checks them, and if it cannot restore them it stops with the lamp
+alternating. The lamp shows the path (orange, then three green pulses; red and green in turn four, five or six times; red and green
+for ever); the armed loader shows seven green blinks (verified-only two). It writes nothing but its own block, the lamp pins, the
+stage's stack and the named words; it never writes the flash.
+
+`sd-boot-v1-hook-startup FIRMWARE DAT NEW_DIRECTORY --destination ADDRESS (--verify-only | --apply)` (XP5) uses the same
+route for **thirteen named words that are code** (`StartupOptions::hook`, loader
+`assets/sd-boot-v1-xp5-hook-loader.generated.{bin,json}`, stub `assets/sd-boot-v1-xp5-hook-stub.generated.{bin,json}`; the stub is
+the previous one with a table of sixteen words, and the loader's room for it is 1,280 bytes in this build only). They are the first
+instruction of the one OS function that copies the Exif identity record into the OS's global (it becomes a `b`), and a twelve-word
+program in a run of alignment padding of the OS's code (zero and nop words after a `ret`; the OS's own memory map of its image
+maps that range read, write and execute, and nothing refers to the padding). The program checks that the first eight bytes of the
+record's Software text, at offset 0x30 of the record the function was given, are `Digital `, and only then writes `FUJIMOD ` over
+them; it then runs the displaced instruction and branches back into the function. It touches no register but `x16`, `x17` and the
+flags, no memory but those eight bytes of the caller's own record, and calls nothing. The packager finds the function by its nine
+words (exactly once, every use a call that passes an address of the caller's stack frame), finds the OS's map of its code, picks
+the shortest run of padding that is long enough, and refuses the padding if anything refers to it. The loader assembles the thirteen
+stock and new words itself from the two addresses and the eight bytes of text and refuses any table that is not exactly them (one
+instruction wrong, a word moved, a stock word that is not zero or a nop, an unprintable character), on top of the Exif build's
+proofs of the flash range, the stage's call and the section's row, the bound CRC-32s of the stock and the new words and every word
+of the stub's block. The stub checks each of the thirteen against the fresh decode before it writes one. The armed loader shows
+eight green blinks (verified-only two). The OS bytes do not come from the card (`ffboot.bin` is the same 4 KiB placeholder) and the
+flash is never written.
+
+`sd-boot-v1-startup` and `sd-boot-v1-ram-startup` accept `--ram-overlay FILE` (XP5), a JSON
+description of bytes to add to the RAM image before it is packaged, so the loader's length and
+CRC checks cover them (`Recipe::build_startup_with_overlay` and `image::Overlay` are the library
+forms). It lists `regions` (`name`, `address`, `size`, `file`, `sha256`; each file is a basename in
+the description's directory) and `edits` (`address`, `old`, `new`, `what`). A region must lie in
+zero bytes outside every initialized section and every BSS extent of the RAM plan, since the stock
+startup may clear BSS after the image is loaded. An edit must replace the expected word of
+initialized bytes outside the regions. Nothing is written unless every check passes.
+`sd-boot-v1-read-only-startup`, `sd-boot-v1-checked-redirect-startup`, `sd-boot-v1-copy-stub-startup`, `sd-boot-v1-marker-startup`, `sd-boot-v1-os-startup`, `sd-boot-v1-exif-startup` and `sd-boot-v1-hook-startup` refuse an overlay, since their RAM image is never run.
+
+`sd-boot-v1-startup` also accepts `--ram-patches FILE` (XP5, not together with `--ram-overlay`;
+`Recipe::build_startup_with_ram_patches` and `ram_patch::RamPatches` are the library forms). It
+lists `words` (`address`, `old`, `new`) inside the image and `payloads` (`address`, `file`,
+`sha256`, and `replaces`, the SHA-256 of the stock bytes a payload inside the image replaces);
+each file is relative to the list's directory. A payload past the image's end grows the image
+with zeros, payloads end below 1 GiB, and no two changes overlap. The changes are applied before
+the loader's length and CRC are taken, and nothing is written unless every check passes.
+
+`sd-boot-v1-startup`, `sd-boot-v1-ram-startup`, `sd-boot-v1-read-only-startup`, `sd-boot-v1-checked-redirect-startup`, `sd-boot-v1-copy-stub-startup`, `sd-boot-v1-marker-startup`, `sd-boot-v1-os-startup`, `sd-boot-v1-exif-startup`, `sd-boot-v1-hook-startup` and `sd-boot-v1-stage-one` accept `--success-hold-seconds N` (default `0`).
 After sampling and header operations succeed, a nonzero value holds steady
 green using a counted loop before continuing. Each second requests 2,048 units
 of 1,000,000 four-NOP iterations, allowing up to two billion iterations per
@@ -200,8 +449,14 @@ second; the startup clock can make the hold longer. This early hold calls no
 stock code and requires no initialized timer. Zero skips the hold. The library
 exposes the same setting through `StartupOptions` and the corresponding `_with_options` methods.
 
-The XP4 compiled SD loader is `assets/xp4-sd-loader.generated.bin`; its companion
-`assets/xp4-sd-loader.generated.json` describes segment offsets, symbols and ARM
+`--success-hold-units N` sets the hold directly in those loop units instead of
+seconds (so `--success-hold-seconds S` equals `--success-hold-units` `S * 2048`) and
+is mutually exclusive with `--success-hold-seconds`. The units are only a count of
+loop passes, not a duration: the processor's speed at this point decides how long
+one unit takes. Only the 64-bit hold word of the guest configuration changes.
+
+The XP4 compiled SD loader is `assets/sd-boot-v1-xp4-loader.generated.bin`; its companion
+`assets/sd-boot-v1-xp4-loader.generated.json` describes segment offsets, symbols and ARM
 relocations. The crate loads these inputs with `include_bytes!` and
 `include_str!`. They contain empty camera-data placeholders. Runtime relocation
 inserts the supplied update's setup tables and updates absolute references,
@@ -215,8 +470,8 @@ reader and primary-loader call identities, reserves its code and backing ranges,
 and preserves the conditional primary-core initialization call. Out-of-range
 reads return errors. Per-unit storage APIs retain their stock behavior.
 
-The XP5 compiled SD loader is `assets/xp5-sd-loader.generated.bin`; its companion
-`assets/xp5-sd-loader.generated.json` gives the image size, symbol offsets, the
+The XP5 compiled SD loader is `assets/sd-boot-v1-xp5-loader.generated.bin`; its companion
+`assets/sd-boot-v1-xp5-loader.generated.json` gives the image size, symbol offsets, the
 pre-setup stack bound and the two relocations against stock setup routines. The
 build script turns that layout into constants and the crate loads the image with
 `include_bytes!`. The image contains empty camera-data placeholders; card
@@ -225,8 +480,8 @@ Card construction also lists the RAM image's all-zero 64 KiB runs after its
 first block in the loader request, at most 16 and the longest first; the
 loader fills them instead of reading them, and its CRC32 still covers them.
 
-The EXR compiled SD loader is `assets/exr-sd-loader.generated.bin`; its
-companion `assets/exr-sd-loader.generated.json` gives the startup loader and
+The EXR compiled SD loader is `assets/sd-boot-v1-exr-loader.generated.bin`; its
+companion `assets/sd-boot-v1-exr-loader.generated.json` gives the startup loader and
 firmware-reader segments, configuration offsets, symbols, and SRAM/stack
 bounds. The crate loads these inputs with `include_bytes!` and `include_str!`.
 Card construction fills the empty configuration fields with the ROM file API,
@@ -285,3 +540,13 @@ ordinary LED writes then take control without an interrupt, timer or persistent
 LED override. Recipes with completion-controlled startup indication retain that
 handoff instead. Terminal LED cards continue to hold green without booting the
 system.
+
+## EXR II release startup
+
+`sd-boot-v2-sd-card FIRMWARE DAT NEW_DIRECTORY` constructs the board's `ffsys.bin`,
+one universal `ffboot.bin`, and `FM_EXR2.BIN`. The first executable loads stage
+1 from NAND with the ROM's routines, then calls stage 2 without a firmware
+identity. Stage 2 identifies the installed firmware from the SHA-256 of its
+1 KiB NAND section table and selects the release's stage 3 from the card.
+Unknown tables resume stock. Add the A/B manifests and their store files to
+the resulting card directory before use.

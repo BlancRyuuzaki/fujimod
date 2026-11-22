@@ -7,7 +7,7 @@ use std::{
     rc::Rc,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BusMapping {
     pub address: u64,
@@ -28,6 +28,14 @@ impl BusMapping {
     fn end(self) -> u64 {
         self.address + self.size as u64
     }
+}
+fn containing_region(
+    regions: impl Iterator<Item = (u64, u64)>,
+    address: u64,
+) -> Option<(u64, u64)> {
+    regions
+        .into_iter()
+        .find(|&(base, end)| base <= address && address < end)
 }
 pub(super) fn validate_mappings(
     mappings: &[BusMapping],
@@ -50,11 +58,9 @@ pub(super) fn validate_mappings(
         let end = map.physical + map.size as u64;
         let mut cursor = map.physical;
         while cursor < end {
-            let (_, next) = regions
-                .iter()
-                .find(|&&(lo, hi)| lo <= cursor && cursor < hi)
+            let (_, next) = containing_region(regions.iter().copied(), cursor)
                 .ok_or("physical bus mapping has no complete backing")?;
-            cursor = end.min(*next);
+            cursor = end.min(next);
         }
     }
     Ok(())
@@ -74,13 +80,65 @@ pub struct Memory {
     pub(super) observation: RefCell<Option<std::rc::Weak<RefCell<super::observation::Records>>>>,
     pub(super) preservation:
         RefCell<Option<std::rc::Weak<RefCell<super::preservation::PreservationRecords>>>>,
+    /// Passive `--watch-writes` ranges and notes; outside checkpoints and board state.
+    pub(super) write_watch: RefCell<Option<super::write_watch::Watch>>,
 }
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct Checkpoint {
     regions: Vec<(u64, fujimod_emulator_cpu::memory::pages::Image)>,
     mappings: Vec<BusMapping>,
 }
+impl Checkpoint {
+    pub(super) fn diff(&self, other: &Self) -> Option<String> {
+        Memory::checkpoint_diff(self, other)
+    }
+    pub(super) fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "regions":self.regions.iter().map(|(base, image)| {
+                serde_json::json!({
+                    "base":base,
+                    "length":image.len(),
+                    "pages":(0..image.len().div_ceil(fujimod_emulator_cpu::memory::pages::PAGE_BYTES))
+                        .map(|page| image.page(page).map(fujimod_emulator_devices::state::bytes))
+                        .collect::<Vec<_>>(),
+                })
+            }).collect::<Vec<_>>(),
+            "mappings":self.mappings,
+        })
+    }
+}
 impl Memory {
+    pub(super) fn checkpoint_diff(left: &Checkpoint, right: &Checkpoint) -> Option<String> {
+        if left.regions.len() != right.regions.len() {
+            return Some(format!(
+                "regions: count {} differs from {}",
+                left.regions.len(),
+                right.regions.len()
+            ));
+        }
+        for (index, ((a_base, a), (b_base, b))) in
+            left.regions.iter().zip(&right.regions).enumerate()
+        {
+            if a_base != b_base || a.len() != b.len() {
+                return Some(format!("regions[{index}]: base or length differs"));
+            }
+            for page in 0..a.len().div_ceil(fujimod_emulator_cpu::memory::pages::PAGE_BYTES) {
+                let (Some(x), Some(y)) = (a.page(page), b.page(page)) else {
+                    return Some(format!("regions[{index}]: page {page} is missing"));
+                };
+                if let Some(offset) = first_difference(x, y) {
+                    return Some(format!(
+                        "regions[{index}] at {:#x}: page {page} differs at byte {offset}",
+                        a_base + (page * fujimod_emulator_cpu::memory::pages::PAGE_BYTES) as u64
+                    ));
+                }
+            }
+        }
+        if left.mappings != right.mappings {
+            return Some("bus mappings differ".into());
+        }
+        None
+    }
     pub(super) fn physical_ranges(
         &self,
         address: u64,
@@ -191,6 +249,17 @@ impl Memory {
         }
         Ok(())
     }
+    /// Flag processor writes from the first instruction on RAM that holds
+    /// `fill` everywhere, so keyframes never read pages the guest left
+    /// untouched. Boards whose processors cannot be observed keep reading
+    /// every page at their first keyframe.
+    pub(super) fn track_from_fill(&self, cpus: &[Rc<dyn Cpu>], fill: u8) {
+        if self.rearm(cpus).is_ok() {
+            for tracker in &self.trackers {
+                tracker.assume_uniform(fill);
+            }
+        }
+    }
     pub(super) fn checkpoint(&self) -> Checkpoint {
         Checkpoint {
             regions: self
@@ -201,6 +270,26 @@ impl Memory {
                 .collect(),
             mappings: self.mappings.borrow().clone(),
         }
+    }
+    pub(super) fn checkpoint_full(&self) -> Checkpoint {
+        Checkpoint {
+            regions: self
+                .regions
+                .iter()
+                .zip(&self.trackers)
+                .map(|((base, b), t)| (*base, unsafe { t.capture_all(b.as_ptr()) }))
+                .collect(),
+            mappings: self.mappings.borrow().clone(),
+        }
+    }
+    pub(super) fn memory_state(&self) -> serde_json::Value {
+        self.regions
+            .iter()
+            .map(|(base, backing)| {
+                let bytes = unsafe { std::slice::from_raw_parts(backing.as_ptr(), backing.len()) };
+                serde_json::json!({"base":base,"contents":fujimod_emulator_devices::state::bytes(bytes)})
+            })
+            .collect()
     }
     pub(super) fn validate_checkpoint(&self, saved: &Checkpoint) -> Result<(), String> {
         if self.regions.len() != saved.regions.len()
@@ -285,12 +374,6 @@ impl Memory {
         Err("dirty write has no physical backing".into())
     }
 
-    pub(super) fn fingerprint(&self) -> serde_json::Value {
-        self.regions.iter().map(|(base, backing)| {
-            let bytes = unsafe { std::slice::from_raw_parts(backing.as_ptr(), backing.len()) };
-            serde_json::json!({"base":base,"contents":fujimod_emulator_devices::fingerprint::bytes(bytes)})
-        }).collect()
-    }
     pub fn new(
         mut regions: Vec<(u64, Backing)>,
         mut mappings: Vec<BusMapping>,
@@ -302,7 +385,7 @@ impl Memory {
             let end = base
                 .checked_add(backing.len() as u64)
                 .ok_or("physical memory range overflow")?;
-            if backing.len() == 0 || *base < previous_end {
+            if backing.is_empty() || *base < previous_end {
                 return Err("empty or overlapping physical memory".into());
             }
             previous_end = end;
@@ -321,6 +404,7 @@ impl Memory {
             observation: Default::default(),
             preservation: Default::default(),
             continuation: Default::default(),
+            write_watch: Default::default(),
         })
     }
     pub(super) fn clear_preservation(
@@ -338,6 +422,72 @@ impl Memory {
     }
     pub(super) fn regions(&self) -> &[(u64, Backing)] {
         &self.regions
+    }
+    pub(super) fn backing_chunks(
+        &self,
+        address: u64,
+        size: usize,
+    ) -> Result<Vec<(u64, NonNull<u8>, usize)>, String> {
+        let end = address
+            .checked_add(size as u64)
+            .ok_or("physical backing access overflow")?;
+        let mut cursor = address;
+        let mut chunks = Vec::new();
+        while cursor < end {
+            let (base, region_end) = containing_region(
+                self.regions
+                    .iter()
+                    .map(|(base, backing)| (*base, *base + backing.len() as u64)),
+                cursor,
+            )
+            .ok_or("physical backing range is unavailable")?;
+            let backing = &self
+                .regions
+                .iter()
+                .find(|(start, _)| *start == base)
+                .unwrap()
+                .1;
+            let len = (end.min(region_end) - cursor) as usize;
+            let pointer =
+                NonNull::new(unsafe { backing.as_ptr().add((cursor - base) as usize) }).unwrap();
+            chunks.push((cursor, pointer, len));
+            cursor += len as u64;
+        }
+        Ok(chunks)
+    }
+    pub(super) fn read_backing(&self, address: u64, bytes: &mut [u8]) -> Result<(), String> {
+        let mut offset = 0;
+        for (_, pointer, len) in self.backing_chunks(address, bytes.len())? {
+            unsafe {
+                std::ptr::copy_nonoverlapping(pointer.as_ptr(), bytes.as_mut_ptr().add(offset), len)
+            };
+            offset += len;
+        }
+        Ok(())
+    }
+    pub(super) fn write_backing(
+        &self,
+        cpus: &[Rc<dyn Cpu>],
+        domain: &exclusive::Shared,
+        address: u64,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let mut offset = 0;
+        for (physical, pointer, len) in self.backing_chunks(address, bytes.len())? {
+            self.mark(pointer, len)?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr().add(offset), pointer.as_ptr(), len);
+                for cpu in cpus {
+                    cpu.backing_written(physical, pointer, len)?;
+                }
+            }
+            domain
+                .lock()
+                .map_err(|_| "exclusive monitors poisoned")?
+                .written(Some((physical, len)))?;
+            offset += len;
+        }
+        Ok(())
     }
     pub(super) fn replace_views(&self, replacements: &[BusMapping]) -> Result<(), String> {
         let mut mappings = self.mappings.borrow_mut();
@@ -400,6 +550,30 @@ impl Memory {
         self.read(address, bytes, Access::Host)?;
         self.observe_transfer("host-read", address, bytes.len());
         Ok(())
+    }
+    pub(super) fn host_bytes_equal(&self, address: u64, expected: &[u8]) -> Result<bool, String> {
+        let mut offset = 0;
+        let mut equal = true;
+        for chunk in self.chunks(address, expected.len(), Access::Host)? {
+            let (_, pointer, len) = chunk?;
+            // Physical backing is readable for the lifetime of the validated
+            // chunk and processors are stopped during host display capture.
+            let actual = unsafe { std::slice::from_raw_parts(pointer.as_ptr(), len) };
+            if actual != &expected[offset..offset + len] {
+                equal = false;
+                break;
+            }
+            offset += len;
+        }
+        self.observe_transfer("host-read", address, expected.len());
+        Ok(equal)
+    }
+    /// The physical (address, bytes) pieces of a bus range; an unmapped piece ends the list.
+    pub(super) fn physical_spans(&self, address: u64, bytes: usize) -> Vec<(u64, usize)> {
+        match self.chunks(address, bytes, Access::Host) {
+            Ok(chunks) => chunks.map_while(Result::ok).map(|(physical, _, len)| (physical, len)).collect(),
+            Err(_) => vec![],
+        }
     }
     pub(super) fn read_dma(&self, address: u64, bytes: &mut [u8]) -> Result<(), String> {
         self.read(address, bytes, Access::Read)?;
@@ -472,7 +646,7 @@ impl Memory {
             for (physical, _, len) in self.chunks(address, bytes.len(), Access::Host)?.flatten() {
                 stops
                     .borrow_mut()
-                    .store(physical, &bytes[offset..offset + len]);
+                    .store(None, physical, &bytes[offset..offset + len]);
                 offset += len;
             }
         }
@@ -536,4 +710,11 @@ impl Iterator for Chunks<'_> {
         self.address += len as u64;
         Some(Ok((physical, NonNull::new(pointer).unwrap(), len)))
     }
+}
+
+fn first_difference(left: &[u8], right: &[u8]) -> Option<usize> {
+    left.iter()
+        .zip(right)
+        .position(|(a, b)| a != b)
+        .or_else(|| (left.len() != right.len()).then_some(left.len().min(right.len())))
 }

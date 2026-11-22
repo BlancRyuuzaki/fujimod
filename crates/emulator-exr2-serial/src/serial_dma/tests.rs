@@ -66,12 +66,13 @@ fn options() -> Options {
     Options {
         serial_base: 0x5000,
         dma_base: 0x4000,
-        routing_base: 0x8000,
+        routing_base: Some(0x8000),
         channels: [2, 3],
         transmit_request: 9,
         receive_request: 8,
         frame_ticks: 64,
         irq_targets: vec![(2, 0, 93), (3, 0, 94)],
+        completion: Default::default(),
     }
 }
 
@@ -180,19 +181,23 @@ fn pending_pair_restores_typed_children_without_replaying_dma() {
             .is_err()
     );
     let mut overlap = options();
-    overlap.routing_base = overlap.serial_base;
+    overlap.routing_base = Some(overlap.serial_base);
     assert!(Transport::new(overlap, Input::Fixed { high: true }).is_err());
 }
 
 #[test]
 fn coarse_service_preserves_the_complete_long_transfer_state() {
-    let mut fine = Clock::default();
-    fine.ram = (0x1000..0x1083)
-        .map(|a| (a, (a - 0x1000) as u8))
-        .chain((0x2000..0x2083).map(|a| (a, 0xee)))
-        .collect();
-    let mut coarse = Clock::default();
-    coarse.ram = fine.ram.clone();
+    let mut fine = Clock {
+        ram: (0x1000..0x1083)
+            .map(|a| (a, (a - 0x1000) as u8))
+            .chain((0x2000..0x2083).map(|a| (a, 0xee)))
+            .collect(),
+        ..Default::default()
+    };
+    let mut coarse = Clock {
+        ram: fine.ram.clone(),
+        ..Default::default()
+    };
     let mut a = start_count(&mut fine, 131);
     let mut b = start_count(&mut coarse, 131);
     for tick in (64..=131 * 64).step_by(64) {

@@ -1,24 +1,21 @@
 import { BatteryCycleIcon } from '../ui/battery-cycle';
 import { PowerComboKeys } from '@fujimod/emulator-ui/ui/power-combo';
-import { For, Show, createEffect, createMemo, createSignal, onSettled } from 'solid-js';
+import { Show, createEffect, createMemo, createSignal, onSettled } from 'solid-js';
 import { downloadBlob } from '@fujimod/emulator-ui/ui/download';
 import { zipBlob } from '@fujimod/emulator-ui/archive';
 import { catalog as reference, initialize } from 'fujimod';
-import { SegmentedControl } from '@fujimod/emulator-ui/ui/SegmentedControl';
 import { shownError } from '@fujimod/emulator-ui/ui/shown-error';
 
 import { recoveryCameras, recoveryPlan } from './identify';
 import type { LibraryFirmware } from '../cameras/store';
 import { FirmwarePicker } from '../cameras/FirmwarePicker';
 import { createFirmwareLibrary } from '../cameras/firmware-library';
-import { Steps, Step, FileList } from './Steps';
+import { Steps, Step, FileList } from '../install/Steps';
+import { FormatGuide } from '../install/FormatGuide';
 import { FirmwareDownloads, type DownloadRow } from '../cameras/FirmwareDownloads';
 import '../cameras/launcher.css';
-import { recoveryCard, type RecoveryDownload } from './card';
-import { SiteHeader } from '../ui/site-header';
-import { SYSTEMS, FORMAT_STEPS, detectSystem, type System } from './format-guide';
-import '../home/site.css';
-import '../navigation.css';
+import { buildSdCardUtility, type SdCardUtilityDownload } from './card';
+import { SiteFrame } from '../ui/SiteFrame';
 import './recovery.css';
 import { firmwareDownloadName } from '../firmware-download';
 
@@ -27,12 +24,11 @@ declare const __FUJIMOD_BUILD_SHA__: string;
 export default function Recovery() {
   const library = createFirmwareLibrary();
   const store = library.store;
-  const [system, setSystem] = createSignal<System>('macOS');
   const [catalogReady, setCatalogReady] = createSignal(false);
   const [error, setError] = createSignal('');
   const [building, setBuilding] = createSignal(false);
   const [buildError, setBuildError] = createSignal('');
-  const [downloadType, setDownloadType] = createSignal<RecoveryDownload>('system');
+  const [downloadType, setDownloadType] = createSignal<SdCardUtilityDownload>('system');
   const [cameras, setCameras] = createSignal<DownloadRow[]>([]);
 
   const chosen = library.chosen;
@@ -56,16 +52,15 @@ export default function Recovery() {
         setCatalogReady(true);
       })
       .catch((caught: unknown) => setError(shownError(caught)));
-    setSystem(detectSystem(navigator.userAgent));
   });
 
-  async function download(firmware: LibraryFirmware, kind: RecoveryDownload) {
+  async function download(firmware: LibraryFirmware, kind: SdCardUtilityDownload) {
     setBuildError('');
     setDownloadType(kind);
     setBuilding(true);
     try {
       const bytes = new Uint8Array(await store.firmwareBytes(firmware.sha256));
-      const files = recoveryCard(firmware.firmwareId, bytes, kind);
+      const files = buildSdCardUtility(firmware.firmwareId, bytes, kind);
       const zip = await zipBlob(
         files.map((entry) => ({ path: entry.name, data: new Blob([entry.data]) })),
       );
@@ -77,7 +72,7 @@ export default function Recovery() {
         zip,
         firmwareDownloadName(
           kind === 'green-led' ? 'green-led' : 'recovery',
-          'sd-boot',
+          kind === 'green-led' ? 'green-led' : 'sd-card-recovery',
           { model: release.product, version: release.version },
           __FUJIMOD_BUILD_SHA__,
         ),
@@ -90,8 +85,7 @@ export default function Recovery() {
   }
 
   return (
-    <div class="shell recovery">
-      <SiteHeader root="../" current="recovery" />
+    <SiteFrame class="recovery">
       <main>
         <h1>Recovery</h1>
         <p class="recovery-lead">
@@ -101,15 +95,7 @@ export default function Recovery() {
 
         <Steps>
           <Step title="Format an SD card as FAT32">
-            <SegmentedControl
-              label="System"
-              options={SYSTEMS.map((name) => ({ value: name, label: name }))}
-              value={system()}
-              onSelect={setSystem}
-            />
-            <ol class="recovery-sub">
-              <For each={FORMAT_STEPS[system()]}>{(step) => <li>{step}</li>}</For>
-            </ol>
+            <FormatGuide />
           </Step>
 
           <Step title="Choose the official Fujifilm firmware">
@@ -188,7 +174,7 @@ export default function Recovery() {
                   </p>
                   {(() => {
                     const keys = (modes: ('sd' | 'firmware_update')[]) => (
-                      <Show when={result().sdBoot}>
+                      <Show when={result().sdBootCombination}>
                         {(controls) => <PowerComboKeys controls={controls()} modes={modes} />}
                       </Show>
                     );
@@ -198,10 +184,12 @@ export default function Recovery() {
                         fallback={
                           <>
                             <p>
-                              Hold these while switching it on, and keep holding until{' '}
+                              Hold these only while turning the power switch on. Once the switch is
+                              in the ON position, release them. The{' '}
                               {downloadType() === 'green-led'
-                                ? 'the green LED lights:'
-                                : 'the screen lights:'}
+                                ? 'green LED lights'
+                                : 'screen lights'}{' '}
+                              while the card starts:
                             </p>
                             {keys(
                               downloadType() === 'green-led' ? ['sd'] : ['sd', 'firmware_update'],
@@ -209,17 +197,17 @@ export default function Recovery() {
                           </>
                         }
                       >
-                        <p>Hold these while switching it on, until the green LED lights:</p>
-                        {keys(['sd'])}
                         <p>
-                          Then release them and hold this until the screen lights, which can take a
-                          few minutes:
+                          Hold these only while turning the power switch on. Once the switch is in
+                          the ON position, release them. The green LED lights while the card starts:
                         </p>
+                        {keys(['sd'])}
+                        <p>Then hold this until the screen lights, which can take a few minutes:</p>
                         {keys(['firmware_update'])}
                       </Show>
                     );
                   })()}
-                  <Show when={!result().sdBoot}>
+                  <Show when={!result().sdBootCombination}>
                     <p class="recovery-error">
                       The {result().model}’s SD boot buttons are not in the catalog yet.
                     </p>
@@ -261,6 +249,6 @@ export default function Recovery() {
           </Show>
         </Steps>
       </main>
-    </div>
+    </SiteFrame>
   );
 }

@@ -106,7 +106,7 @@ pub enum Interface {
     Rotary {
         id: String,
         node: String,
-        cycles_per_step: i32,
+        edges_per_step: i32,
     },
     Touch {
         id: String,
@@ -138,6 +138,10 @@ pub struct Driver {
     active: Option<Transition>,
     requested: BTreeMap<String, String>,
     completed: u64,
+    /// Host only: a wait read the queue, so its run ends at the queue's next
+    /// change instead of the host polling every `poll_ticks`.
+    #[serde(skip)]
+    watched: bool,
 }
 impl Driver {
     pub(crate) fn validate_checkpoint(&self, saved: &Self, now: u64) -> Result<(), String> {
@@ -243,11 +247,11 @@ impl Driver {
             match interface {
                 Interface::Rotary {
                     node,
-                    cycles_per_step,
+                    edges_per_step,
                     ..
                 } => {
-                    if !matches!(cycles_per_step, -1 | 1) {
-                        return Err("invalid rotary cycle direction".into());
+                    if *edges_per_step == 0 || edges_per_step.unsigned_abs() > 64 {
+                        return Err("invalid rotary edges per step".into());
                     }
                     session.resources.encoder(node)?;
                 }
@@ -280,6 +284,7 @@ impl Driver {
             active: None,
             requested: BTreeMap::new(),
             completed: 0,
+            watched: false,
         })
     }
     fn actuator(&self, id: &str) -> Result<&Actuator, String> {
@@ -335,6 +340,12 @@ impl Driver {
     }
     pub fn busy(&self) -> bool {
         self.active.is_some() || !self.pending.is_empty()
+    }
+    pub fn set_watched(&mut self, watched: bool) {
+        self.watched = watched;
+    }
+    fn progress(&self) -> (usize, bool, u64) {
+        (self.pending.len(), self.active.is_some(), self.completed)
     }
     pub fn owns(&self, id: &str) -> bool {
         self.active.as_ref().is_some_and(|t| t.id == id) || self.pending.iter().any(|t| t.id == id)
@@ -575,8 +586,16 @@ impl Session {
             .ok_or_else(|| "instruction count overflow".into())
     }
 
+    fn synchronize_window(&mut self) -> Result<(), String> {
+        match &mut self.window_action {
+            Some(action) => (action.synchronize)(&self.board),
+            None => Ok(()),
+        }
+    }
+
     /// Continue an existing host window across contact acknowledgments and
     /// passive observer stops, retaining its absolute instruction ceiling.
+    /// A watched queue ends the window after the pump that changes it.
     pub fn run_window(
         &mut self,
         end: u64,
@@ -584,16 +603,35 @@ impl Session {
         pause_after: Option<u64>,
         until: Option<u64>,
     ) -> Result<(), String> {
-        self.pump_contacts()?;
+        let watched = self
+            .contact_driver
+            .as_ref()
+            .filter(|d| d.watched)
+            .map(Driver::progress);
+        if !self.board.is_powered_off() {
+            self.synchronize_window()?;
+            self.pump_contacts()?;
+        }
         if end <= self.total_instructions()? {
+            if self.board.is_powered_off() { return Ok(()); }
             return self.board.run_window(end, quantum, pause_after, until);
         }
         loop {
+            if self.board.is_powered_off() {
+                if until.is_some_and(|t| self.board.now() >= t) { return Ok(()); }
+                if !self.advance_power_cycle(until)? { return Ok(()); }
+                self.pump_contacts()?;
+            }
             let current = self.total_instructions()?;
             if current >= end || until.is_some_and(|t| self.board.now() >= t) {
                 return Ok(());
             }
-            let pending = self.contact_driver.as_ref().filter(|d| d.busy());
+            // A watched queue is sampled even when idle, so a change made by
+            // the opening pump ends the window one poll later at most.
+            let pending = self
+                .contact_driver
+                .as_ref()
+                .filter(|d| d.busy() || d.watched);
             let horizon = match pending {
                 Some(driver) => Some(
                     self.board
@@ -603,9 +641,18 @@ impl Session {
                 ),
                 None => until,
             };
+            let horizon = horizon.into_iter().chain(self.window_action.as_ref().map(|action|
+                self.board.now().saturating_add(action.interval.get())
+            )).min();
             let before = (self.board.now(), current);
-            self.board.run_window(end, quantum, pause_after, horizon)?;
+            let execution = self.board.run_window(end, quantum, pause_after, horizon);
+            self.synchronize_window()?;
+            execution?;
+            if self.board.is_powered_off() { continue; }
             self.pump_contacts()?;
+            if watched.is_some() && watched != self.contact_driver.as_ref().map(Driver::progress) {
+                return Ok(());
+            }
             let after = (self.board.now(), self.total_instructions()?);
             if after == before
                 || horizon.is_none_or(|h| self.board.now() < h)

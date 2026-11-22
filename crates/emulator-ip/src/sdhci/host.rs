@@ -18,7 +18,7 @@ use fujimod_emulator_devices::{Cx, Device, bus::InterruptLine};
 use serde::{Deserialize, Serialize};
 use std::sync::{
     Arc,
-    atomic::{AtomicU16, Ordering},
+    atomic::{AtomicBool, AtomicU16, Ordering},
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -36,6 +36,11 @@ pub enum InitializationFault {
     None,
     /// CMD8 completes with Command Timeout Error and no response.
     RejectCmd8,
+    /// Allow this many CMD8 responses, then time out one CMD8.
+    RejectCmd8OnceAfter(u32),
+    /// As `RejectCmd8OnceAfter`, and time out every CMD3 sent in Stand-by,
+    /// so a host cannot adopt an identified card and must identify it again.
+    RejectStandbyCmd3AndCmd8OnceAfter(u32),
 }
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -55,6 +60,26 @@ pub struct Options {
     /// Further DRAM banks SDMA reaches: (physical base, bytes).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ram_banks: Vec<(u64, u64)>,
+    /// 0x40000000..0x60000000 aliases DRAM at 0 (address & 0x3fffffff), as on
+    /// the X-Processor 4 and earlier bodies. XP5 maps separate DRAM there.
+    #[serde(default = "dram_alias_default")]
+    pub dram_alias: bool,
+    /// Absolute address of this port's DMA address-high word, which lies
+    /// outside the SDHCI register file (XP5: 0xff90e7d8 + slot * 0xc for
+    /// port 0, written by 0x13a8ea0 before each block transfer). Bits 2..0
+    /// are DMA address bits 34..32; the SDMA system address holds bits 31..0.
+    #[serde(default)]
+    pub address_high: Option<u64>,
+    /// SD clock dividers (clock control bits 15..6) a stock driver programs
+    /// for a card in default speed and in high speed, under the interface
+    /// clock configuration that driver selects. Under that configuration a
+    /// command at a smaller divider, which is a faster clock than the stock
+    /// driver gives that card, refuses: the clock's frequency is not known
+    /// from a measured part. Divider 0 selects the undivided base clock, the
+    /// fastest setting, and refuses with either step. Under another interface
+    /// clock configuration nothing is known and no step applies.
+    #[serde(default)]
+    pub speed_dividers: Option<SpeedDividers>,
     /// Explicit SDHCI Capabilities 1 register input.
     #[serde(default)]
     pub capabilities_1: Option<u32>,
@@ -74,9 +99,25 @@ pub struct Options {
     pub write_busy_ticks: u64,
     /// Vendor registers (offsets 0x100..0x200) the guest only stores and
     /// reads back. Each holds its last write and resets to zero; no side
-    /// effect is modeled.
+    /// effect is modeled. A declared register takes precedence over the
+    /// built-in SDH30 vendor words it overlaps, which then refuse.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retained_registers: Vec<RetainedRegister>,
+}
+/// See [`Options::speed_dividers`].
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SpeedDividers {
+    /// Clock configuration field of the slot's interface block (0..=3).
+    pub interface: u8,
+    pub default_speed: u16,
+    pub high_speed: u16,
+}
+fn dram_alias_default() -> bool {
+    true
+}
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 /// One declared vendor register outside the modeled SDHCI set.
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -159,6 +200,9 @@ struct Request {
     quantity: usize,
     cursor: usize,
     address: u32,
+    /// Address-high word latched when the command starts (DMA bits 34..32).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    address_high: u32,
     phase: Phase,
     due: Option<u64>,
     command: u8,
@@ -175,6 +219,7 @@ fn read_media(
 }
 pub struct SdHost {
     options: Options,
+    register_gate: Option<Arc<AtomicBool>>,
     // Guest media transfers since the last explicit card replacement. Host
     // inspection and contact removal do not affect this passive ledger.
     reads: StorageReads,
@@ -199,6 +244,14 @@ pub struct SdHost {
     rom_fifo_ready: bool,
     faults: Vec<DataFault>,
     fault_history: Vec<DataFaultEvent>,
+    cmd8_responses: u64,
+    /// SDH30 vendor words +0x108..=+0x124 (sdhc protocol only). The X-T5 4.31 slot driver
+    /// read-modify-writes +0x124 bit 9 (0x13a8ae0) once a card is present; the meaning is unknown,
+    /// so the words only keep their last 32-bit write.
+    vendor: [u32; 8],
+    /// Last value written to the `address_high` word (DMA address bits 34..32).
+    address_high: u32,
+    /// Last writes to `Options::retained_registers`, in declaration order.
     retained: Vec<u32>,
 }
 /// CMD6 status (SD Physical Layer 4.3.10) of a card whose group 1 offers
@@ -206,6 +259,13 @@ pub struct SdHost {
 /// Function 15 keeps a group unchanged; an unsupported request reads 15.
 /// A switch (bit 31) selects the access mode; bus timing is not modeled.
 /// Returns the status and the group 1 selection.
+/// Bytes of one PIO block: a fixed-size status block or one sector.
+fn pio_block(r: &Request) -> usize {
+    match r.payload {
+        Payload::Metadata { len, .. } => len,
+        _ => 512,
+    }
+}
 fn switch_status(argument: u32, access_mode: u8) -> ([u8; 64], u8) {
     let mut bytes = [0; 64];
     let mut access = access_mode;
@@ -236,6 +296,16 @@ fn default_speed(mode: &u8) -> bool {
     *mode == 0
 }
 impl SdHost {
+    /// Connect a physical gate controlling visibility of the register bank.
+    pub fn with_register_gate(mut self, gate: Arc<AtomicBool>) -> Self {
+        self.register_gate = Some(gate);
+        self
+    }
+    fn registers_enabled(&self) -> bool {
+        self.register_gate
+            .as_ref()
+            .is_none_or(|gate| gate.load(Ordering::Relaxed))
+    }
     pub fn new(options: Options, wiring: Wiring) -> Result<Self, String> {
         Self::construct(options, wiring.card, wiring.contacts, Some(wiring.irq))
     }
@@ -282,12 +352,17 @@ impl SdHost {
         contacts: Contacts,
         irq: Option<InterruptLine>,
     ) -> Result<Self, String> {
-        if options.base & 3 != 0
+        // The X-T5 slot hosts keep a second SDHCI register set at +0x200 of
+        // their vendor page (0xff9b2200), so only word alignment is required;
+        // the window size still bounds the decode.
+        if options.base & 0x3 != 0
             || options.base > 0xffffe000
             || options.transfer_ticks == 0
             || options.rca == 0
             || options.ram_bytes == 0
             || options.ram_bytes > 0x1_0000_0000
+            || options.protocol == Protocol::Rom && !options.dram_alias
+            || options.address_high.is_some_and(|a| a & 3 != 0)
         {
             return Err("Invalid SD latency, RCA or DRAM extent".into());
         }
@@ -326,6 +401,7 @@ impl SdHost {
             supply: None,
             supply_seen: SupplyEpoch::default(),
             options,
+            register_gate: None,
             reads: StorageReads::default(),
             card,
             contacts,
@@ -345,6 +421,9 @@ impl SdHost {
             rom_fifo_ready: false,
             faults: Vec::new(),
             fault_history: Vec::new(),
+            cmd8_responses: 0,
+            vendor: [0; 8],
+            address_high: 0,
             retained,
         })
     }
@@ -404,6 +483,17 @@ impl SdHost {
         }
         Ok(())
     }
+    fn latch_normal(&mut self, status: u16) {
+        let enabled = status & self.regs.get(0x34);
+        self.regs.set(0x30, self.regs.get(0x30) | enabled);
+    }
+    fn latch_error(&mut self, status: u16) {
+        let enabled = status & self.regs.get(0x36);
+        if enabled != 0 {
+            self.regs.set(0x32, self.regs.get(0x32) | enabled);
+            self.regs.set(0x30, self.regs.get(0x30) | ERROR_INTERRUPT);
+        }
+    }
     /// Data CRC error status ends the transfer at the failing byte position.
     fn data_error(&mut self, cx: &mut Cx<'_>, r: Request) -> Result<(), String> {
         let sector = match r.payload {
@@ -418,8 +508,8 @@ impl SdHost {
             sector,
             transferred: r.cursor,
         });
-        self.regs.set(0x32, self.regs.get(0x32) | DATA_CRC_ERROR);
-        self.finish(cx, r, ERROR_INTERRUPT)
+        self.latch_error(DATA_CRC_ERROR);
+        self.finish(cx, r, 0)
     }
     pub fn card(&self) -> &Card {
         &self.card
@@ -498,9 +588,10 @@ impl SdHost {
     /// `keep_alias`: a DRAM-alias address stays aliased (ROM and single-block
     /// reads, while physical low RAM may be shadowed by ROM). Outside the
     /// alias, only the ROM protocol refuses; others address DRAM directly.
-    fn physical(&self, address: u32, len: usize, keep_alias: bool) -> Result<u64, String> {
-        let a = address as u64;
-        let alias = (0x40000000..0x60000000).contains(&a);
+    /// `high` supplies DMA address bits 34..32 (XP5 address-high word).
+    fn physical(&self, high: u32, address: u32, len: usize, keep_alias: bool) -> Result<u64, String> {
+        let a = u64::from(high) << 32 | u64::from(address);
+        let alias = self.options.dram_alias && (0x40000000..0x60000000).contains(&a);
         if self.options.protocol == Protocol::Rom && !alias {
             return Err("ROM SDMA requires DRAM alias".into());
         }
@@ -517,7 +608,9 @@ impl SdHost {
             || !inside(0, self.options.ram_bytes)
                 && (alias || !self.options.ram_banks.iter().any(|&(b, n)| inside(b, n)))
         {
-            return Err("SD DMA exceeds aligned DRAM".into());
+            return Err(format!(
+                "SD DMA exceeds aligned DRAM: address {a:#x} (physical {physical:#x}) length {len:#x}"
+            ));
         }
         Ok(if keep_alias && alias { a } else { physical })
     }
@@ -564,8 +657,18 @@ impl SdHost {
         };
         let single =
             self.options.protocol == Protocol::Sdhc && matches!(word, 0x113a0010 | 0x113a0011);
-        let pio = !rom && (matches!(word, 0x193a0026 | 0x123a0036) || single && word & 1 == 0);
-        if (rom && word >> 16 & 255 != expected) || (!rom && word != expected && !pio && !single) {
+        // CMD6 also reads its 64-byte status through the data port: the X-T3
+        // fast SD card read sends 0x063a0010 on the X-Processor 4 host.
+        let pio = !rom
+            && (matches!(word, 0x193a0026 | 0x123a0036)
+                || word == 0x063a0010 && !app
+                || single && word & 1 == 0);
+        // CMD7 with RCA 0 deselects every card and none answers it, so a
+        // host sends it without a response (Physical Layer 7.10, 4.7.4).
+        let deselect = !rom && word == 0x07000000 && argument == 0;
+        if (rom && word >> 16 & 255 != expected)
+            || (!rom && word != expected && !pio && !single && !deselect)
+        {
             return Err(format!("Unsupported SD command {command}/{word:#x}"));
         }
         let mut request = Request {
@@ -580,6 +683,7 @@ impl SdHost {
             quantity: 0,
             cursor: 0,
             address: self.regs.word(0),
+            address_high: self.address_high,
             phase: Phase::Command,
             due: None,
             command,
@@ -651,9 +755,11 @@ impl SdHost {
                 self.state != State::Ready || argument != 0
             }
             3 => {
+                // Physical Layer 7.10, 4.2.2: the host may send CMD3 again in
+                // Stand-by to have the card publish a new RCA.
                 request.state = State::Standby;
                 response = rca | if rom { 0x500 } else { 0x600 };
-                self.state != State::Identification || argument != 0
+                !matches!(self.state, State::Identification | State::Standby) || argument != 0
             }
             9 if !rom => {
                 let csd = 1u128 << 126
@@ -675,7 +781,13 @@ impl SdHost {
                 } else {
                     State::Standby
                 };
-                response = if argument != 0 { 0x900 } else { 0x600 };
+                response = if deselect {
+                    0
+                } else if argument != 0 {
+                    0x900
+                } else {
+                    0x600
+                };
                 !matches!(self.state, State::Standby | State::Transfer)
                     || ![0, rca].contains(&(argument & 0xffff0000))
                     || rom && argument == 0
@@ -707,6 +819,9 @@ impl SdHost {
                 argument != 0 || self.regs.get(4) & 0xfff != 8
             }
             6 if !rom && self.options.high_speed => {
+                if pio {
+                    request.transfer = Transfer::PioRead;
+                }
                 let (bytes, selected) = switch_status(argument, self.access_mode);
                 if argument >> 31 != 0 && selected != 15 {
                     request.access_mode = selected;
@@ -718,6 +833,9 @@ impl SdHost {
                 // The card supports only default speed (group 1 function 0).
                 // Checking or switching to high speed reports result 0xF for
                 // group 1, as the SD spec defines for an unsupported function.
+                if pio {
+                    request.transfer = Transfer::PioRead;
+                }
                 let mut bytes = [0; 64];
                 bytes[13] = 1;
                 bytes[16] = 0xf;
@@ -783,13 +901,30 @@ impl SdHost {
         if self.regs.get(0x3e) & 0x107 == 0x107 {
             return Err("SD command with UHS-II mode selected".into());
         }
+        let stock_clock = |steps: &SpeedDividers| self.contacts.interface_clock() == steps.interface;
+        if let Some(steps) = self.options.speed_dividers.filter(|steps| !rom && stock_clock(steps)) {
+            let divider = (clock >> 8 & 0xff | (clock >> 6 & 3) << 8) as u16;
+            let (mode, step) = if self.access_mode == 1 {
+                ("high speed", steps.high_speed)
+            } else {
+                ("default speed", steps.default_speed)
+            };
+            if divider == 0 || divider < step {
+                return Err(format!(
+                    "SD command at clock divider {divider}: the stock driver's {mode} step is {step}"
+                ));
+            }
+        }
+        if self.contacts.uhs2_interface() {
+            // The slot's lines belong to the UHS-II PHY. What a card then sees of a
+            // command on the 4-bit interface is not known from a measured part.
+            return Err("SD command while the slot's UHS-II interface is enabled".into());
+        }
         if !self.contacts.present() {
             // No card answers the command: the controller reports a command
             // timeout and the error interrupt at once. The timeout interval
             // is not measured, so none is modeled.
-            self.regs
-                .set(0x32, self.regs.get(0x32) | COMMAND_TIMEOUT_ERROR);
-            self.regs.set(0x30, self.regs.get(0x30) | ERROR_INTERRUPT);
+            self.latch_error(COMMAND_TIMEOUT_ERROR);
             return self.signal(cx);
         }
         self.observe_supply();
@@ -797,9 +932,6 @@ impl SdHost {
         let mut r = self.plan(word, argument)?;
         if rom && r.command != 17 && word as u16 != 0 {
             return Err("ROM non-data command has transfer mode bits".into());
-        }
-        if rom && self.regs.get(0x34) & 3 != 3 {
-            return Err("ROM command requires status enabled".into());
         }
         if r.quantity != 0 {
             if self.regs.get(4) & 0xfff
@@ -833,12 +965,20 @@ impl SdHost {
             if !rom && r.command != 17 && enabled & 2 == 0 {
                 return Err("SD data-complete signal disabled".into());
             }
+            // A polled host leaves every signal enable clear and waits on
+            // status enabled at +0x34 (the X-Processor 4 boot ROM writes only
+            // +0x34; the X-T3 fast SD card read polls the same way).
+            let signalled = if self.regs.get(0x38) == 0 {
+                self.regs.get(0x34)
+            } else {
+                self.regs.get(0x34) & self.regs.get(0x38)
+            };
             if r.transfer == Transfer::Dma {
-                self.physical(r.address, r.quantity, rom || r.command == 17)?;
+                self.physical(r.address_high, r.address, r.quantity, rom || r.command == 17)?;
                 let boundary = 4096usize << (self.regs.get(4) >> 12 & 7);
                 if !rom
                     && r.quantity > boundary - r.address as usize % boundary
-                    && self.regs.get(0x34) & self.regs.get(0x38) & 8 == 0
+                    && signalled & 8 == 0
                 {
                     return Err("SDMA boundary interrupt disabled".into());
                 }
@@ -853,9 +993,7 @@ impl SdHost {
                 } else {
                     0x23
                 };
-                if enabled & signals & !1 != signals & !1
-                    || self.regs.get(0x34) & self.regs.get(0x38) & 1 == 0
-                {
+                if enabled & signals & !1 != signals & !1 || signalled & 1 == 0 {
                     return Err("SD PIO directional signals disabled".into());
                 }
             }
@@ -880,7 +1018,7 @@ impl SdHost {
         self.bus_width = r.bus_width;
         self.access_mode = r.access_mode;
         self.response = r.response;
-        self.regs.set(0x30, self.regs.get(0x30) | status);
+        self.latch_normal(status);
         self.signal(cx)
     }
     fn complete(&mut self, cx: &mut Cx<'_>) -> Result<(), String> {
@@ -898,10 +1036,32 @@ impl SdHost {
             self.request = Some(r);
             return Err("SD contacts changed during transfer".into());
         }
-        if r.command == 8 && self.options.initialization_fault == InitializationFault::RejectCmd8 {
-            self.regs
-                .set(0x32, self.regs.get(0x32) | COMMAND_TIMEOUT_ERROR);
-            self.regs.set(0x30, self.regs.get(0x30) | ERROR_INTERRUPT);
+        let reject_cmd8 = r.command == 8
+            && match self.options.initialization_fault {
+                InitializationFault::None => false,
+                InitializationFault::RejectCmd8 => true,
+                InitializationFault::RejectCmd8OnceAfter(count)
+                | InitializationFault::RejectStandbyCmd3AndCmd8OnceAfter(count) => {
+                    self.cmd8_responses == u64::from(count)
+                }
+            };
+        if r.command == 8
+            && matches!(
+                self.options.initialization_fault,
+                InitializationFault::RejectCmd8OnceAfter(_)
+                    | InitializationFault::RejectStandbyCmd3AndCmd8OnceAfter(_)
+            )
+        {
+            self.cmd8_responses = self.cmd8_responses.saturating_add(1);
+        }
+        let reject_cmd3 = r.command == 3
+            && self.state == State::Standby
+            && matches!(
+                self.options.initialization_fault,
+                InitializationFault::RejectStandbyCmd3AndCmd8OnceAfter(_)
+            );
+        if reject_cmd8 || reject_cmd3 {
+            self.latch_error(COMMAND_TIMEOUT_ERROR);
             return self.signal(cx);
         }
         if let Phase::Programming { status } = r.phase {
@@ -917,11 +1077,7 @@ impl SdHost {
                 0
             };
             let status = 1 | busy_end;
-            return self.finish(
-                cx,
-                r,
-                status & if rom { self.regs.get(0x34) } else { u16::MAX },
-            );
+            return self.finish(cx, r, status);
         }
         if r.transfer != Transfer::Dma {
             // On an SDHC host the response precedes the first block: a PIO
@@ -940,7 +1096,7 @@ impl SdHost {
                         .ok_or("SD PIO deadline overflow")?,
                 );
                 self.request = Some(r);
-                self.regs.set(0x30, self.regs.get(0x30) | 1);
+                self.latch_normal(1);
                 return self.signal(cx);
             }
             if r.phase == Phase::Sector && r.transfer == Transfer::PioWrite {
@@ -952,23 +1108,29 @@ impl SdHost {
                 }
                 r.cursor += 512;
             }
-            self.regs.set(6, ((r.quantity - r.cursor) / 512) as u16);
+            let block = pio_block(&r);
+            self.regs.set(6, ((r.quantity - r.cursor) / block) as u16);
             if r.fault == Some(r.cursor) {
                 return self.data_error(cx, r);
             }
             if r.cursor == r.quantity {
                 return self.end_data(cx, r, 2);
             }
-            if r.transfer == Transfer::PioRead
-                && let Payload::Read(first) = r.payload
-            {
+            if r.transfer == Transfer::PioRead {
                 let mut bytes = [0; 512];
-                read_media(
-                    &self.card,
-                    &mut self.reads,
-                    first as u64 * 512 + r.cursor as u64,
-                    &mut bytes,
-                )?;
+                match r.payload {
+                    Payload::Read(first) => read_media(
+                        &self.card,
+                        &mut self.reads,
+                        first as u64 * 512 + r.cursor as u64,
+                        &mut bytes,
+                    )?,
+                    // The CMD6 status block through the data port.
+                    Payload::Metadata { bytes: status, len } => {
+                        bytes[..len].copy_from_slice(&status[..len])
+                    }
+                    _ => {}
+                }
                 self.fifo.restore(&bytes, 0)?;
             }
             if rom {
@@ -984,7 +1146,7 @@ impl SdHost {
             r.phase = Phase::Ready;
             self.fifo.rewind();
             self.request = Some(r);
-            self.regs.set(0x30, self.regs.get(0x30) | status);
+            self.latch_normal(status);
             return self.signal(cx);
         }
         if r.fault == Some(r.cursor) {
@@ -997,7 +1159,7 @@ impl SdHost {
             .ok_or("SDMA address overflow")?;
         let end = r.fault.filter(|f| *f > r.cursor).unwrap_or(r.quantity);
         let length = (end - r.cursor).min(boundary - address as usize % boundary);
-        let physical = self.physical(address, length, rom || r.command == 17)?;
+        let physical = self.physical(r.address_high, address, length, rom || r.command == 17)?;
         match r.payload {
             Payload::Write(first) => {
                 cx.ram_read(physical, &mut self.scratch[..length])?;
@@ -1032,10 +1194,10 @@ impl SdHost {
         if r.cursor < r.quantity {
             r.phase = Phase::Boundary;
             self.request = Some(r);
-            self.regs.set(0x30, self.regs.get(0x30) | 9);
+            self.latch_normal(9);
             self.signal(cx)
         } else {
-            self.end_data(cx, r, 3 & if rom { self.regs.get(0x34) } else { u16::MAX })
+            self.end_data(cx, r, 3)
         }
     }
     /// End a data transfer with `status`; a write first waits out the card's
@@ -1080,9 +1242,10 @@ impl SdHost {
         } else {
             self.fifo.read().ok_or("SD PIO FIFO is empty")?
         };
-        if self.fifo.position() == 512 {
+        let block = pio_block(r);
+        if self.fifo.position() == block {
             if !is_write {
-                r.cursor += 512;
+                r.cursor += block;
             }
             r.phase = Phase::Sector;
             r.due = Some(
@@ -1106,6 +1269,9 @@ impl SdHost {
         let offset = address.wrapping_sub(self.options.base) as usize;
         if let Some(index) = self.retained_index(offset, size) {
             return u64::from(self.retained[index]);
+        }
+        if let Some(index) = self.vendor_index(offset, size) {
+            return u64::from(self.vendor[index]);
         }
         if !self.valid(offset, size) {
             cx.unmodeled();
@@ -1168,6 +1334,19 @@ impl SdHost {
                 .is_some_and(|r| r.phase == Phase::Ready && r.transfer == Transfer::PioRead)
         };
         self.fifo.publish(ready);
+    }
+    /// A built-in vendor word that no declared retained register overlaps.
+    fn vendor_index(&self, offset: usize, size: u8) -> Option<usize> {
+        let declared = self.options.retained_registers.iter().any(|r| {
+            let start = usize::from(r.offset);
+            start < offset + 4 && offset < start + usize::from(r.size)
+        });
+        (self.options.protocol == Protocol::Sdhc
+            && size == 4
+            && (0x108..=0x124).contains(&offset)
+            && offset % 4 == 0
+            && !declared)
+            .then(|| (offset - 0x108) / 4)
     }
     fn valid(&self, offset: usize, size: u8) -> bool {
         Self::modeled(&self.options, offset, size)
@@ -1251,15 +1430,18 @@ impl SdHost {
             return self.signal(cx);
         }
         if offset == 0x2e || offset == 0x2f {
-            if value & if offset == 0x2f { !1 } else { !0x70f } != 0 {
+            // Software Reset: bit 0 all, bit 1 CMD line, bit 2 DAT line
+            // (bits 8..10 of a halfword write at +0x2e). The X-Processor 4
+            // boot ROM resets single lines through the byte (0xfff02bd8).
+            if value & if offset == 0x2f { !7 } else { !0x70f } != 0 {
                 return Err("Unsupported SD reset/timeout bits".into());
             }
-            if value & if offset == 0x2f { 1 } else { 0x700 } != 0 {
+            if value & if offset == 0x2f { 7 } else { 0x700 } != 0 {
                 self.request = None;
                 self.rom_fifo_ready = false;
                 self.regs.set(0x30, 0);
                 self.regs.set(0x32, 0);
-                if rom || offset == 0x2f || value & 0x100 != 0 {
+                if rom || value & if offset == 0x2f { 1 } else { 0x100 } != 0 {
                     self.regs = Registers::new();
                     self.response = [0; 16];
                     self.clocks.write(cx, self.options.base + 0x2c, 2, 0);
@@ -1281,8 +1463,9 @@ impl SdHost {
                 },
             );
         }
-        if offset == 0 && self.request.is_some() {
-            let r = self.request.as_mut().unwrap();
+        if offset == 0
+            && let Some(r) = self.request.as_mut()
+        {
             if r.phase != Phase::Boundary
                 || self.regs.get(0x30) & 8 != 0
                 || value != self.regs.word(0)
@@ -1318,18 +1501,20 @@ impl SdHost {
             return Err(format!(
                 "SD configuration changed during CMD{} ({:?}, byte {} of {}): offset {offset:#x} size {size} value {value:#x}",
                 r.command, r.phase, r.cursor, r.quantity
-            )
-            .into());
+            ));
         }
         // Power-control bits 12-15 select SDHCI 4 VDD2, used only by UHS-II
         // cards; GFX 50R 0xcac8e4 sets them. They are stored with no effect.
         if offset == 0x28 && !rom && value & !0xffff != 0
             || offset == 4 && value & 0x8000 != 0
-            // Host-control-2 bit 8 (UHS-II interface enable), bit 12 (Host
-            // Version 4 Enable), mode 7 and driver-strength bits 4-5 are
-            // retained without changing card signaling. Other UHS modes and
-            // tuning still refuse.
-            || offset == 0x3e && value & !0x1137 != 0
+            // Host-control-2 bit 8 (UHS-II interface enable) and UHS mode 7
+            // (UHS-II) are SDHCI 4 UHS-II selections; GFX 50R 0xcac788 probes
+            // them. A default-speed card has no UHS-II lanes, so they select
+            // nothing; other UHS modes and tuning still refuse.
+            // Bit 12 (Host Version 4 Enable, the X-T5 slot driver writes 0x1100)
+            // and bits 4-5 (driver strength select, 0x30 after CMD6) are stored
+            // with no effect: they select nothing on the modeled lanes.
+            || offset == 0x3e && value & !0x1130 != 0 && value & !0x1137 != 0
             || offset == 0x3e && value & 7 != 0 && value & 7 != 7
             || offset == 0x100 && value & !7 != 0
             || offset == 0x104 && value != 0
@@ -1358,6 +1543,12 @@ struct Snapshot {
     reads: StorageReads,
     contacts: u8,
     initialization_fault: InitializationFault,
+    #[serde(default)]
+    cmd8_responses: u64,
+    #[serde(default, skip_serializing_if = "vendor_clear")]
+    vendor: [u32; 8],
+    #[serde(default, skip_serializing_if = "is_zero")]
+    address_high: u32,
     capabilities_1: Option<u32>,
     #[serde(default)]
     rom_initialized: bool,
@@ -1401,6 +1592,11 @@ impl Device for SdHost {
             reads: &'a StorageReads,
             contacts: u8,
             initialization_fault: InitializationFault,
+            cmd8_responses: u64,
+            #[serde(skip_serializing_if = "vendor_clear")]
+            vendor: [u32; 8],
+            #[serde(skip_serializing_if = "is_zero")]
+            address_high: u32,
             capabilities_1: Option<u32>,
             rom_initialized: bool,
             supply_seen: SupplyEpoch,
@@ -1431,6 +1627,9 @@ impl Device for SdHost {
                 reads: &self.reads,
                 contacts: self.contacts.checkpoint_level(),
                 initialization_fault: self.options.initialization_fault,
+                cmd8_responses: self.cmd8_responses,
+                vendor: self.vendor,
+                address_high: self.address_high,
                 capabilities_1: self.options.capabilities_1,
                 rom_initialized: self.rom_initialized,
                 supply_seen: self.supply_seen,
@@ -1482,6 +1681,9 @@ impl Device for SdHost {
         let s: Snapshot = saved.decode(self.name())?;
         self.fifo.restore(&s.fifo, s.fifo_position)?;
         self.card = s.card;
+        self.cmd8_responses = s.cmd8_responses;
+        self.vendor = s.vendor;
+        self.address_high = s.address_high;
         self.rom_initialized = s.rom_initialized;
         self.supply_seen = s.supply_seen;
         self.reads = s.reads;
@@ -1511,17 +1713,22 @@ impl Device for SdHost {
                 Payload::None => serde_json::json!({"kind":"none"}),
                 Payload::Read(lba) => serde_json::json!({"kind":"read","lba":lba}),
                 Payload::Write(lba) => serde_json::json!({"kind":"write","lba":lba}),
-                Payload::Metadata { bytes, len } => serde_json::json!({"kind":"metadata","bytes":fujimod_emulator_devices::fingerprint::bytes(&bytes),"len":len}),
+                Payload::Metadata { bytes, len } => serde_json::json!({"kind":"metadata","bytes":fujimod_emulator_devices::state::bytes(&bytes),"len":len}),
             };
-            serde_json::json!({"state":r.state,"app":r.app,"block_length":r.block_length,"bus_width":r.bus_width,"response":r.response,
+            let mut value = serde_json::json!({"state":r.state,"app":r.app,"block_length":r.block_length,"bus_width":r.bus_width,"response":r.response,
                 "payload":payload,"transfer":r.transfer,"quantity":r.quantity,"cursor":r.cursor,"address":r.address,"phase":r.phase,
-                "due":r.due,"command":r.command,"fault":r.fault})
+                "due":r.due,"command":r.command,"fault":r.fault});
+            if r.address_high != 0 {
+                value["address_high"] = r.address_high.into();
+            }
+            value
         });
-        let mut value = serde_json::json!({"reads":self.reads,"card":self.card.fingerprint(),"contacts":[self.contacts.present(),self.contacts.protected()],"registers":self.regs.0.as_slice(),
+        let mut value = serde_json::json!({"reads":self.reads,"card":self.card.state(),"contacts":[self.contacts.present(),self.contacts.protected()],"registers":self.regs.0.as_slice(),
             "clocks":self.clocks.save(),"state":self.state,"app":self.app,"block_length":self.block_length,"bus_width":self.bus_width,
-            "response":self.response,"request":request,"fifo":fujimod_emulator_devices::fingerprint::bytes(&fifo),"scratch":fujimod_emulator_devices::fingerprint::bytes(&self.scratch),
+            "response":self.response,"request":request,"fifo":fujimod_emulator_devices::state::bytes(&fifo),"scratch":fujimod_emulator_devices::state::bytes(&self.scratch),
             "fifo_position":fifo_position,"rom_fifo_ready":self.rom_fifo_ready,
-            "initialization_fault":self.options.initialization_fault,"capabilities_1":self.options.capabilities_1,"faults":self.faults,"fault_history":self.fault_history});
+            "initialization_fault":self.options.initialization_fault,"cmd8_responses":self.cmd8_responses,
+            "capabilities_1":self.options.capabilities_1,"faults":self.faults,"fault_history":self.fault_history});
         if self.options.initialized_by_boot_rom {
             value["rom_initialized"] = self.rom_initialized.into();
             value["supply_seen"] = self.supply_seen.rising_edges.into();
@@ -1529,12 +1736,23 @@ impl Device for SdHost {
         if self.access_mode != 0 {
             value["access_mode"] = self.access_mode.into();
         }
+        if self.address_high != 0 {
+            value["address_high"] = self.address_high.into();
+        }
         Ok(value)
     }
     fn name(&self) -> &'static str {
         "sdhci-memory-card"
     }
     fn read(&mut self, cx: &mut Cx<'_>, address: u64, size: u8) -> u64 {
+        if self.options.address_high == Some(address) {
+            // The driver only writes the word; a read has no observed value.
+            cx.unmodeled();
+            return 0;
+        }
+        if !self.registers_enabled() {
+            return 0;
+        }
         self.fifo.publish(false);
         let value = self.read_register(cx, address, size);
         if cx.refusal().is_none() {
@@ -1545,6 +1763,18 @@ impl Device for SdHost {
         value
     }
     fn write(&mut self, cx: &mut Cx<'_>, address: u64, size: u8, value: u64) {
+        if self.options.address_high == Some(address) {
+            // 0x13a8ea0 stores (buffer >> 32) & 7 (ubfx #32, #3 at 0x13a1f3c and 0x13a37c8).
+            if size != 4 || value > 7 {
+                cx.unmodeled();
+            } else {
+                self.address_high = value as u32;
+            }
+            return;
+        }
+        if !self.registers_enabled() {
+            return;
+        }
         self.fifo.publish(false);
         if address == self.options.base + 0x2c && matches!(size, 2 | 4) {
             if value > u32::MAX as u64
@@ -1558,10 +1788,11 @@ impl Device for SdHost {
                 cx.fail("SD clock changed during command");
             } else {
                 self.clocks.write(cx, address, 2, value & 0xffff);
-                if size == 4 && cx.refusal().is_none() {
-                    if let Err(e) = self.store(cx, 0x2e, 2, (value >> 16) as u32) {
-                        cx.fail(e);
-                    }
+                if size == 4
+                    && cx.refusal().is_none()
+                    && let Err(e) = self.store(cx, 0x2e, 2, (value >> 16) as u32)
+                {
+                    cx.fail(e);
                 }
             }
             if cx.refusal().is_none() {
@@ -1576,6 +1807,10 @@ impl Device for SdHost {
             } else {
                 self.retained[index] = value as u32;
             }
+            return;
+        }
+        if let Some(index) = self.vendor_index(offset, size) {
+            self.vendor[index] = value as u32;
             return;
         }
         if !self.valid(offset, size)
@@ -1633,11 +1868,15 @@ impl Device for SdHost {
             "request":self.request.as_ref().map(|r| serde_json::json!({"command":r.command,
                 "cursor":r.cursor,"quantity":r.quantity,"deadline":r.due})),
             "clocks":self.clocks.save(), "initialization_fault":self.options.initialization_fault,
+            "cmd8_responses":self.cmd8_responses,
             "capabilities_1":self.options.capabilities_1,
             "data_faults":self.faults, "fault_history":self.fault_history
         })
     }
     fn fast_reads(&self, window_base: u64, window_size: u64) -> Vec<FastReadWord> {
+        if self.register_gate.is_some() {
+            return Vec::new();
+        }
         let address = self.options.base + 0x20;
         let end = window_base.saturating_add(window_size);
         let mut reads = Vec::new();
@@ -1663,6 +1902,48 @@ impl Device for SdHost {
         address != self.options.base + 0x20
             && (self.valid(address.wrapping_sub(self.options.base) as usize, size)
                 || address == self.options.base + 0x2c && matches!(size, 2 | 4))
+    }
+}
+
+impl fujimod_emulator_devices::capability::CardSlot for SdHost {
+    fn card(&self) -> &fujimod_emulator_devices::parts::sd_card::Card {
+        SdHost::card(self)
+    }
+    fn busy(&self) -> bool {
+        SdHost::busy(self)
+    }
+    fn readable_card(
+        &self,
+        revision: Option<u64>,
+    ) -> std::result::Result<&fujimod_emulator_devices::parts::sd_card::Card, String> {
+        SdHost::readable_card(self, revision)
+    }
+    fn replace_card(
+        &mut self,
+        card: fujimod_emulator_devices::parts::sd_card::Card,
+    ) -> std::result::Result<fujimod_emulator_devices::parts::sd_card::Card, String> {
+        SdHost::replace_card(self, card)
+    }
+    fn retain_card(
+        &mut self,
+        card: fujimod_emulator_devices::parts::sd_card::Card,
+    ) -> std::result::Result<(), String> {
+        SdHost::retain_card(self, card)
+    }
+    fn initialize_revision(&mut self, revision: u64) -> std::result::Result<(), String> {
+        SdHost::initialize_revision(self, revision)
+    }
+    fn inject_data_fault(&mut self, fault: DataFault) -> std::result::Result<(), String> {
+        SdHost::inject_data_fault(self, fault)
+    }
+    fn clear_data_faults(&mut self) -> std::result::Result<(), String> {
+        SdHost::clear_data_faults(self)
+    }
+    fn data_faults(&self) -> &[DataFault] {
+        SdHost::data_faults(self)
+    }
+    fn fault_history(&self) -> &[DataFaultEvent] {
+        SdHost::fault_history(self)
     }
 }
 
@@ -1695,6 +1976,116 @@ mod tests {
         assert_eq!(read(&mut m, &mut h, 0x34, 4), 0);
         assert_eq!(read(&mut m, &mut h, 0x2c, 4), 0);
     }
+    #[test]
+    fn version_4_enable_and_driver_strength_are_stored_and_other_uhs_bits_refused() {
+        let mut m = host(Protocol::Sdhc);
+        let mut h = Ram::new(0x10000);
+        for value in [0x1100, 0x1130, 0x30] {
+            write(&mut m, &mut h, 0x3e, 2, value);
+            assert_eq!(read(&mut m, &mut h, 0x3e, 2), value);
+        }
+        for value in [0x1400, 0x40] {
+            let mut cx = h.cx();
+            m.write(&mut cx, BASE + 0x3e, 2, value);
+            assert!(cx.refusal().is_some(), "{value:#x}");
+        }
+    }
+    /// The slot's UHS-II port owns the lines while its interface enable is set:
+    /// a command on this host then refuses, and runs again once the bit clears.
+    #[test]
+    fn command_refuses_while_the_slots_uhs2_interface_is_enabled() {
+        let mut m = host(Protocol::Sdhc);
+        let mut h = Ram::new(0x10000);
+        setup(&mut m, &mut h);
+        m.contacts.select_uhs2_interface(true);
+        write(&mut m, &mut h, 8, 4, 0);
+        let mut cx = h.cx();
+        m.write(&mut cx, BASE + 12, 4, 0);
+        assert!(cx.refusal().is_some_and(|r| r.contains("UHS-II interface")));
+        m.contacts.select_uhs2_interface(false);
+        command(&mut m, &mut h, 0, 0);
+        due(&mut m, &mut h);
+        assert_eq!(read(&mut m, &mut h, 0x30, 2) & 1, 1);
+    }
+    /// With declared stock clock steps, a default-speed card accepts a command
+    /// at the default-speed divider or a slower one, and no faster clock.
+    #[test]
+    fn command_refuses_a_clock_faster_than_the_declared_stock_step() {
+        let mut m = host(Protocol::Sdhc);
+        m.options.speed_dividers = Some(SpeedDividers { interface: 2, default_speed: 4, high_speed: 2 });
+        let mut h = Ram::new(0x10000);
+        setup(&mut m, &mut h);
+        // Another interface clock configuration: no step is known, any divider runs.
+        command(&mut m, &mut h, 0, 0);
+        due(&mut m, &mut h);
+        m.contacts.select_interface_clock(2);
+        for (clock, accepted) in [(0x0005, false), (0x0105, false), (0x0205, false), (0x0405, true), (0xfa05, true)] {
+            // The card clock stops before its divider changes.
+            write(&mut m, &mut h, 0x2c, 2, 1);
+            write(&mut m, &mut h, 0x2c, 2, clock & !4);
+            write(&mut m, &mut h, 0x2c, 2, clock);
+            h.now += 2;
+            m.advance(&mut h.cx());
+            write(&mut m, &mut h, 0x30, 2, 0xffff);
+            write(&mut m, &mut h, 8, 4, 0);
+            let mut cx = h.cx();
+            m.write(&mut cx, BASE + 12, 4, 0);
+            let refusal = cx.refusal();
+            assert_eq!(refusal.is_none(), accepted, "clock {clock:#x}: {refusal:?}");
+            if accepted {
+                due(&mut m, &mut h);
+            } else {
+                assert!(refusal.unwrap().contains("clock divider"));
+            }
+        }
+    }
+    #[test]
+    fn status_enables_control_latching_and_reset_clears_enables() {
+        let mut m = host(Protocol::Sdhc);
+        let mut h = Ram::new(0x10000);
+        setup(&mut m, &mut h);
+        write(&mut m, &mut h, 0x34, 2, 2);
+        command(&mut m, &mut h, 0, 0);
+        due(&mut m, &mut h);
+        assert_eq!(read(&mut m, &mut h, 0x30, 2), 0);
+        write(&mut m, &mut h, 0x34, 2, 3);
+        command(&mut m, &mut h, 0, 0);
+        due(&mut m, &mut h);
+        assert_eq!(read(&mut m, &mut h, 0x30, 2) & 1, 1);
+        m.contacts.set(false, false);
+        write(&mut m, &mut h, 0x30, 2, 0xffff);
+        command(&mut m, &mut h, 0, 0);
+        assert_eq!(read(&mut m, &mut h, 0x32, 2), 0);
+        write(&mut m, &mut h, 0x36, 2, 1);
+        command(&mut m, &mut h, 0, 0);
+        assert_eq!(read(&mut m, &mut h, 0x32, 2), 1);
+        assert_eq!(read(&mut m, &mut h, 0x30, 2) & 0x8000, 0x8000);
+        write(&mut m, &mut h, 0x2f, 1, 1);
+        assert_eq!(read(&mut m, &mut h, 0x34, 2), 0);
+        assert_eq!(read(&mut m, &mut h, 0x36, 2), 0);
+    }
+    #[test]
+    fn a_word_aligned_base_inside_a_page_is_accepted() {
+        let mut m = host_at(Protocol::Sdhc, BASE + 0x200);
+        assert_eq!(m.options.base, BASE + 0x200);
+        let mut h = Ram::new(0x10000);
+        write(&mut m, &mut h, 0x23e, 2, 0x100);
+        assert_eq!(read(&mut m, &mut h, 0x23e, 2), 0x100);
+        let misaligned = Options {
+            base: BASE + 0x202,
+            ..m.options.clone()
+        };
+        let wiring = Wiring {
+            card: Card::new(sd_card::Options {
+                sectors: 0x800000,
+                max_dirty_sectors: 65536,
+            })
+            .unwrap(),
+            contacts: Contacts::new(true, false),
+            irq: InterruptLine::Shared(78),
+        };
+        assert!(SdHost::new(misaligned, wiring).is_err());
+    }
     fn host(protocol: Protocol) -> SdHost {
         host_at(protocol, BASE)
     }
@@ -1717,6 +2108,9 @@ mod tests {
                 initialization_fault: InitializationFault::None,
                 high_speed: false,
                 ram_banks: vec![],
+                dram_alias: true,
+                address_high: None,
+                speed_dividers: None,
                 capabilities_1,
                 initialized_by_boot_rom: false,
                 supply: None,
@@ -1734,66 +2128,6 @@ mod tests {
             },
         )
         .unwrap()
-    }
-    #[test]
-    fn host_control_2_works_at_word_aligned_base() {
-        use fujimod_emulator_devices::test_host::recording::RecordingHost;
-
-        let mut host = host_at(Protocol::Sdhc, 0xff9b2200);
-        let mut recording = RecordingHost::default();
-        let mut cx = Cx::new(&mut recording, 0, 0, 0);
-        host.write(&mut cx, 0xff9b223e, 2, 0x100);
-        assert_eq!(cx.refusal(), None);
-        assert_eq!(host.read(&mut cx, 0xff9b223e, 2), 0x100);
-
-        let options = Options {
-            base: 0xff9b2202,
-            protocol: Protocol::Sdhc,
-            transfer_ticks: 10,
-            clock_ticks: 2,
-            rca: 0x1234,
-            ram_bytes: 0x10000,
-            initialization_fault: InitializationFault::None,
-            high_speed: false,
-            ram_banks: vec![],
-            capabilities_1: None,
-            initialized_by_boot_rom: false,
-            supply: None,
-            write_busy_ticks: 0,
-            retained_registers: vec![],
-        };
-        let wiring = Wiring {
-            card: Card::new(sd_card::Options {
-                sectors: 0x800000,
-                max_dirty_sectors: 65536,
-            })
-            .unwrap(),
-            contacts: Contacts::new(true, false),
-            irq: InterruptLine::Shared(78),
-        };
-        assert!(SdHost::new(options, wiring).is_err());
-    }
-    #[test]
-    fn host_control_2_retains_driver_strength_and_permitted_interface_bits() {
-        use fujimod_emulator_devices::test_host::recording::RecordingHost;
-
-        let mut host = host(Protocol::Sdhc);
-        let mut recording = RecordingHost::default();
-        let mut cx = Cx::new(&mut recording, 0, 0, 0);
-        host.write(&mut cx, BASE + 0x3e, 2, 0x1100);
-        assert_eq!(cx.refusal(), None);
-        assert_eq!(host.read(&mut cx, BASE + 0x3e, 2), 0x1100);
-        host.write(&mut cx, BASE + 0x3e, 2, 0x1130);
-        assert_eq!(cx.refusal(), None);
-        assert_eq!(host.read(&mut cx, BASE + 0x3e, 2), 0x1130);
-        host.write(&mut cx, BASE + 0x3e, 2, 0x30);
-        assert_eq!(cx.refusal(), None);
-        assert_eq!(host.read(&mut cx, BASE + 0x3e, 2), 0x30);
-
-        let mut unsupported_host = RecordingHost::default();
-        let mut unsupported_cx = Cx::new(&mut unsupported_host, 0, 0, 0);
-        host.write(&mut unsupported_cx, BASE + 0x3e, 2, 0x40);
-        assert!(unsupported_cx.refusal().is_some());
     }
     fn retained(offset: u16, size: u8) -> RetainedRegister {
         RetainedRegister { offset, size }
@@ -1835,7 +2169,9 @@ mod tests {
         assert_eq!(copy.read(&mut cx, BASE + 0x124, 4), 0x200);
         assert!(host(Protocol::Sdhc).validate_checkpoint(&restored).is_err());
 
-        for (offset, size) in [(0x124, 2), (0x10c, 2), (0x128, 4)] {
+        // Undeclared widths and offsets refuse, as does a built-in vendor
+        // word under a declared register.
+        for (offset, size) in [(0x124, 2), (0x10c, 2), (0x128, 4), (0x108, 4)] {
             let mut refused = RecordingHost::default();
             let mut refused_cx = Cx::new(&mut refused, 0, 0, 0);
             sd.read(&mut refused_cx, BASE + offset, size);
@@ -1957,6 +2293,18 @@ mod tests {
         assert_eq!(acmd41_ocr(&mut plain, &mut h), 0xc0ff8000);
     }
     #[test]
+    fn an_identified_card_is_deselected_and_publishes_a_new_rca_in_standby() {
+        let mut m = host(Protocol::Sdhc);
+        m.state = State::Transfer;
+        assert_eq!(m.plan(0x07000000, 0).unwrap().state, State::Standby);
+        assert!(m.plan(0x07000000, 0x12340000).is_err());
+        m.state = State::Standby;
+        assert_eq!(m.plan(0x07000000, 0).unwrap().state, State::Standby);
+        assert_eq!(m.plan(0x031a0000, 0).unwrap().state, State::Standby);
+        m.state = State::Transfer;
+        assert!(m.plan(0x031a0000, 0).is_err());
+    }
+    #[test]
     fn ocr_inquiry_keeps_idle_until_a_supported_voltage_is_selected() {
         let mut m = host(Protocol::Sdhc);
         let mut h = Ram::new(0x10000);
@@ -2060,15 +2408,38 @@ mod tests {
         assert_eq!((bytes[16], mode), (1, 1));
     }
     #[test]
-    fn fingerprint_distinguishes_media_with_the_same_diagnostic_summary() {
+    fn switch_function_sdma_queries_and_selects_only_supported_high_speed() {
+        for high_speed in [false, true] {
+            let mut m = host(Protocol::Sdhc);
+            m.options.high_speed = high_speed;
+            let mut h = Ram::new(0x10000);
+            setup(&mut m, &mut h);
+            m.state = State::Transfer;
+            write(&mut m, &mut h, 4, 2, 64);
+            write(&mut m, &mut h, 6, 2, 1);
+            for argument in [1, 0x80fffff1] {
+                h.bytes[0x1000..0x1044].fill(0xcc);
+                write(&mut m, &mut h, 0, 4, 0x1000);
+                command(&mut m, &mut h, 0x063a0011, argument);
+                due(&mut m, &mut h);
+                assert_eq!(read(&mut m, &mut h, 0x30, 2) & 3, 3);
+                assert_eq!(h.bytes[0x100d] & 3, if high_speed { 3 } else { 1 });
+                assert_eq!(h.bytes[0x1010] & 15, if high_speed { 1 } else { 15 });
+                assert_eq!(&h.bytes[0x1040..0x1044], &[0xcc; 4]);
+                assert_eq!(m.access_mode, u8::from(high_speed && argument >> 31 != 0));
+            }
+        }
+    }
+    #[test]
+    fn state_distinguishes_media_with_the_same_diagnostic_summary() {
         let mut a = host(Protocol::Sdhc);
         let mut b = host(Protocol::Sdhc);
         a.card.write_bytes(512, &[1; 512]).unwrap();
         b.card.write_bytes(512, &[2; 512]).unwrap();
         assert_eq!(a.save(), b.save());
-        assert_ne!(a.fingerprint().unwrap(), b.fingerprint().unwrap());
-        let stable = a.fingerprint().unwrap();
-        assert_eq!(a.fingerprint().unwrap(), stable);
+        assert_ne!(a.checkpoint().unwrap(), b.checkpoint().unwrap());
+        let stable = a.checkpoint().unwrap();
+        assert_eq!(a.checkpoint().unwrap(), stable);
         let mut bytes = [0; 512];
         a.card.read_bytes(512, &mut bytes).unwrap();
         assert_eq!(bytes, [1; 512]);
@@ -2194,6 +2565,92 @@ mod tests {
         assert!(!m.busy());
     }
     #[test]
+    fn xp5_address_high_word_moves_sdma_into_a_high_dram_bank() {
+        // X-T5 4.31 movie recording: low SDMA address 0xd0ec6bc0 with address-high 1
+        // (0x13a8ea0 writes 0xff90e7d8 for slot 0 port 0) targets DRAM channel 3.
+        const HIGH: u64 = 0xff90e7d8;
+        let mut m = host(Protocol::Sdhc);
+        m.options.ram_bytes = 0xc0000000;
+        m.options.ram_banks = vec![(0x1c0000000, 0x40000000)];
+        m.options.dram_alias = false;
+        m.options.address_high = Some(HIGH);
+        // The test RAM folds addresses with & 0x3fffffff: 0x1d0ec6bc0 is byte 0x10ec6bc0.
+        let mut h = Ram::new(0x10ec6bc0 + 0x400);
+        setup(&mut m, &mut h);
+        m.state = State::Transfer;
+        m.card.write_bytes(0, &[0x5a; 512]).unwrap();
+        for (size, value) in [(4, 8), (2, 1)] {
+            let mut cx = h.cx();
+            m.write(&mut cx, HIGH, size, value);
+            assert!(cx.refusal().is_some());
+        }
+        let mut cx = h.cx();
+        assert_eq!(m.read(&mut cx, HIGH, 4), 0);
+        assert!(cx.refusal().is_some());
+        let mut cx = h.cx();
+        m.write(&mut cx, HIGH, 4, 1);
+        assert_eq!(cx.refusal(), None);
+        write(&mut m, &mut h, 0, 4, 0xd0ec6bc0);
+        write(&mut m, &mut h, 4, 2, 512);
+        write(&mut m, &mut h, 6, 2, 1);
+        command(&mut m, &mut h, 0x123a0037, 0);
+        let saved = m.checkpoint().unwrap();
+        assert_eq!(m.fingerprint().unwrap()["request"]["address_high"], 1);
+        // The request latched the high bits: a later word write does not move it.
+        let mut cx = h.cx();
+        m.write(&mut cx, HIGH, 4, 0);
+        assert_eq!(cx.refusal(), None);
+        due(&mut m, &mut h);
+        assert!(h.effects.contains(&Effect::Write(0x1d0ec6bc0, 512)));
+        assert_eq!(&h.bytes[0x10ec6bc0..0x10ec6dc0], &[0x5a; 512]);
+        // The exact checkpoint keeps the word and the latched request bits.
+        m.restore_checkpoint(&saved).unwrap();
+        assert_eq!(m.address_high, 1);
+        assert_eq!(m.request.as_ref().unwrap().address_high, 1);
+        // CMD25 reads the card data from the same high address.
+        let mut m = host(Protocol::Sdhc);
+        m.options.ram_bytes = 0xc0000000;
+        m.options.ram_banks = vec![(0x1c0000000, 0x40000000)];
+        m.options.dram_alias = false;
+        m.options.address_high = Some(HIGH);
+        let mut h = Ram::new(0x10ec6bc0 + 0x400);
+        setup(&mut m, &mut h);
+        m.state = State::Transfer;
+        h.bytes[0x10ec6bc0..0x10ec6dc0].fill(0xa5);
+        let mut cx = h.cx();
+        m.write(&mut cx, HIGH, 4, 1);
+        write(&mut m, &mut h, 0, 4, 0xd0ec6bc0);
+        write(&mut m, &mut h, 4, 2, 512);
+        write(&mut m, &mut h, 6, 2, 1);
+        command(&mut m, &mut h, 0x193a0027, 8);
+        due(&mut m, &mut h);
+        assert_eq!(m.card().sector(8).unwrap(), [0xa5; 512]);
+        // Without the high word the same low address is outside every bank.
+        let mut cx = h.cx();
+        m.write(&mut cx, HIGH, 4, 0);
+        write(&mut m, &mut h, 0x30, 2, 0xffff);
+        write(&mut m, &mut h, 0, 4, 0xd0ec6bc0);
+        write(&mut m, &mut h, 6, 2, 1);
+        write(&mut m, &mut h, 8, 2, 8);
+        write(&mut m, &mut h, 10, 2, 0);
+        let mut cx = h.cx();
+        m.write(&mut cx, BASE + 12, 4, 0x193a0027);
+        assert!(cx.refusal().unwrap().contains("address 0xd0ec6bc0"));
+    }
+    #[test]
+    fn xp5_dram_at_0x40000000_is_not_an_alias() {
+        let mut m = host(Protocol::Sdhc);
+        m.options.ram_bytes = 0xc0000000;
+        assert_eq!(m.physical(0, 0x40001000, 512, false).unwrap(), 0x1000);
+        m.options.dram_alias = false;
+        assert_eq!(m.physical(0, 0x40001000, 512, true).unwrap(), 0x40001000);
+        assert_eq!(m.physical(0, 0x40001000, 512, false).unwrap(), 0x40001000);
+        assert_eq!(m.physical(1, 0xd0ec6bc0, 512, false).unwrap_err(), "SD DMA exceeds aligned DRAM: address 0x1d0ec6bc0 (physical 0x1d0ec6bc0) length 0x200");
+        m.options.ram_banks = vec![(0x1c0000000, 0x40000000)];
+        assert_eq!(m.physical(1, 0xd0ec6bc0, 512, false).unwrap(), 0x1d0ec6bc0);
+        assert!(m.physical(1, 0xfffffe00, 0x400, false).is_err());
+    }
+    #[test]
     fn dma_boundary_requires_ack_resume_and_writes_before_irq() {
         let mut m = host(Protocol::Application);
         let mut h = Ram::new(0x10000);
@@ -2289,6 +2746,7 @@ mod tests {
         let mut m = host(Protocol::Application);
         let mut h = Ram::new(0x10000);
         setup(&mut m, &mut h);
+        write(&mut m, &mut h, 0x36, 2, 0xffff);
         m.state = State::Transfer;
         h.bytes[0x1000..0x1400].fill(0x77);
         m.inject_data_fault(DataFault {
@@ -2627,44 +3085,6 @@ mod tests {
     }
 }
 
-impl fujimod_emulator_devices::capability::CardSlot for SdHost {
-    fn card(&self) -> &fujimod_emulator_devices::parts::sd_card::Card {
-        SdHost::card(self)
-    }
-    fn busy(&self) -> bool {
-        SdHost::busy(self)
-    }
-    fn readable_card(
-        &self,
-        revision: Option<u64>,
-    ) -> std::result::Result<&fujimod_emulator_devices::parts::sd_card::Card, String> {
-        SdHost::readable_card(self, revision)
-    }
-    fn replace_card(
-        &mut self,
-        card: fujimod_emulator_devices::parts::sd_card::Card,
-    ) -> std::result::Result<fujimod_emulator_devices::parts::sd_card::Card, String> {
-        SdHost::replace_card(self, card)
-    }
-    fn retain_card(
-        &mut self,
-        card: fujimod_emulator_devices::parts::sd_card::Card,
-    ) -> std::result::Result<(), String> {
-        SdHost::retain_card(self, card)
-    }
-    fn initialize_revision(&mut self, revision: u64) -> std::result::Result<(), String> {
-        SdHost::initialize_revision(self, revision)
-    }
-    fn inject_data_fault(&mut self, fault: DataFault) -> std::result::Result<(), String> {
-        SdHost::inject_data_fault(self, fault)
-    }
-    fn clear_data_faults(&mut self) -> std::result::Result<(), String> {
-        SdHost::clear_data_faults(self)
-    }
-    fn data_faults(&self) -> &[DataFault] {
-        SdHost::data_faults(self)
-    }
-    fn fault_history(&self) -> &[DataFaultEvent] {
-        SdHost::fault_history(self)
-    }
+fn vendor_clear(vendor: &[u32; 8]) -> bool {
+    vendor.iter().all(|&word| word == 0)
 }

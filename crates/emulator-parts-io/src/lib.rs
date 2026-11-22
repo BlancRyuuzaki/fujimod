@@ -1,12 +1,17 @@
-//! Serial, SPI, USB endpoint, WiFi module and audio sink parts.
+//! Serial, SPI, I2C, USB endpoint and audio sink parts.
 pub mod audio_sink;
 pub mod bis_configuration;
 pub mod command_data_output;
+pub mod framed_command_peer;
+pub mod i2c;
 pub mod lsm6ds;
+pub mod lsm6ds_i2c;
 pub mod power_controller;
+pub mod rl78_programmer;
 pub mod serial;
 pub mod serial_calibration;
+pub mod serial_command_registers;
 pub mod spi;
 pub mod spi_registers;
+pub mod tmd2772;
 pub mod usb_endpoint;
-pub mod wifi_module;

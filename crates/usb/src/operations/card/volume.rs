@@ -105,6 +105,14 @@ impl<'a> Volume<'a> {
         }
     }
 
+    /// Time spent waiting for the camera to complete owned-helper operations.
+    pub fn helper_wait(&self) -> std::time::Duration {
+        match &self.backend {
+            Backend::Sdk(_) => std::time::Duration::ZERO,
+            Backend::Mailbox(s) => s.waited,
+        }
+    }
+
     fn host(&mut self) -> &mut Host<'a> {
         match &mut self.backend {
             Backend::Sdk(s) => &mut s.host,
@@ -118,7 +126,8 @@ impl<'a> Volume<'a> {
             self.usable,
             "Card volume fenced after an uncertain operation",
         )?;
-        let result = match &mut self.backend {
+
+        match &mut self.backend {
             Backend::Sdk(sdk) => {
                 let result = sdk.transfer(request).await;
                 if sdk.host.session.state() == SessionState::Ready && sdk.idle() {
@@ -147,8 +156,7 @@ impl<'a> Volume<'a> {
                 }
                 result
             }
-        };
-        result
+        }
     }
 
     /// Caller validates readable regions. Only read access is exposed; an

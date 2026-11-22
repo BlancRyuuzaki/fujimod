@@ -1,5 +1,6 @@
 //! Read-only NOR flash-storage aperture and sparse session NOR storage. Evidence and
 //! erased-tail behavior is an explicit storage assumption.
+use fujimod_emulator_devices::checkpoint::Checkpoint;
 use fujimod_emulator_devices::storage_reads::StorageReads;
 use fujimod_emulator_devices::{Cx, Device};
 use serde::{Deserialize, Serialize};
@@ -18,11 +19,38 @@ pub struct Session {
     pub program_mode: bool,
     #[serde(default)]
     pub controller_complete: bool,
+    /// Set by the controller when its latched read opcode/dummy setup is one the
+    /// part does not answer; the next aperture or DMA read through it fails.
+    #[serde(default)]
+    pub aperture_fault: Option<String>,
     pub reads: StorageReads,
+}
+impl Session {
+    fn validate(&self) -> Result<(), String> {
+        let pages = SIZE / PAGE as u64;
+        if self.pages.keys().any(|&index| index >= pages)
+            || self.pages.values().any(|page| page.len() != PAGE)
+        {
+            return Err("Invalid flash storage checkpoint pages".into());
+        }
+        self.reads.validate(SIZE)
+    }
+}
+#[derive(Serialize)]
+enum StoredRef<'a> {
+    Nor(&'a Session),
+    Nand(&'a crate::nand_storage::NandSession),
+}
+#[derive(Deserialize)]
+enum Stored {
+    Nor(Session),
+    Nand(crate::nand_storage::NandSession),
 }
 pub struct Storage {
     image: Vec<u8>,
     pub session: Session,
+    /// Overlay pages written (seed, program, erase) since the last `take_dirty_pages`.
+    dirty: std::collections::BTreeSet<u64>,
 }
 impl Storage {
     pub fn new(image: Vec<u8>) -> Result<Self, String> {
@@ -32,6 +60,7 @@ impl Storage {
         Ok(Self {
             image,
             session: Session::default(),
+            dirty: Default::default(),
         })
     }
     fn extent(offset: u64, n: usize) -> Result<(), String> {
@@ -70,7 +99,13 @@ impl Storage {
         self.session.reads.record(offset, n as u64, SIZE)?;
         Ok(bytes)
     }
+    /// Indices (4 KiB) of the pages changed since the previous call. A caller that keeps its own
+    /// copy of the linear image refreshes exactly these.
+    pub fn take_dirty_pages(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.dirty).into_iter().collect()
+    }
     fn page(&mut self, index: u64) -> &mut Vec<u8> {
+        self.dirty.insert(index);
         self.session.pages.entry(index).or_insert_with(|| {
             let start = index as usize * PAGE;
             (start..start + PAGE)
@@ -82,6 +117,15 @@ impl Storage {
     pub fn seed(&mut self, offset: u64, value: u8) -> Result<(), String> {
         Self::extent(offset, 1)?;
         self.page(offset / PAGE as u64)[offset as usize % PAGE] = value;
+        Ok(())
+    }
+    /// Declared data seed from a file: the bytes land as if every byte had been seeded. Used for
+    /// optional private inputs (a stored-settings record) that must stay out of the repository.
+    pub fn seed_bytes(&mut self, offset: u64, bytes: &[u8]) -> Result<(), String> {
+        Self::extent(offset, bytes.len())?;
+        for (address, &byte) in (offset..).zip(bytes) {
+            self.page(address / PAGE as u64)[address as usize % PAGE] = byte;
+        }
         Ok(())
     }
     pub fn program(&mut self, offset: u64, bytes: &[u8]) -> Result<(), String> {
@@ -117,14 +161,100 @@ impl Storage {
         Ok(())
     }
 }
-pub struct Aperture(pub Shared);
+/// Parse `XT5_FLASH_ERASED="OFFSET+SIZE,..."` (numbers decimal or `0x` hexadecimal) and erase
+/// those extents of the installed flash image before the board starts. A host input like
+/// `XT5_ADC`, kept outside the manifest: the image is otherwise the update's own payload, and
+/// the stock storage driver compares each sector with the new data and skips an equal one
+/// (X-T5 4.31 `0x138494c`), so an install of the installed version programs nothing. An erased
+/// extent is flash that an install has to program. Offsets and sizes are whole 4 KiB pages
+/// inside the image; an extent the start reads before the install must not be erased.
+pub fn erase_installed(image: &mut [u8], spec: &str) -> Result<(), String> {
+    fn number(text: &str) -> Option<usize> {
+        let text = text.trim();
+        match text.strip_prefix("0x") {
+            Some(hex) => usize::from_str_radix(hex, 16).ok(),
+            None => text.parse().ok(),
+        }
+    }
+    for item in spec.split(',').map(str::trim).filter(|item| !item.is_empty()) {
+        let (offset, size) = item
+            .split_once('+')
+            .and_then(|(offset, size)| Some((number(offset)?, number(size)?)))
+            .ok_or_else(|| format!("XT5_FLASH_ERASED needs OFFSET+SIZE[,...], not {item}"))?;
+        let end = offset
+            .checked_add(size)
+            .filter(|end| size != 0 && offset % PAGE == 0 && size % PAGE == 0 && *end <= image.len())
+            .ok_or_else(|| format!("XT5_FLASH_ERASED: {item} is not whole pages of the installed image"))?;
+        image[offset..end].fill(0xff);
+    }
+    Ok(())
+}
+/// The flash-storage medium behind the aperture, controller and DMA devices.
+/// Serial NOR keeps the sparse session overlay; serial NAND is die-backed
+/// (parts::nand) with the same linear evidence surface.
+#[derive(Clone)]
+pub enum Medium {
+    Nor(Shared),
+    Nand(crate::nand_storage::NandShared),
+}
+
+impl Medium {
+    pub(crate) fn read_device(&self, offset: u64, n: usize) -> Result<Vec<u8>, String> {
+        match self {
+            Medium::Nor(s) => {
+                let mut s = s.lock().unwrap();
+                if let Some(fault) = &s.session.aperture_fault {
+                    return Err(fault.clone());
+                }
+                s.read_device(offset, n)
+            }
+            Medium::Nand(s) => s.lock().unwrap().read_device(offset, n),
+        }
+    }
+    /// File-backed seed bytes (NOR overlay only).
+    pub fn seed_bytes(&self, offset: u64, bytes: &[u8]) -> Result<(), String> {
+        match self {
+            Medium::Nor(s) => s.lock().unwrap().seed_bytes(offset, bytes),
+            Medium::Nand(_) => Err("serial NAND storage takes no data seeds".into()),
+        }
+    }
+    /// Declared data seeds are a NOR-overlay concept; the NAND die takes none.
+    pub fn seed(&self, offset: u64, value: u8) -> Result<(), String> {
+        match self {
+            Medium::Nor(s) => s.lock().unwrap().seed(offset, value),
+            Medium::Nand(_) => Err("serial NAND storage takes no data seeds".into()),
+        }
+    }
+}
+
+/// Bus masters (general DMA) read the CPU aperture from the same backing as the aperture device,
+/// including the erased tail, and the read is recorded as guest evidence like a CPU read.
+impl fujimod_emulator_devices::dma::ReadSource for Medium {
+    fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), String> {
+        out.copy_from_slice(&self.read_device(offset, out.len())?);
+        Ok(())
+    }
+}
+
+impl Medium {
+    /// The CPU aperture `BASE..BASE + SIZE` as a read-only bus-master window.
+    pub fn read_window(&self) -> fujimod_emulator_devices::dma::ReadWindow {
+        fujimod_emulator_devices::dma::ReadWindow {
+            base: BASE,
+            size: SIZE,
+            source: Arc::new(self.clone()),
+        }
+    }
+}
+
+pub struct Aperture(pub Medium);
 impl Device for Aperture {
     fn name(&self) -> &'static str {
         "firmware-flash-storage"
     }
     fn read(&mut self, cx: &mut Cx<'_>, address: u64, n: u8) -> u64 {
         let o = address.wrapping_sub(BASE);
-        match self.0.lock().unwrap().read_device(o, n as usize) {
+        match self.0.read_device(o, n as usize) {
             Ok(b) => b
                 .iter()
                 .enumerate()
@@ -139,14 +269,91 @@ impl Device for Aperture {
         cx.fail("CPU write to read-only flash storage aperture");
     }
     fn save(&self) -> Value {
-        serde_json::to_value(&self.0.lock().unwrap().session).unwrap()
+        match &self.0 {
+            Medium::Nor(s) => serde_json::json!({
+                "medium": "nor",
+                "session": serde_json::to_value(&s.lock().unwrap().session).unwrap(),
+            }),
+            Medium::Nand(s) => serde_json::json!({
+                "medium": "nand",
+                "session": serde_json::to_value(&s.lock().unwrap().session).unwrap(),
+            }),
+        }
     }
     fn restore(&mut self, v: &Value) -> Result<(), String> {
-        let session: Session = serde_json::from_value(v.clone())
-            .map_err(|e| format!("invalid flash storage checkpoint: {e}"))?;
-        session.reads.validate(SIZE)?;
-        self.0.lock().unwrap().session = session;
+        let medium = v
+            .get("medium")
+            .and_then(Value::as_str)
+            .ok_or("flash storage checkpoint without a medium tag")?;
+        let session = v
+            .get("session")
+            .ok_or("flash storage checkpoint without a session")?;
+        match (medium, &mut self.0) {
+            ("nor", Medium::Nor(s)) => {
+                let session: Session = serde_json::from_value(session.clone())
+                    .map_err(|e| format!("invalid flash storage checkpoint: {e}"))?;
+                session.validate()?;
+                s.lock().unwrap().session = session;
+                Ok(())
+            }
+            ("nand", Medium::Nand(s)) => {
+                let session: crate::nand_storage::NandSession =
+                    serde_json::from_value(session.clone())
+                        .map_err(|e| format!("invalid flash storage checkpoint: {e}"))?;
+                session.reads.validate(SIZE)?;
+                s.lock().unwrap().session = session;
+                Ok(())
+            }
+            _ => Err("flash storage checkpoint medium differs from the device".into()),
+        }
+    }
+    fn checkpoint(&self) -> Result<Checkpoint, String> {
+        match &self.0 {
+            Medium::Nor(s) => {
+                let s = s.lock().unwrap();
+                Checkpoint::encode(self.name(), &StoredRef::Nor(&s.session))
+            }
+            Medium::Nand(s) => {
+                let s = s.lock().unwrap();
+                Checkpoint::encode(self.name(), &StoredRef::Nand(&s.session))
+            }
+        }
+    }
+    fn validate_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), String> {
+        self.validate_stored(&checkpoint.decode::<Stored>(self.name())?)
+    }
+    fn restore_checkpoint(&mut self, checkpoint: &Checkpoint) -> Result<(), String> {
+        let stored: Stored = checkpoint.decode(self.name())?;
+        self.validate_stored(&stored)?;
+        match (&self.0, stored) {
+            (Medium::Nor(s), Stored::Nor(session)) => s.lock().unwrap().session = session,
+            (Medium::Nand(s), Stored::Nand(session)) => s.lock().unwrap().session = session,
+            _ => unreachable!("validated flash storage checkpoint medium changed"),
+        }
         Ok(())
+    }
+    fn fingerprint(&self) -> Result<Value, String> {
+        Ok(match &self.0 {
+            Medium::Nor(s) => {
+                let session = serde_json::to_value(&s.lock().unwrap().session)
+                    .map_err(|e| e.to_string())?;
+                serde_json::json!({"medium": "nor", "session": session})
+            }
+            Medium::Nand(s) => {
+                let session = serde_json::to_value(&s.lock().unwrap().session)
+                    .map_err(|e| e.to_string())?;
+                serde_json::json!({"medium": "nand", "session": session})
+            }
+        })
+    }
+}
+impl Aperture {
+    fn validate_stored(&self, stored: &Stored) -> Result<(), String> {
+        match (&self.0, stored) {
+            (Medium::Nor(_), Stored::Nor(session)) => session.validate(),
+            (Medium::Nand(_), Stored::Nand(session)) => session.reads.validate(SIZE),
+            _ => Err("flash storage checkpoint medium differs from the device".into()),
+        }
     }
 }
 #[cfg(test)]
@@ -156,7 +363,7 @@ mod tests {
     fn guest_reads_are_checkpointed_but_host_inspection_is_observational() {
         use fujimod_emulator_devices::test_host::recording::RecordingHost;
         let storage = Arc::new(Mutex::new(Storage::new(vec![0xa5; 16]).unwrap()));
-        let mut aperture = Aperture(storage.clone());
+        let mut aperture = Aperture(Medium::Nor(storage.clone()));
         let mut host = RecordingHost::default();
         assert_eq!(
             aperture.read(&mut Cx::new(&mut host, 0, 0, 0), BASE + 4, 4),
@@ -164,6 +371,7 @@ mod tests {
         );
         assert_eq!(storage.lock().unwrap().session.reads.ranges, [(4, 8)]);
         let saved = aperture.save();
+        assert_eq!(saved["medium"], "nor");
         for _ in 0..2 {
             storage.lock().unwrap().read(0, 16).unwrap();
             aperture.save();
@@ -175,10 +383,20 @@ mod tests {
         aperture.restore(&saved).unwrap();
         assert_eq!(aperture.save(), saved);
         let mut invalid = saved;
-        invalid["reads"]["ranges"] = serde_json::json!([[SIZE, SIZE + 1]]);
+        invalid["session"]["reads"]["ranges"] = serde_json::json!([[SIZE, SIZE + 1]]);
         assert!(aperture.restore(&invalid).is_err());
         assert!(storage.lock().unwrap().read_device(SIZE - 1, 2).is_err());
         assert_eq!(storage.lock().unwrap().session.reads.bytes, 4);
+    }
+    #[test]
+    fn seed_bytes_overlays_a_file_across_pages_without_touching_neighbours() {
+        let mut s = Storage::new(vec![0xa5; PAGE * 2]).unwrap();
+        let bytes: Vec<u8> = (0..16u8).collect();
+        s.seed_bytes(PAGE as u64 - 8, &bytes).unwrap();
+        assert_eq!(s.read(PAGE as u64 - 9, 18).unwrap()[0], 0xa5);
+        assert_eq!(s.read(PAGE as u64 - 8, 16).unwrap(), bytes);
+        assert_eq!(s.read(PAGE as u64 + 8, 1).unwrap(), [0xa5]);
+        assert!(s.seed_bytes(SIZE - 1, &[0, 1]).is_err());
     }
     #[test]
     fn nor_overlay_crosses_pages_and_restores_without_mutating_image() {
@@ -198,5 +416,63 @@ mod tests {
         assert_eq!(s.image[PAGE - 1], 0xa5);
         assert_eq!(s.read(SIZE - 1, 1).unwrap(), [0xff]);
         assert!(s.read(SIZE - 1, 2).is_err());
+    }
+
+    #[test]
+    fn erased_installed_extents_are_whole_pages_inside_the_image() {
+        let mut image = vec![0x5a; 4 * PAGE];
+        erase_installed(&mut image, "0x1000+0x1000, 12288+4096").unwrap();
+        assert!(image[..PAGE].iter().all(|byte| *byte == 0x5a));
+        assert!(image[PAGE..2 * PAGE].iter().all(|byte| *byte == 0xff));
+        assert!(image[2 * PAGE..3 * PAGE].iter().all(|byte| *byte == 0x5a));
+        assert!(image[3 * PAGE..].iter().all(|byte| *byte == 0xff));
+        erase_installed(&mut image, "").unwrap();
+        for bad in ["0x1000", "0x800+0x1000", "0+0x800", "0+0", "0x3000+0x2000", "x+0x1000"] {
+            let mut copy = vec![0x5a; 4 * PAGE];
+            assert!(erase_installed(&mut copy, bad).is_err(), "{bad}");
+            assert!(copy.iter().all(|byte| *byte == 0x5a), "{bad}");
+        }
+    }
+    #[test]
+    fn programmed_and_erased_pages_are_reported_once() {
+        let mut storage = Storage::new(vec![0; 3 * 4096]).unwrap();
+        assert!(storage.take_dirty_pages().is_empty());
+        storage.seed(5000, 1).unwrap();
+        storage.session.write_enable = true;
+        storage.erase(8192, 4096).unwrap();
+        assert_eq!(storage.take_dirty_pages(), vec![1, 2]);
+        assert!(storage.take_dirty_pages().is_empty());
+        assert_eq!(storage.read(5000, 1).unwrap(), vec![1]);
+    }
+    #[test]
+    fn bus_master_window_reads_the_aperture_bytes_and_erased_tail() {
+        let storage = Arc::new(Mutex::new(Storage::new(vec![0xa5; 16]).unwrap()));
+        let medium = Medium::Nor(storage.clone());
+        let window = medium.read_window();
+        assert_eq!((window.base, window.size), (BASE, SIZE));
+        let mut aperture = Aperture(medium);
+        let mut host = fujimod_emulator_devices::test_host::recording::RecordingHost::default();
+        let cpu = aperture.read(&mut Cx::new(&mut host, 0, 0, 0), BASE + 12, 8);
+        let mut bytes = [0; 8];
+        window.source.read(12, &mut bytes).unwrap();
+        assert_eq!(u64::from_le_bytes(bytes), cpu);
+        assert_eq!(bytes, [0xa5, 0xa5, 0xa5, 0xa5, 0xff, 0xff, 0xff, 0xff]);
+        window.source.read(SIZE - 8, &mut bytes).unwrap();
+        assert_eq!(bytes, [0xff; 8]);
+        assert!(window.source.read(SIZE - 4, &mut bytes).is_err());
+        // DMA reads are guest evidence, as CPU aperture reads are.
+        assert_eq!(storage.lock().unwrap().session.reads.bytes, 24);
+    }
+    #[test]
+    fn session_checkpoint_round_trips_overlay_and_reads() {
+        let storage = Arc::new(Mutex::new(Storage::new(vec![0xa5; 16]).unwrap()));
+        let mut aperture = Aperture(Medium::Nor(storage.clone()));
+        storage.lock().unwrap().read_device(4, 4).unwrap();
+        let saved = aperture.save();
+        let checkpoint = aperture.checkpoint().unwrap();
+        aperture.validate_checkpoint(&checkpoint).unwrap();
+        storage.lock().unwrap().session.write_enable = true;
+        aperture.restore_checkpoint(&checkpoint).unwrap();
+        assert_eq!(aperture.save(), saved);
     }
 }

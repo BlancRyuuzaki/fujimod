@@ -40,8 +40,12 @@
 //! and waits for bit 0 through 0x1560de8). Idle bits may share the status
 //! word when they do not overlap the status bit (0xfffc4000: +0x3c bit 20
 //! idle, bit 0 done; 0xfffc3000: +0xdc 0x01000100 idle, bit 0 done, which
-//! its handler 0xcce510 clears through 0xc6d580). What a job computes is not
-//! modeled.
+//! its handler 0xcce510 clears through 0xc6d580). A job with neither a status
+//! nor a stop bit is a pulse job: when it finishes, its start bit reads clear
+//! again and its edge line pulses once, with nothing to acknowledge (XP4
+//! X-T3 5.11 0xfffa8000: 0x1091630 sets +0x04 bit 0 and returns, GIC 144's
+//! handler 0x1090e24 reads no register; 0x1091150 instead polls bit 0 back
+//! to 0). What a job computes is not modeled.
 //!
 //! A block may declare [`Command`]s: writing exactly a command's value to its
 //! word sets the declared field of a status word, which otherwise reads back
@@ -49,6 +53,17 @@
 //! 0xfff0f000 through 0xc6c64c (+0xb8 = 0x6a020202, then waits for +0xbc bits
 //! 5..0 = 0x27) and back through 0xc6c700 (0x01020202, waits for 0x20); these
 //! are its only +0xb8 commands. What the states mean is not known.
+//! A command may name its own word as the status word: the field takes its
+//! state right after the write, a busy or request bit whose work completes
+//! at once. On the X-T3 5.11, the boot setup writes 1 to 0xff505384 and waits
+//! for it to read 0; the block 0xfff78000 is enabled by writing 1 to +0x1c
+//! and reading it back until 0; the power-off path writes 0 to bit 0 of
+//! 0xfff6c400 and waits for that bit to read set again.
+//!
+//! A block's base only has to be word-aligned, so a block can cover the rest
+//! of a page whose first words another model owns, as long as it stays inside
+//! that page: on the XP4 the sensor command window owns 0xfff6c000..0xfff6c244,
+//! and the block that holds 0xfff6c400 starts at 0xfff6c244.
 //!
 //! A job may declare [`Work`]: when it finishes, before its interrupt rises,
 //! the block develops or scales a still from the registers the firmware
@@ -56,9 +71,14 @@
 //! A block may publish its words for another block to read: the development
 //! engine reads the color unit 0xfff47000 this way when its film law is
 //! declared ([`crate::development::FILM_PROFILE`]).
+//!
+//! A job may declare a [`MovieOutput`]: when it finishes, the padded I420 frame
+//! its registers point at is converted to RGBA and published to one host
+//! scanout (the X-T20 2.11 playback display engine 0xfffd5000).
+use fujimod_emulator_devices::graphics::scanout::Frame;
 use fujimod_emulator_devices::{Cx, Device};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -66,6 +86,81 @@ use std::{
 
 /// Words a block publishes: its current register file.
 pub type Published = Arc<Mutex<BTreeMap<u64, u32>>>;
+
+/// A block's published words as a PL330 source. A DMA load reads the same
+/// words the block returns to the CPU, zero where nothing was written. The
+/// audio register window also accepts DMA stores; other windows stay
+/// read-only.
+pub struct SourceWindow {
+    base: u64,
+    size: u64,
+    words: Published,
+    writable: bool,
+}
+impl SourceWindow {
+    pub fn new(base: u64, size: u64, words: Published) -> Result<Self, String> {
+        Self::with_writable(base, size, words, false)
+    }
+    pub fn new_writable(base: u64, size: u64, words: Published) -> Result<Self, String> {
+        Self::with_writable(base, size, words, true)
+    }
+    fn with_writable(
+        base: u64,
+        size: u64,
+        words: Published,
+        writable: bool,
+    ) -> Result<Self, String> {
+        if base & 0xfff != 0 || size == 0 || size > 0x1000 {
+            return Err("Invalid X-Processor Pro block source window".into());
+        }
+        Ok(Self {
+            base,
+            size,
+            words,
+            writable,
+        })
+    }
+}
+impl fujimod_emulator_ip_arm::pl330::Source for SourceWindow {
+    fn contains(&self, address: u64, len: usize) -> bool {
+        address >= self.base
+            && address
+                .checked_add(len as u64)
+                .is_some_and(|end| end <= self.base + self.size)
+    }
+    fn read(&self, address: u64, len: usize) -> Result<Vec<u8>, String> {
+        let words = self
+            .words
+            .lock()
+            .map_err(|_| "Register block words poisoned")?;
+        let start = address - self.base;
+        Ok((start..start + len as u64)
+            .map(|offset| {
+                let word = words.get(&(offset & !3)).copied().unwrap_or(0);
+                (word >> (8 * (offset & 3))) as u8
+            })
+            .collect())
+    }
+    fn writable(&self) -> bool {
+        self.writable
+    }
+    fn write(&self, address: u64, bytes: &[u8]) -> Result<(), String> {
+        if !self.writable {
+            return Err("PL330 store into a read-only source".into());
+        }
+        let mut words = self
+            .words
+            .lock()
+            .map_err(|_| "Register block words poisoned")?;
+        for (index, byte) in bytes.iter().enumerate() {
+            let offset = address + index as u64 - self.base;
+            let word = words.entry(offset & !3).or_insert(0);
+            let shift = 8 * (offset & 3);
+            *word = (*word & !(0xffu32 << shift)) | ((*byte as u32) << shift);
+        }
+        Ok(())
+    }
+}
 
 /// Frame law of a block: (offset, mask) of the start and stopped bits, the
 /// interrupt line and the frame period in ticks.
@@ -87,6 +182,23 @@ pub struct Job {
     pub irq: u32,
     pub ticks: u64,
 }
+/// X-T20 2.11 movie display engine: a job that scans a padded I420 frame to a
+/// host output when it finishes. The frame planes are the luma and chroma
+/// bases; the programmed width and height are padded up to the engine's
+/// 16-line alignment.
+#[derive(Clone, Copy, Debug)]
+pub struct MovieOutput {
+    pub output: usize,
+}
+/// X-T20 2.11 playback display engine register window.
+pub const MOVIE_OUTPUT_BASE: u64 = 0xfffd_5000;
+/// Host output index of the movie display, separate from the panel OSD output.
+pub const MOVIE_OUTPUT: usize = 1;
+const MOVIE_LUMA: u64 = 0x008;
+const MOVIE_CHROMA: u64 = 0x00c;
+const MOVIE_WIDTH: u64 = 0x010;
+const MOVIE_PITCH: u64 = 0x014;
+const MOVIE_GEOMETRY: u64 = 0x018;
 /// Command law of a block: writing `value` to `word` sets the bits `mask` of
 /// the status word `status` to `state`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -105,12 +217,66 @@ pub enum Work {
     Develop { phase: (u8, u8) },
     /// The resizer.
     Resize,
+    /// The XP4 audio format converter: see [`AUDIO_CONTROL`].
+    Audio,
 }
+/// X-T3 5.11 audio format converter 0xfffa8000, as its driver programs it
+/// (0x1091220, 0x1091630):
+///
+/// - +0x08: bit 0 converts (clear, +0x04 loads the firmware table addressed
+///   by +0x0c/+0x10, 0x1091150); source sample format in bits 8..10 and
+///   destination format in bits 24..26 (0x111a4bc: 1 = 16-bit, 2 = 24-bit
+///   packed, 3 = 32-bit);
+/// - source at +0x18 (high bits +0x14), line bytes +0x1c, lines +0x20;
+///   destination at +0x28 (high bits +0x24), +0x2c, +0x30; +0x34 and +0x38
+///   repeat the source and destination line bytes in both halves;
+/// - movie playback, 720 stereo frames a job: 90 lines of 0x30 bytes
+///   (24-bit packed) become 90 lines of 0x40 bytes (32-bit) that DMA
+///   channel 7 sends to serial audio port 0. Recording goes the other way,
+///   from the 32-bit slots DMA channel 4 receives to 24-bit packed samples.
+///
+/// The declared stand-in converts each signed little-endian sample
+/// left-justified ([`convert_audio`]): 24 to 32 bits shifts left by 8, 32 to
+/// 24 keeps the top 24 bits. The firmware table (a microcode of 16-bit
+/// slots) is not decoded: the law is declared, not measured. Other
+/// geometries are left unconverted and counted.
+pub const AUDIO_CONTROL: u64 = 0x08;
+const AUDIO_SOURCE_HIGH: u64 = 0x14;
+const AUDIO_SOURCE: u64 = 0x18;
+const AUDIO_SOURCE_LINE: u64 = 0x1c;
+const AUDIO_SOURCE_LINES: u64 = 0x20;
+const AUDIO_DESTINATION_HIGH: u64 = 0x24;
+const AUDIO_DESTINATION: u64 = 0x28;
+const AUDIO_DESTINATION_LINE: u64 = 0x2c;
+const AUDIO_DESTINATION_LINES: u64 = 0x30;
+const AUDIO_SOURCE_PITCH: u64 = 0x34;
+const AUDIO_DESTINATION_PITCH: u64 = 0x38;
+/// Converts `source`, samples of `from` bytes, to samples of `to` bytes
+/// (2, 3 or 4, signed little-endian), left-justified: the sample's top bits
+/// stay its top bits, the low bits added are zero, the low bits dropped are
+/// truncated.
+pub fn convert_audio(source: &[u8], from: usize, to: usize) -> Vec<u8> {
+    source
+        .chunks_exact(from)
+        .flat_map(|sample| {
+            let mut slot = [0u8; 4];
+            slot[4 - from..].copy_from_slice(sample);
+            let mut out = [0u8; 4];
+            out[..to].copy_from_slice(&slot[4 - to..]);
+            out.into_iter().take(to)
+        })
+        .collect()
+}
+const DEVELOP_CONTROL: u64 = 0x04;
 const DEVELOP_SOURCE: u64 = 0x08;
 const DEVELOP_SOURCE_STRIDE: u64 = 0x0c;
 const DEVELOP_SIZE: u64 = 0x14;
+const DEVELOP_MODE: u64 = 0x18;
 const DEVELOP_DESTINATION: u64 = 0x1c;
 const DEVELOP_DESTINATION_STRIDE: u64 = 0x20;
+const DEVELOP_RAW_DESTINATION: u64 = 0x28;
+const DEVELOP_RAW_DESTINATION_STRIDE: u64 = 0x2c;
+const DEVELOP_RAW_OUTPUT: u32 = 0x010c_0c02;
 const RESIZE_INPUT: u64 = 0x08;
 const RESIZE_OUTPUT: u64 = 0x14;
 const RESIZE_STEP_X: u64 = 0x18;
@@ -154,6 +320,38 @@ fn whole(scene: fujimod_virtual_scene::Scene) -> fujimod_virtual_scene::Crop {
         height: scene.height,
     }
 }
+/// Tightly packed I420 (Y, Cb, Cr) to RGBA, BT.601 limited range, in the host
+/// scanout's red-first byte order.
+fn i420_to_rgba(width: usize, height: usize, y_plane: &[u8], uv: &[u8]) -> Result<Vec<u8>, String> {
+    let pixels = width
+        .checked_mul(height)
+        .ok_or("Movie frame size overflows")?;
+    let chroma = pixels / 4;
+    if width & 1 != 0 || height & 1 != 0 || y_plane.len() != pixels || uv.len() != chroma * 2 {
+        return Err("Invalid X-Processor Pro movie I420 frame".into());
+    }
+    let (cb, cr) = uv.split_at(chroma);
+    let cw = width / 2;
+    let clamp = |value: i32| value.clamp(0, 255) as u8;
+    let mut rgba = Vec::with_capacity(pixels * 4);
+    for row in 0..height {
+        let y_row = &y_plane[row * width..][..width];
+        let c_row = (row / 2) * cw;
+        for column in 0..width {
+            let y = i32::from(y_row[column]);
+            let u = i32::from(cb[c_row + column / 2]) - 128;
+            let v = i32::from(cr[c_row + column / 2]) - 128;
+            let c = 298 * (y - 16);
+            rgba.extend_from_slice(&[
+                clamp((c + 409 * v + 128) >> 8),
+                clamp((c - 100 * u - 208 * v + 128) >> 8),
+                clamp((c + 516 * u + 128) >> 8),
+                255,
+            ]);
+        }
+    }
+    Ok(rgba)
+}
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -167,6 +365,14 @@ struct State {
     status: u32,
     #[serde(default, skip_serializing_if = "is_zero")]
     jobs: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    movie_frames: u64,
+    /// Audio converter jobs converted, and conversion jobs left unconverted
+    /// (unmodeled format or geometry); table loads count in neither.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    audio_converted: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    audio_skipped: u64,
 }
 const BUFFER: u64 = 0xc0;
 const WIDTH: u64 = 0xc4;
@@ -184,6 +390,7 @@ pub struct Block {
     frames: Option<Frames>,
     job: Option<Job>,
     work: Option<Work>,
+    movie: Option<MovieOutput>,
     /// Lines and the Y0 Y1 Cb Cr pixel pair of a uniform live-view image.
     image: Option<(u32, Picture)>,
     /// (offset, value) of words that read a fixed value whatever is written.
@@ -197,6 +404,9 @@ pub struct Block {
     /// The still tone unit's words (matrix, curves and brightness table of the
     /// still law), for a development job.
     tone: Option<Published>,
+    /// The configured phase applies to the raster named by the sensor port.
+    /// Other source addresses carry the zero-phase X-Trans memory layout.
+    readout_port: Option<crate::imaging::ReadoutPort>,
     /// The published integration value and scene-light scale the film
     /// picture's light follows.
     film_exposure: Option<crate::statistics::Exposure>,
@@ -225,9 +435,9 @@ impl Block {
         frames: Option<Frames>,
     ) -> Result<Self, String> {
         let bit = |(o, mask): (u64, u32)| o & 3 != 0 || o >= size || mask == 0;
-        if base & 0xfff != 0
+        if base & 3 != 0
             || size == 0
-            || size > 0x1000
+            || (base & 0xfff) + size > 0x1000
             || size & 3 != 0
             || idle.iter().any(|&b| bit(b))
             || frames.is_some_and(|f| {
@@ -247,12 +457,14 @@ impl Block {
             frames,
             job: None,
             work: None,
+            movie: None,
             image: None,
             fixed: Vec::new(),
             commands: Vec::new(),
             published: None,
             color: None,
             tone: None,
+            readout_port: None,
             film_exposure: None,
             film_light: None,
             film_picture: None,
@@ -265,7 +477,7 @@ impl Block {
         let bit = |(o, mask): (u64, u32)| o & 3 != 0 || o >= self.size || mask == 0;
         if self.frames.is_some()
             || bit(job.start)
-            || job.status.is_some() == job.stop.is_some()
+            || job.status.is_some() && job.stop.is_some()
             || job.stop.is_some_and(bit)
             || job.status.is_some_and(|status| {
                 bit(status)
@@ -283,11 +495,20 @@ impl Block {
         self.job = Some(job);
         Ok(self)
     }
+    /// Scan the job's padded I420 frame to `output` when it finishes.
+    pub fn with_movie_output(mut self, output: usize) -> Result<Self, String> {
+        if self.job.is_none() || self.size <= MOVIE_GEOMETRY || output > 8 {
+            return Err("Invalid X-Processor Pro movie output".into());
+        }
+        self.movie = Some(MovieOutput { output });
+        Ok(self)
+    }
     /// Data the job moves when it finishes.
     pub fn with_work(mut self, work: Work) -> Result<Self, String> {
         let words = match work {
-            Work::Develop { phase } if phase.0 < 6 && phase.1 < 6 => DEVELOP_DESTINATION_STRIDE,
+            Work::Develop { phase } if phase.0 < 6 && phase.1 < 6 => DEVELOP_RAW_DESTINATION_STRIDE,
             Work::Resize => RESIZE_FORMAT,
+            Work::Audio => AUDIO_DESTINATION_PITCH,
             Work::Develop { .. } => return Err("Invalid X-Trans phase".into()),
         };
         if self.job.is_none() || words >= self.size {
@@ -300,6 +521,10 @@ impl Block {
     pub fn with_published(mut self, words: Published) -> Self {
         *words.lock().unwrap() = self.state.words.clone();
         self.published = Some(words);
+        self
+    }
+    pub(crate) fn with_readout_port(mut self, port: crate::imaging::ReadoutPort) -> Self {
+        self.readout_port = Some(port);
         self
     }
     /// Develop with the film law and white balance of the color unit's
@@ -326,18 +551,107 @@ impl Block {
             *words.lock().unwrap() = self.state.words.clone();
         }
     }
+    /// One audio converter job: None for a table load, Some(true) once
+    /// converted, Some(false) for an unmodeled format or geometry.
+    fn run_audio(&self, cx: &mut Cx<'_>) -> Result<Option<bool>, String> {
+        let word = |o| self.state.words.get(&o).copied().unwrap_or(0);
+        let control = word(AUDIO_CONTROL);
+        if control & 1 == 0 {
+            return Ok(None);
+        }
+        let width = |code: u32| match code {
+            1 => Some(2usize),
+            2 => Some(3),
+            3 => Some(4),
+            _ => None,
+        };
+        let (Some(from), Some(to)) = (width(control >> 8 & 7), width(control >> 24 & 7)) else {
+            return Ok(Some(false));
+        };
+        let line = |o| word(o) as usize;
+        let (source_line, lines) = (line(AUDIO_SOURCE_LINE), line(AUDIO_SOURCE_LINES));
+        let destination_line = line(AUDIO_DESTINATION_LINE);
+        let both = |o: u64, bytes: usize| {
+            let w = word(o) as usize;
+            w & 0x3ff == bytes && w >> 16 & 0x3ff == bytes
+        };
+        if source_line == 0
+            || lines == 0
+            || line(AUDIO_DESTINATION_LINES) != lines
+            || !source_line.is_multiple_of(from)
+            || !destination_line.is_multiple_of(to)
+            || source_line / from != destination_line / to
+            || !both(AUDIO_SOURCE_PITCH, source_line)
+            || !both(AUDIO_DESTINATION_PITCH, destination_line)
+        {
+            return Ok(Some(false));
+        }
+        let address = |low, high| u64::from(word(high) & 3) << 32 | u64::from(word(low));
+        let source = cx.ram_bytes(
+            address(AUDIO_SOURCE, AUDIO_SOURCE_HIGH),
+            source_line * lines,
+        )?;
+        cx.ram_write(
+            address(AUDIO_DESTINATION, AUDIO_DESTINATION_HIGH),
+            &convert_audio(&source, from, to),
+        )?;
+        Ok(Some(true))
+    }
+    /// Complete the in-place RAW sensor-correction pass. The secondary
+    /// port starts one stride and 128 samples before the input port. Both
+    /// refer to the sensor's U16 raster, which already contains the
+    /// declared sample levels. Preserve that raster's coordinates and CFA
+    /// phase when approximating the corrections as identity.
+    fn finish_raw_output(&self) -> Result<(), String> {
+        let word = |offset| self.state.words.get(&offset).copied().unwrap_or(0);
+        let (lines, width) = crate::development::size(word(DEVELOP_SIZE));
+        let row_bytes = 2 * width as u64;
+        let source_stride = u64::from(word(DEVELOP_SOURCE_STRIDE)) * 2;
+        let destination_stride = u64::from(word(DEVELOP_RAW_DESTINATION_STRIDE)) * 2;
+        let source = u64::from(word(DEVELOP_SOURCE));
+        let destination = u64::from(word(DEVELOP_RAW_DESTINATION));
+        let port_distance = source_stride + 256;
+        if destination == 0
+            || !destination.is_multiple_of(8)
+            || !source.is_multiple_of(8)
+            || source_stride < row_bytes
+            || source_stride > 0x6000
+            || width > 0x3001
+            || lines > 0x3001
+            || destination_stride != source_stride
+            || source.checked_sub(destination) != Some(port_distance)
+            || port_distance >= source_stride * (lines as u64 - 1) + row_bytes
+        {
+            return Err("Unmodeled still RAW output geometry".into());
+        }
+        Ok(())
+    }
+
     fn run_work(&self, cx: &mut Cx<'_>, work: Work) -> Result<(), String> {
         let word = |o| self.state.words.get(&o).copied().unwrap_or(0);
         let address = |o| u64::from(word(o));
         let stride = |o| word(o) as usize * 2;
         let (rows, destination, destination_stride) = match work {
+            Work::Audio => return Err("The audio converter converts through its own path".into()),
             Work::Develop { phase } => {
+                if word(DEVELOP_MODE) == DEVELOP_RAW_OUTPUT
+                    && word(DEVELOP_CONTROL) & 7 == 7
+                    && word(DEVELOP_DESTINATION) == 0
+                    && word(DEVELOP_DESTINATION_STRIDE) == 0
+                {
+                    return self.finish_raw_output();
+                }
                 let (lines, width) = crate::development::size(word(DEVELOP_SIZE));
+                let source = address(DEVELOP_SOURCE);
                 let source_stride = stride(DEVELOP_SOURCE_STRIDE);
-                let raw = cx.ram_bytes(
-                    address(DEVELOP_SOURCE),
-                    source_stride * (lines - 1) + 2 * width,
-                )?;
+                let raw = cx.ram_bytes(source, source_stride * (lines - 1) + 2 * width)?;
+                let phase = if self.readout_port.as_ref().is_some_and(|port| {
+                    !port.lock().unwrap().contains(source, source_stride as u64)
+                }) {
+                    (0, 0)
+                } else {
+                    phase
+                };
                 let phase = (usize::from(phase.0), usize::from(phase.1));
                 let film = match &self.color {
                     Some((words, reference)) => {
@@ -435,7 +749,8 @@ impl Block {
         self.fixed = fixed;
         Ok(self)
     }
-    /// Commands that set a field of a status word.
+    /// Commands that set a field of a status word, which may be the command's
+    /// own word.
     pub fn with_commands(mut self, commands: Vec<Command>) -> Result<Self, String> {
         let word = |o: u64| o & 3 != 0 || o >= self.size;
         let special = |o: u64| {
@@ -453,7 +768,6 @@ impl Block {
         if commands.iter().any(|c| {
             word(c.word)
                 || word(c.status)
-                || c.word == c.status
                 || c.mask == 0
                 || c.state & !c.mask != 0
                 || special(c.word)
@@ -743,18 +1057,21 @@ impl Block {
         let offset = address.checked_sub(self.base)?;
         (size == 4 && offset & 3 == 0 && offset < self.size).then_some(offset)
     }
-}
-impl Device for Block {
-    fn name(&self) -> &'static str {
-        "xpp-register-block"
+    /// Any 1/2/4-byte aligned offset within the block. Sub-word accesses reach
+    /// the same word storage as a four-byte access.
+    fn access_offset(&self, address: u64, size: u8) -> Option<u64> {
+        let offset = address.checked_sub(self.base)?;
+        let width = u64::from(size);
+        ((1..=4).contains(&size)
+            && offset % width == 0
+            && offset.checked_add(width)? <= self.size)
+            .then_some(offset)
     }
-    fn read(&mut self, cx: &mut Cx<'_>, address: u64, size: u8) -> u64 {
-        let Some(offset) = self.offset(address, size) else {
-            cx.unmodeled();
-            return 0;
-        };
+    /// The four-byte word at a four-byte-aligned offset, with its fixed, idle
+    /// and frame-stop bits applied.
+    fn read_word(&self, offset: u64) -> u32 {
         if let Some(&(_, value)) = self.fixed.iter().find(|(o, _)| *o == offset) {
-            return u64::from(value);
+            return value;
         }
         let mut idle = self
             .idle
@@ -762,7 +1079,7 @@ impl Device for Block {
             .filter(|(o, _)| *o == offset)
             .fold(0, |bits, (_, mask)| bits | mask);
         if let Some((_, mask)) = self.job.and_then(|j| j.status).filter(|s| s.0 == offset) {
-            return u64::from(self.state.status & mask | idle);
+            return self.state.status & mask | idle;
         }
         if let Some(frames) = self.frames.filter(|f| f.stopped.0 == offset) {
             idle = idle & !frames.stopped.1
@@ -772,11 +1089,84 @@ impl Device for Block {
                     frames.stopped.1
                 };
         }
-        u64::from(
-            self.state.words.get(&offset).copied().unwrap_or(0) & !self.stopped_mask(offset) | idle,
-        )
+        self.state.words.get(&offset).copied().unwrap_or(0) & !self.stopped_mask(offset) | idle
+    }
+    /// Publish the movie engine's padded I420 frame as one host scanout.
+    fn scan_movie(&mut self, cx: &mut Cx<'_>, movie: MovieOutput) -> Result<(), String> {
+        let word = |offset| self.state.words.get(&offset).copied().unwrap_or(0);
+        let width = u64::from(word(MOVIE_WIDTH));
+        let pitch = u64::from(word(MOVIE_PITCH));
+        let height = u64::from(word(MOVIE_GEOMETRY) >> 16);
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        if width > 0x2000 || height > 0x2000 || pitch != width {
+            return Err("Invalid X-Processor Pro movie geometry".into());
+        }
+        // The descriptor aligns the frame height up to the engine's 16-line
+        // block; the player buffer holds the padded planes.
+        let lines = (height + 0xf) & !0xf;
+        let pixels = width
+            .checked_mul(lines)
+            .ok_or("Movie frame size overflows")?;
+        let luma = u64::from(word(MOVIE_LUMA));
+        let chroma = u64::from(word(MOVIE_CHROMA));
+        let y = cx.ram_bytes(luma, pixels as usize)?;
+        let uv = cx.ram_bytes(chroma, (pixels / 2) as usize)?;
+        let rgba = i420_to_rgba(width as usize, lines as usize, &y, &uv)?;
+        self.state.movie_frames += 1;
+        let sequence = self.state.movie_frames;
+        cx.output_status(
+            movie.output,
+            json!({
+                "active": true, "format": "rgba8888-premultiplied",
+                "width": width, "height": lines, "sequence": sequence,
+                "source": format!("0x{luma:x}"), "chroma": format!("0x{chroma:x}"),
+                "capture": "movie-i420",
+            }),
+        )?;
+        cx.scanout(Frame {
+            output: movie.output,
+            sequence,
+            width: width as u32,
+            height: lines as u32,
+            rgba,
+        })
+    }
+}
+impl Device for Block {
+    fn name(&self) -> &'static str {
+        "xpp-register-block"
+    }
+    fn read(&mut self, cx: &mut Cx<'_>, address: u64, size: u8) -> u64 {
+        let Some(offset) = self.access_offset(address, size) else {
+            cx.unmodeled();
+            return 0;
+        };
+        if size == 4 {
+            return u64::from(self.read_word(offset));
+        }
+        let shift = (offset & 3) * 8;
+        let width = u32::from(size) * 8;
+        (u64::from(self.read_word(offset & !3)) >> shift) & ((1u64 << width) - 1)
     }
     fn write(&mut self, cx: &mut Cx<'_>, address: u64, size: u8, value: u64) {
+        if size != 4 {
+            let Some(offset) = self.access_offset(address, size) else {
+                return cx.unmodeled();
+            };
+            let base = offset & !3;
+            let shift = (offset & 3) * 8;
+            let width = u32::from(size) * 8;
+            let mask = ((1u32 << width) - 1) << shift;
+            let merged = (self.read_word(base) & !mask) | (((value as u32) << shift) & mask);
+            if merged == 0 {
+                self.state.words.remove(&base);
+            } else {
+                self.state.words.insert(base, merged);
+            }
+            return;
+        }
         if let (Some(job), Some(offset), Ok(value)) =
             (self.job, self.offset(address, size), u32::try_from(value))
         {
@@ -838,12 +1228,31 @@ impl Device for Block {
         if let Some(job) = self.job {
             if self.state.due.is_some_and(|at| at <= cx.now()) {
                 self.state.due = None;
-                if let Some(work) = self.work
+                if let Some(Work::Audio) = self.work {
+                    match self.run_audio(cx) {
+                        Ok(Some(true)) => self.state.audio_converted += 1,
+                        Ok(Some(false)) => self.state.audio_skipped += 1,
+                        Ok(None) => {}
+                        Err(e) => return cx.fail(e),
+                    }
+                } else if let Some(work) = self.work
                     && let Err(e) = self.run_work(cx, work)
                 {
                     return cx.fail(e);
                 }
+                if let Some(movie) = self.movie
+                    && let Err(e) = self.scan_movie(cx, movie)
+                {
+                    return cx.fail(e);
+                }
                 self.state.jobs += 1;
+                if job.status.is_none() && job.stop.is_none() {
+                    // Pulse job: the start bit clears, the edge line pulses.
+                    self.clear_start(job.start);
+                    cx.set_irq(job.irq, true);
+                    cx.set_irq(job.irq, false);
+                    return;
+                }
                 self.state.status |= job.status.map_or(1, |(_, mask)| mask);
                 cx.set_irq(job.irq, true);
             }
@@ -902,10 +1311,19 @@ impl Device for Block {
         Ok(())
     }
     fn fingerprint(&self) -> Result<Value, String> {
-        Ok(self.checkpoint()?.fingerprint())
+        Ok(self.checkpoint()?.state())
     }
 }
 impl Block {
+    fn clear_start(&mut self, (offset, mask): (u64, u32)) {
+        let word = self.state.words.get(&offset).copied().unwrap_or(0) & !mask;
+        if word == 0 {
+            self.state.words.remove(&offset);
+        } else {
+            self.state.words.insert(offset, word);
+        }
+        self.publish();
+    }
     fn check(&self, state: &State) -> Result<(), String> {
         let started = self.frames.is_some_and(|f| {
             let (offset, mask) = f.start;
@@ -918,6 +1336,7 @@ impl Block {
             || self.frames.is_some() && started != state.due.is_some()
             || self.frames.is_none() && self.job.is_none() && state.due.is_some()
             || self.job.is_none() && (state.status != 0 || state.jobs != 0)
+            || self.movie.is_none() && state.movie_frames != 0
             || self.job.is_some_and(|j| match j.status {
                 Some((offset, mask)) => {
                     state.status & !mask != 0 || state.words.contains_key(&offset)
@@ -941,6 +1360,92 @@ mod tests {
     use fujimod_emulator_devices::test_host::{TestHost, read, write};
 
     const BASE: u64 = 0xfff55000;
+
+    #[test]
+    fn i420_converts_black_and_gray_with_bt601_limited_range() {
+        // 2 x 2: black luma, neutral chroma.
+        let rgba = i420_to_rgba(2, 2, &[16, 16, 16, 16], &[128, 128]).unwrap();
+        assert_eq!(
+            rgba,
+            [0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255]
+        );
+        // Mid luma keeps the neutral chroma gray.
+        let rgba = i420_to_rgba(2, 2, &[128, 128, 128, 128], &[128, 128]).unwrap();
+        assert_eq!(rgba, [130, 130, 130, 255].repeat(4));
+        assert!(i420_to_rgba(3, 2, &[0; 6], &[128; 3]).is_err());
+    }
+
+    #[test]
+    fn a_movie_job_scans_its_padded_i420_frame_to_the_declared_output() {
+        use fujimod_emulator_devices::test_host::advance;
+        let mut unit = Block::new(MOVIE_OUTPUT_BASE, 0x1000, vec![(0, 0x8000_0000)], None)
+            .unwrap()
+            .with_job(Job {
+                start: (0, 1),
+                status: Some((0x64, 1)),
+                stop: None,
+                irq: 143,
+                ticks: 100,
+            })
+            .unwrap()
+            .with_fixed(vec![(0x60, 1)])
+            .unwrap()
+            .with_movie_output(MOVIE_OUTPUT)
+            .unwrap();
+        assert!(
+            Block::new(MOVIE_OUTPUT_BASE, 0x1000, vec![], None)
+                .unwrap()
+                .with_movie_output(MOVIE_OUTPUT)
+                .is_err()
+        );
+        let mut h = TestHost::new();
+        // 2 x 2 black frame padded to the engine's 16-line block.
+        h.ram[0x1000..0x1020].fill(16);
+        h.ram[0x2000..0x2010].fill(128);
+        write(&mut unit, &mut h, MOVIE_OUTPUT_BASE + MOVIE_LUMA, 0x1000);
+        write(&mut unit, &mut h, MOVIE_OUTPUT_BASE + MOVIE_CHROMA, 0x2000);
+        write(&mut unit, &mut h, MOVIE_OUTPUT_BASE + MOVIE_WIDTH, 2);
+        write(&mut unit, &mut h, MOVIE_OUTPUT_BASE + MOVIE_PITCH, 2);
+        write(
+            &mut unit,
+            &mut h,
+            MOVIE_OUTPUT_BASE + MOVIE_GEOMETRY,
+            (2 << 16) | 0x80,
+        );
+        write(&mut unit, &mut h, MOVIE_OUTPUT_BASE, 1);
+        advance(&mut unit, &mut h, 100);
+        assert_eq!(read(&mut unit, &mut h, MOVIE_OUTPUT_BASE + 0x64) & 1, 1);
+        assert_eq!(unit.state.movie_frames, 1);
+        assert_eq!(h.scanouts.len(), 1);
+        let frame = &h.scanouts[0];
+        assert_eq!(frame.output, MOVIE_OUTPUT);
+        assert_eq!((frame.width, frame.height), (2, 16));
+        assert_eq!(frame.rgba.len(), 2 * 16 * 4);
+        assert_eq!(&frame.rgba[..4], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn byte_accesses_merge_into_the_word() {
+        let mut unit = Block::new(BASE, 0x200, vec![], None).unwrap();
+        let mut h = TestHost::new();
+        // A byte store writes one lane and leaves the others; a byte read
+        // returns just that lane. 108d8e4 writes gate words this way.
+        {
+            let mut cx = h.cx();
+            unit.write(&mut cx, BASE + 0x18, 1, 0x5a);
+            assert_eq!(cx.refusal(), None);
+        }
+        assert_eq!(read(&mut unit, &mut h, BASE + 0x18), 0x5a);
+        {
+            let mut cx = h.cx();
+            unit.write(&mut cx, BASE + 0x19, 1, 0xa5);
+            assert_eq!(cx.refusal(), None);
+        }
+        assert_eq!(read(&mut unit, &mut h, BASE + 0x18), 0xa55a);
+        let mut cx = h.cx();
+        assert_eq!(unit.read(&mut cx, BASE + 0x19, 1), 0xa5);
+        assert_eq!(cx.refusal(), None);
+    }
 
     #[test]
     fn words_read_back_and_idle_bits_read_set() {
@@ -1231,7 +1736,7 @@ mod tests {
         // Until the firmware programs the color unit the declared pair is written.
         advance(&mut unit, &mut h, 10);
         assert_eq!(h.ram[0x1000..0x1004], [16, 16, 128, 128]);
-        let mut frame = |unit: &mut Block, h: &mut TestHost, now| {
+        let frame = |unit: &mut Block, h: &mut TestHost, now| {
             h.ram[0x1000..0x1100].fill(0);
             advance(unit, h, now);
             h.ram[0x1000..0x1004].to_vec()
@@ -1450,7 +1955,14 @@ mod tests {
             ticks: 10,
         };
         let block = || Block::new(0xfff98000, 0x1000, vec![(0, 1)], None).unwrap();
-        assert!(block().with_job(Job { stop: None, ..job }).is_err());
+        assert!(
+            block()
+                .with_job(Job {
+                    status: Some((8, 1)),
+                    ..job
+                })
+                .is_err()
+        );
         let mut engine = block().with_job(job).unwrap();
         write(&mut engine, &mut h, 0xfff98004, 1);
         assert_eq!(engine.next_deadline(10), Some(20));
@@ -1464,6 +1976,76 @@ mod tests {
         assert_eq!(read(&mut engine, &mut h, 0xfff98000), 1);
         engine.restore(&saved).unwrap();
         assert_eq!(engine.state.status, 1);
+        // The X-T20 catalog's start mask 5: the command in +0x04 bits 0..2 is 1
+        // or 7 for a still and 6 for develop-RAW's second job; 2 starts nothing.
+        let mut engine = block()
+            .with_job(Job {
+                start: (4, 5),
+                ..job
+            })
+            .unwrap();
+        write(&mut engine, &mut h, 0xfff98004, 0x2);
+        write(&mut engine, &mut h, 0xfff98004, 0x22_0000);
+        assert_eq!(engine.next_deadline(20), None);
+        write(&mut engine, &mut h, 0xfff98004, 0x22_0006);
+        assert_eq!(engine.next_deadline(20), Some(30));
+    }
+
+    #[test]
+    fn an_in_place_raw_output_job_preserves_the_sensor_mosaic() {
+        use fujimod_emulator_devices::test_host::advance;
+
+        const BASE: u64 = 0xfff98000;
+        let mut host = TestHost::new();
+        const STRIDE: u32 = 640;
+        const DESTINATION: u32 = 0x1000;
+        const SOURCE: u32 = DESTINATION + STRIDE + 256;
+        host.ram[0x1000..0x2000].fill(0x5a);
+        let mut engine = Block::new(BASE, 0x1000, vec![], None)
+            .unwrap()
+            .with_job(Job {
+                start: (DEVELOP_CONTROL, 5),
+                status: None,
+                stop: Some((0, 1)),
+                irq: 130,
+                ticks: 10,
+            })
+            .unwrap()
+            .with_work(Work::Develop { phase: (2, 2) })
+            .unwrap()
+            .with_color(Default::default(), [256; 3])
+            .unwrap();
+        for (register, value) in [
+            (DEVELOP_SOURCE, SOURCE),
+            (DEVELOP_SOURCE_STRIDE, STRIDE / 2),
+            (DEVELOP_SIZE, (5 << 16) | 303),
+            (DEVELOP_MODE, DEVELOP_RAW_OUTPUT),
+            (DEVELOP_RAW_DESTINATION, DESTINATION),
+            (DEVELOP_RAW_DESTINATION_STRIDE, STRIDE / 2),
+            (DEVELOP_CONTROL, 7),
+        ] {
+            write(&mut engine, &mut host, BASE + register, value);
+        }
+        advance(&mut engine, &mut host, 9);
+        assert_eq!(engine.state.jobs, 0);
+        advance(&mut engine, &mut host, 10);
+        assert!(host.ram[0x1000..0x2000].iter().all(|&byte| byte == 0x5a));
+        assert_eq!(engine.state.jobs, 1);
+        assert_eq!(engine.state.status, 1);
+
+        write(&mut engine, &mut host, BASE, 0);
+        write(
+            &mut engine,
+            &mut host,
+            BASE + DEVELOP_RAW_DESTINATION,
+            0x2000,
+        );
+        write(&mut engine, &mut host, BASE + DEVELOP_CONTROL, 7);
+        host.now = 20;
+        let mut cx = host.cx();
+        engine.advance(&mut cx);
+        assert_eq!(cx.refusal(), Some("Unmodeled still RAW output geometry"));
+        assert_eq!(engine.state.jobs, 1);
     }
 
     #[test]
@@ -1611,6 +2193,161 @@ mod tests {
     }
 
     #[test]
+    fn the_audio_window_reads_the_blocks_words_and_accepts_stores() {
+        use fujimod_emulator_ip_arm::pl330::Source;
+        let words = Published::default();
+        let mut block = Block::new(0xfff1b000, 0x1000, vec![], None)
+            .unwrap()
+            .with_published(words.clone());
+        let mut h = TestHost::new();
+        write(&mut block, &mut h, 0xfff1b020, 0x1122_3344);
+        let window = SourceWindow::new_writable(0xfff1b000, 0x100, words).unwrap();
+        assert!(window.contains(0xfff1b020, 4));
+        assert!(!window.contains(0xfff1afff, 2));
+        assert!(!window.contains(0xfff1b0ff, 2));
+        assert_eq!(
+            window.read(0xfff1b020, 4).unwrap(),
+            [0x44, 0x33, 0x22, 0x11]
+        );
+        // A word the CPU never wrote reads silent, so the movie channel's
+        // load from +0x20 succeeds before an audio codec exists.
+        assert_eq!(window.read(0xfff1b030, 4).unwrap(), [0; 4]);
+        assert!(window.writable());
+        window.write(0xfff1b020, &[0xaa, 0xbb, 0xcc, 0xdd]).unwrap();
+        assert_eq!(
+            window.read(0xfff1b020, 4).unwrap(),
+            [0xaa, 0xbb, 0xcc, 0xdd]
+        );
+        // The DMA store updates the published window. The audio block's
+        // private register state is not synchronized until a codec model
+        // exists; the movie path only needs the store to complete.
+    }
+
+    #[test]
+    fn a_pl330_load_from_the_audio_window_copies_its_words() {
+        use fujimod_emulator_ip_arm::pl330::{Pl330, Throughput};
+        let words = Published::default();
+        let mut block = Block::new(0xfff1b000, 0x1000, vec![], None)
+            .unwrap()
+            .with_published(words.clone());
+        let mut h = TestHost::new();
+        write(&mut block, &mut h, 0xfff1b020, 0x1122_3344);
+        let window = SourceWindow::new(0xfff1b000, 0x100, words).unwrap();
+        let mut dma = Pl330::new(
+            0xfff18000,
+            vec![207],
+            vec![Arc::new(window)],
+            Throughput {
+                setup_ticks: 1,
+                bytes_per_tick: 1,
+            },
+        )
+        .unwrap();
+        // DMAMOV SAR, 0xfff1b020; DAR, 0x1000; CCR 16-byte bursts;
+        // DMALDP 0; DMAST; DMAEND.
+        let program = [
+            0xbc, 0, 0x20, 0xb0, 0xf1, 0xff, 0xbc, 2, 0x00, 0x10, 0x00, 0x00, 0xbc, 1, 0x17, 0xc0,
+            0x05, 0x00, 0x25, 0x00, 0x08, 0x00,
+        ];
+        h.ram[0x100..0x100 + program.len()].copy_from_slice(&program);
+        write(&mut dma, &mut h, 0xfff18000 + 0xd0c, 0x100);
+        write(&mut dma, &mut h, 0xfff18000 + 0xd08, 0xa2_0000);
+        write(&mut dma, &mut h, 0xfff18000 + 0xd04, 0);
+        h.now = 17;
+        {
+            let mut cx = h.cx();
+            dma.event(&mut cx, 0);
+            assert_eq!(cx.refusal(), None);
+        }
+        assert_eq!(h.ram[0x1000..0x1004], 0x1122_3344_u32.to_le_bytes());
+        assert_eq!(h.ram[0x1004..0x1010], [0; 12]);
+    }
+
+    #[test]
+    fn a_command_may_name_its_own_word_as_its_status() {
+        // X-T3 5.11: 0xfff78000 is enabled by writing 1 to +0x1c and reading
+        // it back until bit 0 is clear; the power-off path writes 0 to bit 0
+        // of 0xfff6c400 and waits for it to read set.
+        let enable = Command {
+            word: 0x1c,
+            value: 1,
+            status: 0x1c,
+            mask: 1,
+            state: 0,
+        };
+        let mut block = Block::new(0xfff7_8000, 0x1000, vec![], None)
+            .unwrap()
+            .with_commands(vec![enable])
+            .unwrap();
+        let mut h = TestHost::new();
+        write(&mut block, &mut h, 0xfff7_801c, 1);
+        assert_eq!(read(&mut block, &mut h, 0xfff7_801c), 0);
+        // Only the declared value is a command; the other bits keep the write.
+        write(&mut block, &mut h, 0xfff7_801c, 3);
+        assert_eq!(read(&mut block, &mut h, 0xfff7_801c), 3);
+        let request = Command {
+            word: 0x1bc,
+            value: 0,
+            status: 0x1bc,
+            mask: 1,
+            state: 1,
+        };
+        let mut sensor = Block::new(0xfff6_c244, 0xdbc, vec![], None)
+            .unwrap()
+            .with_commands(vec![request])
+            .unwrap();
+        write(&mut sensor, &mut h, 0xfff6_c400, 0);
+        assert_eq!(read(&mut sensor, &mut h, 0xfff6_c400), 1);
+        let saved = sensor.save();
+        let mut other = Block::new(0xfff6_c244, 0xdbc, vec![], None)
+            .unwrap()
+            .with_commands(vec![request])
+            .unwrap();
+        other.restore(&saved).unwrap();
+        assert_eq!(read(&mut other, &mut h, 0xfff6_c400), 1);
+        // The state must still fit the field, and the word may not be special.
+        assert!(
+            Block::new(0xfff7_8000, 0x1000, vec![(0x1c, 2)], None)
+                .unwrap()
+                .with_commands(vec![enable])
+                .is_err()
+        );
+        assert!(
+            Block::new(0xfff7_8000, 0x1000, vec![], None)
+                .unwrap()
+                .with_commands(vec![Command { state: 2, ..enable }])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_word_aligned_block_covers_the_rest_of_its_page() {
+        // On the XP4 the sensor command window owns 0xfff6c000..0xfff6c244.
+        let mut rest = Block::new(0xfff6_c244, 0xdbc, vec![(0x100, 1)], None).unwrap();
+        assert_eq!(rest.window(), 0xdbc);
+        let mut h = TestHost::new();
+        write(&mut rest, &mut h, 0xfff6_c248, 0x1234);
+        assert_eq!(read(&mut rest, &mut h, 0xfff6_c248), 0x1234);
+        assert_eq!(read(&mut rest, &mut h, 0xfff6_c344), 1);
+        let mut cx = h.cx();
+        rest.read(&mut cx, 0xfff6_c240, 4);
+        assert!(cx.is_unmodeled());
+        // Word-aligned, inside one page.
+        for (base, size) in [
+            (0xfff6_c242, 0xdbc),
+            (0xfff6_c244, 0xdc0),
+            (0xfff6_cffc, 8),
+            (0xfff6_c244, 0),
+        ] {
+            assert!(
+                Block::new(base, size, vec![], None).is_err(),
+                "{base:#x}+{size:#x}"
+            );
+        }
+        assert!(Block::new(0xfff6_cffc, 4, vec![], None).is_ok());
+    }
+
+    #[test]
     fn fixed_words_read_their_value_whatever_is_written() {
         let block = || Block::new(0xfffc3000, 0x1000, vec![(0, 1)], None).unwrap();
         assert!(block().with_fixed(vec![(0, 1)]).is_err());
@@ -1620,5 +2357,162 @@ mod tests {
         assert_eq!(read(&mut engine, &mut h, 0xfffc30dc), 0x0100_0100);
         write(&mut engine, &mut h, 0xfffc30d8, 4);
         assert_eq!(read(&mut engine, &mut h, 0xfffc30d8), 4);
+    }
+
+    #[test]
+    fn a_pulse_job_clears_its_start_bit_and_pulses_its_edge_line() {
+        use fujimod_emulator_devices::test_host::advance;
+        // X-T3 5.11 0xfffa8000: +0x00 bit 0 idle; +0x04 bit 0 starts a job
+        // (0x1091630 returns at once, GIC 144; 0x1091150 polls bit 0 to 0).
+        const ENGINE: u64 = 0xfffa8000;
+        let job = Job {
+            start: (4, 1),
+            status: None,
+            stop: None,
+            irq: 144,
+            ticks: 10,
+        };
+        let mut engine = Block::new(ENGINE, 0x1000, vec![(0, 1)], None)
+            .unwrap()
+            .with_job(job)
+            .unwrap();
+        let mut h = TestHost::new();
+        write(&mut engine, &mut h, ENGINE + 0x10, 0x13eef80);
+        write(&mut engine, &mut h, ENGINE + 4, 1);
+        assert_eq!(read(&mut engine, &mut h, ENGINE + 4), 1);
+        advance(&mut engine, &mut h, 10);
+        assert_eq!(read(&mut engine, &mut h, ENGINE + 4), 0);
+        assert_eq!(read(&mut engine, &mut h, ENGINE + 0x10), 0x13eef80);
+        assert_eq!(read(&mut engine, &mut h, ENGINE), 1);
+        assert_eq!(engine.state.jobs, 1);
+        assert_eq!(engine.state.status, 0);
+        assert_eq!(engine.next_deadline(10), None);
+    }
+
+    #[test]
+    fn audio_converter_left_justifies_24_bit_playback_samples_into_32_bit_slots() {
+        use fujimod_emulator_devices::test_host::advance;
+        const A: u64 = 0xfffa8000;
+        let job = Job {
+            start: (4, 1),
+            status: None,
+            stop: None,
+            irq: 144,
+            ticks: 10,
+        };
+        let block = || {
+            Block::new(A, 0x1000, vec![(0, 1)], None)
+                .unwrap()
+                .with_job(job)
+                .unwrap()
+        };
+        assert!(
+            Block::new(A, 0x1000, vec![(0, 1)], None)
+                .unwrap()
+                .with_work(Work::Audio)
+                .is_err()
+        );
+        assert!(
+            Block::new(A, 0x38, vec![(0, 1)], None)
+                .unwrap()
+                .with_job(job)
+                .unwrap()
+                .with_work(Work::Audio)
+                .is_err()
+        );
+        let mut converter = block().with_work(Work::Audio).unwrap();
+        let mut plain = block();
+        let mut h = TestHost::new();
+        // Two lines of eight stereo frames, 24-bit packed: frame n has left
+        // n + 1 and right 0xa00000 + n (negative samples).
+        for n in 0..16u32 {
+            let at = 0x2000 + 6 * n as usize;
+            h.ram[at..at + 3].copy_from_slice(&(n + 1).to_le_bytes()[..3]);
+            h.ram[at + 3..at + 6].copy_from_slice(&(0xa0_0000 + n).to_le_bytes()[..3]);
+        }
+        let w = |e: &mut Block, h: &mut TestHost, o: u64, v: u32| write(e, h, A + o, v);
+        // 0x1091150: loading the firmware table converts nothing.
+        for (o, v) in [(0x0c, 0), (0x10, 0x013e_ef80), (0x08, 0), (0x04, 1)] {
+            w(&mut converter, &mut h, o, v);
+        }
+        advance(&mut converter, &mut h, 10);
+        assert!(h.ram[0x4000..0x4080].iter().all(|&b| b == 0));
+        // 0x1091220 then 0x1091630, the first job of a movie playback (two
+        // lines instead of 90).
+        let start = |e: &mut Block, h: &mut TestHost, lines: u32| {
+            for (o, v) in [
+                (0x08, 0x0300_0201),
+                (0x14, 0),
+                (0x18, 0x2000),
+                (0x1c, 0x30),
+                (0x20, lines),
+                (0x24, 0),
+                (0x28, 0x4000),
+                (0x2c, 0x40),
+                (0x30, 2),
+                (0x34, 0x0030_0030),
+                (0x38, 0x0040_0040),
+                (0x3c, 1),
+                (0x40, 5),
+                (0x44, 0x25),
+                (0x04, 1),
+            ] {
+                w(e, h, o, v);
+            }
+        };
+        // Without the work, the job only pulses its interrupt.
+        start(&mut plain, &mut h, 2);
+        advance(&mut plain, &mut h, 30);
+        assert!(h.ram[0x4000..0x4080].iter().all(|&b| b == 0));
+        assert_eq!(plain.state.jobs, 1);
+        start(&mut converter, &mut h, 2);
+        advance(&mut converter, &mut h, 50);
+        let slot =
+            |h: &TestHost, at: usize| u32::from_le_bytes(h.ram[at..at + 4].try_into().unwrap());
+        for n in 0..16u32 {
+            let at = 0x4000 + 8 * n as usize;
+            assert_eq!(slot(&h, at), (n + 1) << 8);
+            assert_eq!(slot(&h, at + 4), (0xa0_0000 + n) << 8);
+        }
+        assert_eq!(slot(&h, 0x4080), 0);
+        assert_eq!(
+            (
+                converter.state.audio_converted,
+                converter.state.audio_skipped
+            ),
+            (1, 0)
+        );
+        // Lines that do not match: left alone and counted.
+        h.ram[0x4000..0x4080].fill(0);
+        start(&mut converter, &mut h, 3);
+        advance(&mut converter, &mut h, 70);
+        assert!(h.ram[0x4000..0x4080].iter().all(|&b| b == 0));
+        assert_eq!(
+            (
+                converter.state.audio_converted,
+                converter.state.audio_skipped
+            ),
+            (1, 1)
+        );
+        let saved = converter.save();
+        assert_eq!(saved["audio_skipped"], 1);
+        let mut restored = block().with_work(Work::Audio).unwrap();
+        restored.restore(&saved).unwrap();
+        assert_eq!(restored.state.audio_skipped, 1);
+        // The other widths, and recording's 32 to 24 bits.
+        assert_eq!(
+            convert_audio(&[0x22, 0x33, 0x44], 3, 4),
+            [0, 0x22, 0x33, 0x44]
+        );
+        assert_eq!(convert_audio(&[0x33, 0x44], 2, 4), [0, 0, 0x33, 0x44]);
+        assert_eq!(
+            convert_audio(&[0x11, 0x22, 0x33, 0x44], 4, 3),
+            [0x22, 0x33, 0x44]
+        );
+        assert_eq!(convert_audio(&[0x11, 0x22, 0x33, 0x44], 4, 2), [0x33, 0x44]);
+        assert_eq!(
+            convert_audio(&[0x22, 0x33, 0x44, 0x55], 2, 3),
+            [0, 0x22, 0x33, 0, 0x44, 0x55]
+        );
     }
 }

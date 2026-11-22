@@ -6,6 +6,19 @@ use fujimod_emulator_imaging::scene::{Frame, FramePixels, SensorFrames};
 use std::sync::{Arc, Mutex};
 
 #[test]
+fn durable_media_can_be_installed_before_a_continuing_epoch_runs() {
+    let source = card_session();
+    let spec = crate::durable::Spec { cards: vec!["sd".into()], nands: vec![] };
+    let saved = crate::durable::Media::capture(&source, &spec).unwrap();
+    let mut cold = card_session_with_epoch(Some((9000, vec![321])));
+    assert_eq!(cold.board.instruction_counts(), [321]);
+    saved.apply(&mut cold, &spec).unwrap();
+    assert_eq!(cold.board.now(), 9000);
+    cold.board.run_for_instructions(1, 8).unwrap();
+    assert!(saved.apply(&mut cold, &spec).is_err());
+}
+
+#[test]
 fn durable_card_uses_the_new_hosts_allocation_limit_without_changing_saved_files() {
     let mut source = card_session();
     let mut card = source.card_medium("sd").unwrap();
@@ -134,6 +147,28 @@ fn continue_session(session: &mut Session) {
 }
 
 #[test]
+fn watched_contact_queue_ends_a_window_after_its_change() {
+    let mut session = session();
+    let total = |session: &Session| -> u64 { session.board.instruction_counts().iter().sum() };
+    session.contact_input("menu", None, false).unwrap();
+    session.contact_driver.as_mut().unwrap().set_watched(true);
+    // An unacknowledged press leaves the queue unchanged: the window ends at its limit.
+    session.run_window(50, 7, None, None).unwrap();
+    assert_eq!(total(&session), 50);
+    assert!(session.contact_driver.as_ref().unwrap().busy());
+    session.board.write_physical(0x200, &[1]).unwrap();
+    session.run_window(1000, 7, None, None).unwrap();
+    assert!(!session.contact_driver.as_ref().unwrap().busy());
+    assert!(total(&session) < 1000);
+    // Unwatched, the same queue change continues to the window's end.
+    let mut unwatched = self::session();
+    unwatched.contact_input("menu", None, false).unwrap();
+    unwatched.board.write_physical(0x200, &[1]).unwrap();
+    unwatched.run_window(1000, 7, None, None).unwrap();
+    assert_eq!(total(&unwatched), 1000);
+}
+
+#[test]
 fn durable_session_restores_media_sensor_inputs_contacts_and_queued_actions_then_resumes() {
     let (bytes, before, continued) = {
         let mut source = session();
@@ -154,21 +189,26 @@ fn durable_session_restores_media_sensor_inputs_contacts_and_queued_actions_then
         assert!(source.contact_driver.as_ref().unwrap().busy());
         let saved = source.checkpoint(None).unwrap();
         let bytes = saved.export().unwrap();
-        let before = source.fingerprint().unwrap();
+        let before = source.complete_state().unwrap();
         assert_eq!(saved.export().unwrap(), bytes);
-        assert_eq!(source.fingerprint().unwrap(), before);
+        assert_eq!(source.complete_state().unwrap(), before);
         continue_session(&mut source);
-        (bytes, before, source.fingerprint().unwrap())
+        (bytes, before, source.complete_state().unwrap())
     };
     let mut target = session();
-    let sensor = fujimod_emulator_exr2_images::images_mut(&mut target.resources).unwrap().sensors["scene"].clone();
-    let initial = target.fingerprint().unwrap();
+    let sensor = fujimod_emulator_exr2_images::images_mut(&mut target.resources)
+        .unwrap()
+        .sensors["scene"]
+        .clone();
+    let initial = target.complete_state().unwrap();
     let saved = target.import_snapshot(&bytes).unwrap();
-    assert_eq!(target.fingerprint().unwrap(), initial);
+    assert_eq!(target.complete_state().unwrap(), initial);
     target.restore(&saved).unwrap();
-    assert_eq!(target.fingerprint().unwrap(), before);
+    assert_eq!(target.complete_state().unwrap(), before);
     assert!(Arc::ptr_eq(
-        &fujimod_emulator_exr2_images::images_mut(&mut target.resources).unwrap().sensors["scene"],
+        &fujimod_emulator_exr2_images::images_mut(&mut target.resources)
+            .unwrap()
+            .sensors["scene"],
         &sensor
     ));
     let mut sector = [0; 20];
@@ -179,7 +219,7 @@ fn durable_session_restores_media_sensor_inputs_contacts_and_queued_actions_then
         .unwrap();
     assert_eq!(&sector, b"captured card sector");
     continue_session(&mut target);
-    assert_eq!(target.fingerprint().unwrap(), continued);
+    assert_eq!(target.complete_state().unwrap(), continued);
     assert_eq!(target.board.read_register(0, arm::CORE[0]).unwrap(), 107);
 }
 
@@ -188,20 +228,20 @@ fn incompatible_session_or_corrupt_archive_is_refused_without_changing_live_stat
     let source = session();
     let bytes = source.checkpoint(None).unwrap().export().unwrap();
     let mut target = session();
-    let before = target.fingerprint().unwrap();
+    let before = target.complete_state().unwrap();
     let mut bad = bytes.clone();
     bad.push(0);
     assert!(target.import_snapshot(&bad).is_err());
-    assert_eq!(target.fingerprint().unwrap(), before);
+    assert_eq!(target.complete_state().unwrap(), before);
     target.definition["fixture"] = serde_json::json!("different-constructor");
-    let before = target.fingerprint().unwrap();
+    let before = target.complete_state().unwrap();
     assert!(target.import_snapshot(&bytes).is_err());
-    assert_eq!(target.fingerprint().unwrap(), before);
+    assert_eq!(target.complete_state().unwrap(), before);
     let mut target = session();
     target.nodes.remove("adc");
-    let before = target.fingerprint().unwrap();
+    let before = target.complete_state().unwrap();
     assert!(target.import_snapshot(&bytes).is_err());
-    assert_eq!(target.fingerprint().unwrap(), before);
+    assert_eq!(target.complete_state().unwrap(), before);
 }
 
 #[test]
@@ -222,19 +262,22 @@ fn serialized_checkpoint_resumes_a_fresh_session_and_checks_image_and_graph_iden
         let checkpoint = source.checkpoint(None).unwrap();
         let bytes = checkpoint.export().unwrap();
         let (ticks, counts) = crate::checkpoint::Snapshot::inspect(&bytes).unwrap();
-        assert_eq!((ticks, counts), (checkpoint.now(), checkpoint.instruction_counts().to_vec()));
-        let before = source.fingerprint().unwrap();
+        assert_eq!(
+            (ticks, counts),
+            (checkpoint.now(), checkpoint.instruction_counts().to_vec())
+        );
+        let before = source.complete_state().unwrap();
         source.board.run_for_instructions(200, 17).unwrap();
-        (bytes, before, source.fingerprint().unwrap())
+        (bytes, before, source.complete_state().unwrap())
     };
 
     let mut target = session();
     target.definition = definition.clone();
     let checkpoint = target.import_snapshot(&bytes).unwrap();
     target.restore(&checkpoint).unwrap();
-    assert_eq!(target.fingerprint().unwrap(), before);
+    assert_eq!(target.complete_state().unwrap(), before);
     target.board.run_for_instructions(200, 17).unwrap();
-    assert_eq!(target.fingerprint().unwrap(), after);
+    assert_eq!(target.complete_state().unwrap(), after);
 
     let mut different_image = session();
     different_image.definition = definition.clone();
@@ -246,4 +289,76 @@ fn serialized_checkpoint_resumes_a_fresh_session_and_checks_image_and_graph_iden
     different_graph.definition = definition;
     different_graph.definition["devices"]["nodes"][0]["kind"] = serde_json::json!("other");
     assert!(different_graph.import_snapshot(&bytes).is_err());
+}
+
+#[test]
+fn power_cycle_retains_card_and_packet_and_runs_no_instructions_while_off() {
+    use crate::power_cycle::{ColdBoot, PowerCycle};
+    use fujimod_emulator_devices::exr2::{clock, wake_alarm::WakeAlarm};
+    struct Builder;
+    impl ColdBoot for Builder {
+        fn build(&mut self, tick: u64, counts: Vec<u64>, packet: [u8; 16]) -> Result<Session, String> {
+            let power = Arc::new(Mutex::new(WakeAlarm::new(1_000_000, clock::POWER_HOLD_RELEASE_LIMIT_TICKS)?));
+            power.lock().unwrap().initialize_packet(packet)?;
+            Ok(card_session_with_power(Some((tick, counts)), Some(power)))
+        }
+    }
+    let power = Arc::new(Mutex::new(WakeAlarm::new(1_000_000, clock::POWER_HOLD_RELEASE_LIMIT_TICKS).unwrap()));
+    {
+        let mut p = power.lock().unwrap();
+        p.initialize_packet([0x5a; 16]).unwrap();
+        p.write(0, 0x69, 1).unwrap();
+        p.write(0, 0x6a, 0).unwrap();
+        p.write(0, 0x68, 1).unwrap();
+    }
+    let mut session = card_session_with_power(None, Some(power));
+    session.logic_input("usb_cable", true).unwrap();
+    session.configure_power_cycle(PowerCycle::new("clocks".into(),
+        crate::durable::Spec { cards: vec!["sd".into()], nands: vec![] }, Box::new(Builder))
+        .with_logic_inputs(vec!["usb_cable".into()])).unwrap();
+    // Guest store releases power hold, followed by a self-loop.
+    session.board.write_physical(0, &0xe5801000u32.to_le_bytes()).unwrap();
+    session.board.write_physical(4, &0xeafffffeu32.to_le_bytes()).unwrap();
+    session.board.write_register(0, arm::CORE[0], 0xfff88084).unwrap();
+    session.board.write_register(0, arm::CORE[1], 0).unwrap();
+    session.run_with_limits(10_000_000, 128, None, Some(200_000)).unwrap();
+    assert!(session.board.is_powered_off());
+    assert_eq!(session.board.now(), 200_000);
+    let counts = session.board.instruction_counts();
+    assert!(session.checkpoint(None).is_err());
+    session.run_with_limits(10_000_000, 128, None, Some(1_000_000)).unwrap();
+    assert!(!session.board.is_powered_off());
+    assert_eq!(session.board.now(), 1_000_000);
+    assert_eq!(session.board.instruction_counts(), counts);
+    assert!(session.board.epoch_is_unexecuted());
+    assert!(session.resources.logic_level("usb_cable").unwrap().high());
+    assert_eq!(session.resources.clock("clocks").unwrap().power_alarm().unwrap().unwrap().lock().unwrap().packet(), Some([0x5a; 16]));
+    let revision = session.card_state("sd").unwrap().revision;
+    assert_eq!(session.card_read("sd", "/DCIM/100_FUJI/A.JPG", revision, 100).unwrap(), b"card bytes");
+}
+
+#[test]
+fn a_session_without_connected_controls_adopts_the_snapshots_contacts() {
+    let source = session();
+    let bytes = source.checkpoint(None).unwrap().export().unwrap();
+    let mut target = card_session();
+    fujimod_emulator_exr2_images::images_mut(&mut target.resources).unwrap().sensors.insert(
+        "scene".into(),
+        Arc::new(Mutex::new(SensorFrames::new(
+            Frame::new(1, 1, FramePixels::Rgb24(vec![1, 2, 3].into())).unwrap(),
+        ))),
+    );
+    assert!(target.controls.is_none() && target.contact_driver.is_none());
+    let saved = target.import_snapshot(&bytes).unwrap();
+    target.restore(&saved).unwrap();
+    assert_eq!(
+        target.controls.as_ref().map(|panel| panel.spec().clone()),
+        source.controls.as_ref().map(|panel| panel.spec().clone())
+    );
+    assert!(target.contact_driver.is_some());
+
+    // A connected session never drops its contacts for a snapshot without them.
+    let bare = card_session().checkpoint(None).unwrap().export().unwrap();
+    let connected = session();
+    assert!(connected.import_snapshot(&bare).is_err());
 }

@@ -1,6 +1,7 @@
 name: Web checks
 on:
   workflow_dispatch:
+  workflow_call:
 permissions:
   contents: read
 concurrency:
@@ -13,35 +14,32 @@ jobs:
       run:
         working-directory: apps/web
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           lfs: true
-      - uses: actions/setup-node@v7
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '26.12.0'
-          cache: npm
-          cache-dependency-path: apps/web/package-lock.json
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
       - name: Set up USB Wasm tools
         working-directory: .
         run: |
           rustup toolchain install 1.99.1 --profile minimal --target wasm32-unknown-unknown
           rustup default 1.99.1
-          npm ci
-          npm --prefix packages/emulator-ui ci
-          npm --prefix bindings/javascript ci
-          npm --prefix crates/simulation/tools ci
-          npm --prefix bindings/javascript run setup:tooling
-      - run: npm ci
-      - run: npm run check
+          pnpm install --frozen-lockfile
+          pnpm --filter fujimod run setup:tooling
+      - name: Install browser test runtimes
+        run: pnpm --filter fujimod-web exec playwright install --with-deps chromium webkit
+      - run: pnpm --filter fujimod-web run check
       - name: Check USB protocol core
         working-directory: .
         run: cargo test -p fujimod-usb -p fujimod-usb-app80
       - name: Check shared simulation
         working-directory: .
         run: cargo test --locked --manifest-path crates/simulation/Cargo.toml --lib
-      - run: npm test
-      - run: npm run build
-      - name: Install browser test runtimes
-        run: npx playwright install --with-deps chromium webkit
-      - run: npm run test:prerender
-      - run: npm run test:dev-tools:browser
+      - run: pnpm --filter fujimod-web test
+      - run: pnpm --filter fujimod-web run build
+      - run: pnpm --filter fujimod-web run test:prerender
+      - run: pnpm --filter fujimod-web run test:dev-tools:browser

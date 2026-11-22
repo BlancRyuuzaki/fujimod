@@ -9,6 +9,7 @@ import { loadPreparedBundle } from './prepared-bundle';
 import { CameraStore } from '../cameras/store';
 import { digest } from './identity';
 import { diagnosticReport } from './diagnostics';
+import { PresentedDisplay } from './presented-display';
 import { faultFrom } from '@fujimod/emulator-ui/engine/fault';
 import {
   createCamera,
@@ -168,6 +169,7 @@ export class WasmWorkerRuntime {
   private module?: EmulatorModule;
   private camera?: Camera;
   private manifest?: EmulatorManifest;
+  private display?: PresentedDisplay;
   private dmpWebGpu?: DmpWebGpuModule;
   private config?: EngineConfig;
   private state?: SessionState;
@@ -312,7 +314,8 @@ export class WasmWorkerRuntime {
   }
   private observe(state: SessionState) {
     this.state = state;
-    this.send({ type: 'state', state });
+    using status = this.require().status();
+    this.send({ type: 'state', state, supplyOn: status.supplyOn });
   }
   private observeCurrent() {
     if (this.manifest && this.manifest.construction !== 'resolved')
@@ -422,8 +425,11 @@ export class WasmWorkerRuntime {
         );
         return;
       }
-      case 'checkpoint':
-        return this.captureCheckpoint();
+      case 'checkpoint': {
+        const saved = this.captureCheckpoint();
+        if (!saved) throw Error('The camera power supply is off.');
+        return saved;
+      }
       case 'restore_checkpoint':
         s.restore(request.id);
         this.afterRestore();
@@ -438,8 +444,8 @@ export class WasmWorkerRuntime {
         s.replay(new Uint8Array(request.bytes));
         this.afterRestore();
         return;
-      case 'fingerprint':
-        return s.fingerprint();
+      case 'complete_state':
+        return s.completeState();
       case 'rollback': {
         if (!Number.isFinite(request.seconds) || request.seconds <= 0)
           throw Error('Invalid rollback duration.');
@@ -512,13 +518,16 @@ export class WasmWorkerRuntime {
   private async loadSnapshot(bytes: Uint8Array, config: EngineConfig) {
     if (this.camera) throw Error('Wasm worker already booted.');
     this.config = config;
-    const { module, manifest, identity, loadTimings, dmpWebGpu } = await this.prepare(config.bundle);
+    const { module, manifest, identity, loadTimings, dmpWebGpu } = await this.prepare(
+      config.bundle,
+    );
     this.loadTimings = loadTimings;
     this.module = module;
     this.dmpWebGpu = dmpWebGpu;
     const session = module.Camera.fromSnapshot(bytes);
     this.camera = session;
     this.manifest = manifest;
+    this.display = manifest.displays ? new PresentedDisplay(manifest.displays) : undefined;
     this.runtimeKey = await digest(
       new TextEncoder().encode(`${identity}:${await digest(new Uint8Array(bytes))}`),
     );
@@ -546,14 +555,17 @@ export class WasmWorkerRuntime {
   ) {
     if (this.camera) throw Error('Wasm worker already booted.');
     this.config = config;
-    const saved = config.camera ? await this.cameras.saved(config.camera.id) : undefined;
+    let saved = config.camera ? await this.cameras.saved(config.camera.id) : undefined;
     this.scene = scene && 'rgb' in scene ? scene : undefined;
     this.send({ type: 'progress', message: 'Loading Wasm runtime…' });
-    const { module, manifest, identity, loadTimings, dmpWebGpu } = await this.prepare(config.bundle);
+    const { module, manifest, identity, loadTimings, dmpWebGpu } = await this.prepare(
+      config.bundle,
+    );
     this.loadTimings = loadTimings;
     this.module = module;
     this.dmpWebGpu = dmpWebGpu;
     this.manifest = manifest;
+    this.display = manifest.displays ? new PresentedDisplay(manifest.displays) : undefined;
     this.runtimeKey = await this.timings.measureAsync('runtimeIdentity', async () =>
       digest(
         new TextEncoder().encode(
@@ -591,6 +603,7 @@ export class WasmWorkerRuntime {
             1000,
         );
     const preferredLanguages = this.replayMode ? [] : [...navigator.languages];
+    let create: () => ReturnType<typeof createCamera>;
     if (manifest.construction === 'prepared') {
       const prepared = manifest.prepared;
       if (!prepared || !config.bundle) throw Error('Prepared camera has no bundle files.');
@@ -598,17 +611,16 @@ export class WasmWorkerRuntime {
         prepared,
         new URL('wasm.json', config.bundle),
       );
-      this.camera = this.timings.measure('create', () =>
+      create = () =>
         createCamera(
           module,
           JSON.stringify({ document: text, clockSeconds2000, preferredLanguages }),
           new Uint8Array(dat),
           'prepared',
           inputs,
-        ),
-      );
+        );
     } else
-      this.camera = this.timings.measure('create', () =>
+      create = () =>
         createCamera(
           module,
           manifest.construction === 'resolved'
@@ -624,11 +636,21 @@ export class WasmWorkerRuntime {
               },
           new Uint8Array(dat),
           manifest.construction,
-        ),
-      );
-    const session = this.camera;
+        );
+    let session = (this.camera = this.timings.measure('create', create));
     if (manifest.construction !== 'resolved') {
-      if (saved) this.observe(session.restoreDurable(new Uint8Array(saved.durable)));
+      if (saved) {
+        try {
+          this.observe(session.restoreDurable(new Uint8Array(saved.durable)));
+        } catch (error) {
+          // A save from an emulator with another storage format cannot be read:
+          // the camera starts with fresh storage, which replaces the save.
+          console.warn('Starting with fresh camera storage:', error);
+          session.free();
+          session = this.camera = this.timings.measure('create', create);
+          saved = undefined;
+        }
+      }
       if (files.length) {
         const packed = packFiles(files);
         this.observe(session.replaceCard(packed.rows, packed.bytes, config.bootInputs ?? []));
@@ -647,6 +669,12 @@ export class WasmWorkerRuntime {
       scene = undefined;
     }
     await this.coldBoot(config.bootInputs);
+    if (config.execution?.initialSteps?.length) {
+      this.stop();
+      for (const step of config.execution.initialSteps) await this.replayStep(step);
+      this.rebase();
+      this.start();
+    }
     this.send({
       type: 'progress',
       message: 'Booting camera…',
@@ -793,7 +821,12 @@ export class WasmWorkerRuntime {
       ),
     );
   }
-  private captureCheckpoint(): Checkpoint {
+  private captureCheckpoint(): Checkpoint | undefined {
+    using status = this.require().status();
+    if (!status.supplyOn) {
+      this.points = [];
+      return;
+    }
     const { retainedIds, ...saved } = this.require().checkpoint();
     this.points = this.points.filter((point) => retainedIds.includes(point.id));
     this.points.push(saved);
@@ -891,10 +924,19 @@ export class WasmWorkerRuntime {
     this.speedSamples.push({ wall, ticks: status.ticks });
     while (this.speedSamples.length > 2 && wall - this.speedSamples[1]!.wall >= 2000)
       this.speedSamples.shift();
-    const frame = this.timings.measure('frame', () => s.frame(this.manifest!.output));
+    const shown = this.display?.observe((output) => {
+      const presented = s.frame(output);
+      if (!presented) return undefined;
+      const sequence = presented.sequence;
+      presented.free();
+      return sequence;
+    });
+    const frame = this.timings.measure('frame', () =>
+      s.frame(shown?.output ?? this.manifest!.output),
+    );
     if (!frame) return;
     const { rgba, width, height } = frame,
-      sequence = Number(frame.sequence);
+      sequence = shown?.sequence ?? Number(frame.sequence);
     frame.free();
     if (typeof SharedArrayBuffer !== 'undefined' && rgba.buffer instanceof SharedArrayBuffer) {
       this.leased = new Promise<void>((resolve) => {

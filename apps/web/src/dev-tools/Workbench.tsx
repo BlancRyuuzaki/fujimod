@@ -21,6 +21,7 @@ import { ConsoleLog } from './ConsoleLog';
 import { ToolDeck, type SavedCamera } from './ToolDeck';
 import { CameraStore } from '../cameras/store';
 import { GuideConnection, ServiceModeGuide } from './ServiceModeGuide';
+import { serviceModeCameras, type ServiceModeCamera } from './service-mode-entry';
 import { GettingStarted, type PathResults } from './GettingStarted';
 import { executionSelection, bulkSupportError } from './captures/capture';
 import { LeaveDebugMode } from './debug-mode/LeaveDebugMode';
@@ -73,6 +74,11 @@ export function Workbench(props: {
       () => setSavedCameras([]),
     );
   });
+  const [serviceCameras, setServiceCameras] = createSignal<readonly ServiceModeCamera[]>([]);
+  onSettled(() => {
+    serviceModeCameras().then(setServiceCameras, () => setServiceCameras([]));
+  });
+  const [guideModel, setGuideModel] = createSignal<string>();
   const cameras = () => props.model.cameras();
   const remotePeers = () =>
     cameras().reduce(
@@ -134,12 +140,11 @@ export function Workbench(props: {
     }
   }
   async function connectSimulated(savedCamera: string) {
-    const start = props.model.connectSimulated;
-    if (!start || connecting()) return;
+    if (!props.model.connectSimulated || connecting()) return;
     setConnecting(true);
     setConnectError('');
     try {
-      await start.call(props.model, savedCamera);
+      await props.model.connectSimulated(savedCamera);
     } catch (error) {
       setConnectError(shownError(error));
     } finally {
@@ -238,7 +243,7 @@ export function Workbench(props: {
               onServiceMode={() => setWizard(Wizard.Service)}
               onConnect={() => void connect()}
               savedCameras={savedCameras()}
-              simulationAvailable={Boolean(props.model.connectSimulated)}
+              simulationAvailable={props.model.connectSimulated !== undefined}
               error={connectError()}
               onSimulated={(savedCamera) => void connectSimulated(savedCamera)}
             />
@@ -276,6 +281,9 @@ export function Workbench(props: {
                 <Match when={wizard() === Wizard.Service}>
                   <ServiceModeGuide
                     connection={guideConnection()}
+                    cameras={serviceCameras()}
+                    model={guideModel() ?? camera()?.identity?.product}
+                    onModelChanged={setGuideModel}
                     onConnect={() => void connect()}
                     onClose={closeWizard}
                   />

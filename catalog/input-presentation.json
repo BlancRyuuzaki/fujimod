@@ -191,6 +191,238 @@
     "hdmi": {
       "label": "HDMI",
       "text": "HDMI"
+    },
+    "flash_pop_up_switch": {
+      "label": "Flash pop-up",
+      "text": "Flash pop-up"
+    },
+    "mode_dial": {
+      "label": "Mode dial",
+      "text": "Mode dial"
+    },
+    "selector.press": {
+      "label": "Menu / OK",
+      "text": "MENU/OK"
+    },
+    "view_mode_button": {
+      "label": "View mode",
+      "text": "View mode"
+    },
+    "zoom_power_ring": {
+      "label": "Zoom ring",
+      "text": "Zoom ring"
+    },
+    "zoom_power_ring.increase": {
+      "label": "Zoom in",
+      "text": "Zoom in"
+    },
+    "zoom_power_ring.decrease": {
+      "label": "Zoom out",
+      "text": "Zoom out"
+    },
+    "drive_dial": {
+      "label": "Drive dial",
+      "text": "Drive dial"
+    },
+    "flash_pop_up_lever": {
+      "label": "Flash pop-up",
+      "text": "Flash pop-up"
+    },
+    "front_command_dial": {
+      "label": "Front command dial",
+      "text": "Front command dial"
+    },
+    "front_command_dial.increase": {
+      "label": "Front command right",
+      "text": "Front command right"
+    },
+    "front_command_dial.decrease": {
+      "label": "Front command left",
+      "text": "Front command left"
+    },
+    "front_command_dial.press": {
+      "label": "Front command press",
+      "text": "Front command press"
+    },
+    "diopter_adjustment_control.increase": {
+      "label": "Diopter adjustment",
+      "text": "Diopter adjustment"
+    },
+    "diopter_adjustment_control.decrease": {
+      "label": "Diopter adjustment",
+      "text": "Diopter adjustment"
+    },
+    "rear_command_dial": {
+      "label": "Rear command dial",
+      "text": "Rear command dial"
+    },
+    "rear_command_dial.increase": {
+      "label": "Rear command right",
+      "text": "Rear command right"
+    },
+    "rear_command_dial.decrease": {
+      "label": "Rear command left",
+      "text": "Rear command left"
+    },
+    "rear_command_dial.press": {
+      "label": "Rear command press",
+      "text": "Rear command press"
+    },
+    "selector_up_button": {
+      "label": "Up",
+      "icon": "up"
+    },
+    "selector_right_button": {
+      "label": "Right",
+      "icon": "right"
+    },
+    "selector_down_button": {
+      "label": "Down",
+      "icon": "down"
+    },
+    "selector_left_button": {
+      "label": "Left",
+      "icon": "left"
+    },
+    "lcd_touchscreen": {
+      "label": "Screen",
+      "text": "Screen"
+    },
+    "main_command_dial": {
+      "label": "Main command dial",
+      "text": "Main dial"
+    },
+    "main_command_dial.increase": {
+      "label": "Main command dial right",
+      "text": "Main dial right"
+    },
+    "main_command_dial.decrease": {
+      "label": "Main command dial left",
+      "text": "Main dial left"
+    },
+    "on_off_switch": {
+      "label": "Power",
+      "text": "Power"
+    },
+    "fn_button": {
+      "label": "Fn",
+      "text": "Fn"
+    },
+    "sub_command_dial": {
+      "label": "Sub-command dial",
+      "text": "Sub-command dial"
+    },
+    "sub_command_dial.increase": {
+      "label": "Sub-command dial right",
+      "text": "Sub-command right"
+    },
+    "sub_command_dial.decrease": {
+      "label": "Sub-command dial left",
+      "text": "Sub-command left"
+    },
+    "lcd_monitor": {
+      "label": "LCD monitor",
+      "text": "Screen"
+    },
+    "display_back_button": {
+      "label": "DISP / BACK",
+      "text": "DISP/BACK"
+    },
+    "focus_assist_button": {
+      "label": "Focus assist",
+      "text": "FOCUS ASSIST"
+    },
+    "metering_dial": {
+      "label": "Metering dial",
+      "text": "Metering"
+    },
+    "sensitivity_dial": {
+      "label": "ISO sensitivity dial",
+      "text": "ISO"
+    },
+    "sensitivity_dial_lock_release": {
+      "label": "ISO dial lock release",
+      "text": "ISO lock"
+    },
+    "shutter_speed_dial_lock_release": {
+      "label": "Shutter speed dial lock release",
+      "text": "Shutter speed lock"
+    },
+    "ae_l_button": {
+      "label": "AE-L",
+      "text": "AE-L"
+    },
+    "af_l_button": {
+      "label": "AF-L",
+      "text": "AF-L"
+    },
+    "q_button": {
+      "label": "Q",
+      "text": "Q"
+    },
+    "memory_card_slot_cover_latch": {
+      "label": "Memory card slot cover latch",
+      "text": "Card cover"
+    },
+    "focus_stick": {
+      "label": "Focus stick",
+      "text": "Focus stick"
+    },
+    "focus_stick.press": {
+      "label": "Focus stick press",
+      "text": "Focus stick press"
+    },
+    "connector_cover_latch": {
+      "label": "Connector cover latch",
+      "text": "Connector cover"
+    },
+    "movie_recording_button": {
+      "label": "Movie recording",
+      "icon": "record"
+    },
+    "focus_stick.up": {
+      "label": "Focus stick up",
+      "icon": "up",
+      "text": "Focus stick up"
+    },
+    "focus_stick.down": {
+      "label": "Focus stick down",
+      "icon": "down",
+      "text": "Focus stick down"
+    },
+    "focus_stick.left": {
+      "label": "Focus stick left",
+      "icon": "left",
+      "text": "Focus stick left"
+    },
+    "focus_stick.right": {
+      "label": "Focus stick right",
+      "icon": "right",
+      "text": "Focus stick right"
+    },
+    "dial_lock_release": {
+      "label": "Dial lock",
+      "text": "Dial lock"
+    },
+    "still_movie_mode_dial": {
+      "label": "Still / movie",
+      "text": "STILL/MOVIE"
+    },
+    "af_on_button": {
+      "label": "AF-ON",
+      "text": "AF-ON"
+    },
+    "ael_button": {
+      "label": "AE-L",
+      "text": "AE-L"
+    },
+    "disp_back_bluetooth_button": {
+      "label": "DISP / BACK",
+      "text": "DISP/BACK"
+    },
+    "lcd_tilt_lock_release": {
+      "label": "Screen tilt lock",
+      "text": "Screen tilt lock"
     }
   },
   "icons": {

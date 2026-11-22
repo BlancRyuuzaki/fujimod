@@ -18,8 +18,7 @@ use fujimod_catalog_run_inputs::HardwareReset;
 use fujimod_emulator::board::factory;
 use fujimod_emulator_cpu::Register;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::{borrow::Cow, collections::BTreeMap};
 
 /// Performance-counter cycles per board tick of each application core.
 const CYCLES_PER_TICK: u64 = 64;
@@ -88,7 +87,7 @@ impl SensorImageLight {
     }
 }
 
-fn soc_profile<'a>(resolved: &'a ResolvedConfiguration) -> Result<&'a SocProfile, String> {
+fn soc_profile(resolved: &ResolvedConfiguration) -> Result<&SocProfile, String> {
     let selection = resolved
         .configuration
         .preset
@@ -119,7 +118,7 @@ fn flat_reference(reference: [u32; 3]) -> [u32; 3] {
 }
 
 /// The selected body hardware profile of a resolved run.
-fn body_profile<'a>(resolved: &'a ResolvedConfiguration) -> Result<&'a BodyProfile, String> {
+fn body_profile(resolved: &ResolvedConfiguration) -> Result<&BodyProfile, String> {
     let choice = resolved
         .configuration
         .preset
@@ -136,6 +135,35 @@ fn body_profile<'a>(resolved: &'a ResolvedConfiguration) -> Result<&'a BodyProfi
                 body.id, choice.body_profile_id
             )
         })
+}
+
+/// Add body-specific registers to the shared SoC profile. The shared profile
+/// wins every field it declares; a body may add a register block and the
+/// H.264 layout that block belongs to (X-T20 2.11 is the only such body).
+fn register_maps<'a>(
+    soc: &'a RegisterLayouts,
+    body: Option<&RegisterLayouts>,
+) -> Cow<'a, RegisterLayouts> {
+    let Some(body) = body else {
+        return Cow::Borrowed(soc);
+    };
+    if body.h264_encoder.is_none() && body.register_blocks.is_empty() {
+        return Cow::Borrowed(soc);
+    }
+    let mut maps = soc.clone();
+    if maps.h264_encoder.is_none() {
+        maps.h264_encoder = body.h264_encoder.clone();
+    }
+    for block in &body.register_blocks {
+        if !maps
+            .register_blocks
+            .iter()
+            .any(|existing| existing.base == block.base)
+        {
+            maps.register_blocks.push(block.clone());
+        }
+    }
+    Cow::Owned(maps)
 }
 
 /// Command-dial encoder nodes of the selected body profile. Each declaration
@@ -166,6 +194,7 @@ fn encoder_nodes(body: &Body, profile: &BodyProfile) -> Result<Vec<Value>, Strin
             .options
             .pins
             .iter()
+            .flatten()
             .map(|pin| (pin.port, pin.pin))
             .collect();
         if declared.len() != 2 || signals != declared {
@@ -199,7 +228,7 @@ fn encoder_nodes(body: &Body, profile: &BodyProfile) -> Result<Vec<Value>, Strin
 }
 
 fn hex_bytes(text: &str, label: &str) -> Result<Vec<u8>, String> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return Err(format!("{label} is not whole bytes of hexadecimal"));
     }
     (0..text.len())
@@ -211,29 +240,25 @@ fn hex_bytes(text: &str, label: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-/// The words of a declared statistics buffer, checked against its identity.
-fn buffer_words(
-    assets: &BTreeMap<String, Vec<u8>>,
-    asset: &str,
-    sha256: &str,
-) -> Result<Vec<u32>, String> {
+/// The words of a declared statistics buffer, checked for complete words.
+fn buffer_words(assets: &BTreeMap<String, Vec<u8>>, asset: &str) -> Result<Vec<u32>, String> {
     let data = assets
         .get(asset)
         .ok_or_else(|| format!("statistics buffer asset {asset} was not supplied"))?;
-    let digest: String = Sha256::digest(data)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    if data.is_empty() || data.len() % 4 != 0 || digest != sha256 {
-        return Err(format!("statistics buffer asset {asset} identity differs"));
+    if data.is_empty() || data.len() % 4 != 0 {
+        return Err(format!(
+            "statistics buffer asset {asset} must contain complete words"
+        ));
     }
     Ok(data
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
         .collect())
 }
 
-/// Hexadecimal rows of a declared live-view host image, after its identity check.
+/// Hexadecimal rows of a declared live-view host image with the declared size.
 fn host_image(
     assets: &BTreeMap<String, Vec<u8>>,
     image: &fujimod_catalog_run_inputs::hardware_inputs::LiveViewHostImage,
@@ -242,13 +267,13 @@ fn host_image(
     let data = assets
         .get(asset)
         .ok_or_else(|| format!("live-view image asset {asset} was not supplied"))?;
-    let digest: String = Sha256::digest(data)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    let size = u64::from(image.width) * u64::from(image.height) * 3;
-    if size == 0 || data.len() as u64 != size || digest != image.sha256 {
-        return Err(format!("live-view image asset {asset} identity differs"));
+    let size = u64::from(image.width)
+        .checked_mul(u64::from(image.height))
+        .and_then(|pixels| pixels.checked_mul(3))
+        .filter(|size| *size > 0)
+        .ok_or_else(|| format!("live-view image asset {asset} dimensions are invalid"))?;
+    if data.len() as u64 != size {
+        return Err(format!("live-view image asset {asset} size differs"));
     }
     Ok(data.iter().map(|byte| format!("{byte:02x}")).collect())
 }
@@ -606,12 +631,7 @@ fn nodes(
             model["buffers"] = scene
                 .buffers
                 .iter()
-                .map(|b| {
-                    Ok(json!([
-                        b.output,
-                        buffer_words(inputs.assets, &b.asset, &b.sha256)?
-                    ]))
-                })
+                .map(|b| Ok(json!([b.output, buffer_words(inputs.assets, &b.asset)?])))
                 .collect::<Result<Value, String>>()?;
             let light_words: Vec<Value> = scene
                 .buffers
@@ -648,6 +668,15 @@ fn nodes(
                 }),
             );
         }
+    }
+    if let Some(codec) = &maps.h264_encoder {
+        node(
+            "h264-encoder".into(),
+            json!({
+                "kind": "h264", "base": codec.base, "irq": codec.irq_route,
+                "run_ticks": codec.run_ticks,
+            }),
+        );
     }
     if let Some(hdmi) = &maps.hdmi_tx {
         node("hdmi".into(), json!({ "kind": "hdmi", "base": hdmi.base }));
@@ -687,10 +716,18 @@ fn nodes(
             return Err(format!("I2C part {:#x} names an absent bus", part.address));
         }
         for (bus, &irq) in buses.irq_routes.iter().enumerate() {
+            let touch_parts: Vec<_> = reset
+                .i2c_parts
+                .iter()
+                .filter(|part| part.bus as usize == bus && part.touch_panel.is_some())
+                .collect();
+            if touch_parts.len() > 1 {
+                return Err(format!("I2C bus {bus} has multiple touch-panel models"));
+            }
             let parts: Vec<Value> = reset
                 .i2c_parts
                 .iter()
-                .filter(|part| part.bus as usize == bus)
+                .filter(|part| part.bus as usize == bus && part.touch_panel.is_none())
                 .map(|part| {
                     json!({
                         "address": part.address, "select_mask": part.select_mask,
@@ -701,13 +738,29 @@ fn nodes(
                     })
                 })
                 .collect();
-            node(
-                format!("i2c{bus}"),
-                json!({ "kind": "i2c", "options": {
+            let options = json!({
                 "base": buses.base + bus as u64 * buses.stride, "irq": irq,
                 "fifo_depth": buses.fifo_depth, "clock_hz": buses.clock_hz, "tick_hz": buses.tick_hz,
-            }, "parts": parts }),
-            );
+            });
+            if let Some(part) = touch_parts.first() {
+                let touch = part.touch_panel.as_ref().ok_or("touch model options are absent")?;
+                node(
+                    format!("i2c{bus}"),
+                    json!({ "kind": "xt20-touch-i2c", "options": options, "parts": parts,
+                        "touch": {
+                            "address": part.address,
+                            "report_register": touch.report_register,
+                            "input_ready_irq": touch.input_ready_irq,
+                            "ticks_per_second": buses.tick_hz,
+                        }
+                    }),
+                );
+            } else {
+                node(
+                    format!("i2c{bus}"),
+                    json!({ "kind": "i2c", "options": options, "parts": parts }),
+                );
+            }
         }
     } else if !reset.i2c_parts.is_empty() {
         return Err("I2C parts require the I2C buses".into());
@@ -883,21 +936,13 @@ fn ram_banks(regions: &[MemoryRegion]) -> Vec<(u64, u64)> {
 
 pub fn assemble(resolved: &ResolvedConfiguration, inputs: &Inputs<'_>) -> Result<Assembly, String> {
     let selection = &resolved.reference;
-    let profile = soc_profile(resolved)?;
-    if profile.runtime_abi != "armv7a-unicorn-v1" || profile.cpu_model != "Cortex-A7" {
+    let soc = soc_profile(resolved)?;
+    if soc.runtime_abi != "armv7a-unicorn-v1" || soc.cpu_model != "Cortex-A7" {
         return Err(format!(
             "SoC profile of {} is not an ARMv7-A Cortex-A7 application profile",
             selection.soc.id
         ));
     }
-    let maps = profile
-        .register_maps
-        .as_ref()
-        .ok_or("X-Processor Pro assembly requires the SoC register maps")?;
-    let gic = maps
-        .gic
-        .as_ref()
-        .ok_or("X-Processor Pro assembly requires the GIC map")?;
     let Some(ApplicationHardware::Armv7a {
         configuration_base,
         caches,
@@ -915,6 +960,16 @@ pub fn assemble(resolved: &ResolvedConfiguration, inputs: &Inputs<'_>) -> Result
         .reset;
     let body = &selection.body;
     let profile = body_profile(resolved)?;
+    let maps = register_maps(
+        soc.register_maps
+            .as_ref()
+            .ok_or("X-Processor Pro assembly requires the SoC register maps")?,
+        profile.register_maps.as_ref(),
+    );
+    let gic = maps
+        .gic
+        .as_ref()
+        .ok_or("X-Processor Pro assembly requires the GIC map")?;
     let (numerator, denominator) = reset
         .execution_clock
         .as_ref()
@@ -932,7 +987,7 @@ pub fn assemble(resolved: &ResolvedConfiguration, inputs: &Inputs<'_>) -> Result
     )?;
     let cores = execution.processors.len() as u64;
     let mut node_list = nodes(
-        maps,
+        maps.as_ref(),
         &reset,
         dram_address_space_limit_bytes,
         &ram_banks(&selection.soc.memory_regions),
@@ -994,6 +1049,7 @@ pub fn definition(
         .map(|(processor, registers)| ProcessorStart {
             processor_id: processor.id.clone(),
             released: true,
+            parked_until_sgi: false,
             registers,
         })
         .collect();
@@ -1031,6 +1087,7 @@ mod tests {
             .map(|id| ProcessorStart {
                 processor_id: id.into(),
                 released: true,
+                parked_until_sgi: false,
                 registers: vec![(Register::Pc, 0), (Register::Pstate, 0xd3)],
             })
             .into()
@@ -1068,6 +1125,43 @@ mod tests {
     }
 
     #[test]
+    fn only_the_xt20_body_adds_the_h264_and_playback_registers() {
+        for (configuration, expected) in [
+            ("gfx50r-311", false),
+            ("xt2-441", false),
+            ("xt20-211", true),
+        ] {
+            let resolved = ResolvedConfiguration::bundled(configuration).unwrap();
+            let soc = soc_profile(&resolved)
+                .unwrap()
+                .register_maps
+                .as_ref()
+                .unwrap();
+            let body = body_profile(&resolved).unwrap().register_maps.as_ref();
+            let maps = register_maps(soc, body);
+            assert_eq!(
+                maps.h264_encoder.is_some(),
+                expected,
+                "{configuration} H.264 encoder"
+            );
+            assert_eq!(
+                maps.register_blocks
+                    .iter()
+                    .any(|block| block.base == 0xfff5_b000),
+                expected,
+                "{configuration} H.264 idle block"
+            );
+            assert_eq!(
+                maps.register_blocks
+                    .iter()
+                    .any(|block| block.base == 0xfffd_5000),
+                expected,
+                "{configuration} playback display block"
+            );
+        }
+    }
+
+    #[test]
     fn x_t20_graph_is_built_from_the_catalog_and_body_inputs() {
         let assets = assets();
         let assembly = xt20(&assets).unwrap();
@@ -1096,6 +1190,15 @@ mod tests {
         assert_eq!(devices["cpus"].as_array().unwrap().len(), 2);
         assert_eq!(devices["cpus"][1]["mpidr"], 0x8000_0001_u64);
         assert_eq!(devices["cpus"][0]["configuration_base"], 0xffff_0000_u64);
+        assert_eq!(node(devices, "h264-encoder")["base"], 0xfff5_c000_u64);
+        assert!(
+            devices["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|node| node["model"]["base"] == 0xfff5_b000_u64),
+            "the body adds the 0xfff5b000 idle register block"
+        );
 
         // Command dials: one encoder node per declared body connection, its pads
         // taken from the connection and its edge pacing from the body profile.
@@ -1134,9 +1237,17 @@ mod tests {
         // Still capture: development engines, the second DRAM controller's
         // commands, the read-out unit, the JPEG codecs and the second DRAM bank.
         let engine = |base: u64| blocks.clone().find(|m| m["base"] == base).unwrap();
+        // Playback display engine: the completed descriptor's scanout raises
+        // source 0x43 / GIC line 143, and +0x064 acknowledges the job.
+        assert_eq!(
+            engine(0xfffd_5000)["job"],
+            json!({"start": [0, 1], "status": [0x64, 1], "stop": null, "irq": 143, "ticks": 100000})
+        );
+        assert_eq!(engine(0xfffd_5000)["idle"], json!([[0, 0x8000_0000u32]]));
+        assert_eq!(engine(0xfffd_5000)["fixed"], json!([[0x60, 1]]));
         assert_eq!(
             engine(0xfff9_8000)["job"],
-            json!({"start": [4, 1], "status": null, "stop": [0, 1], "irq": 130, "ticks": 144000})
+            json!({"start": [4, 5], "status": null, "stop": [0, 1], "irq": 130, "ticks": 144000})
         );
         assert_eq!(engine(0xfff7_e000)["fixed"], json!([[0x1c, 0x0100_0100]]));
         assert_eq!(
@@ -1220,7 +1331,7 @@ mod tests {
         let assembly = xt20(&assets).unwrap();
         let spec: Spec = serde_json::from_value(assembly.devices).unwrap();
         let flash = BTreeMap::from([(assembly.flash_asset.to_string(), vec![0xff; 0x1000])]);
-        let built = build(assembly.execution, spec, &flash, Mode::Strict).unwrap();
+        let built = build(assembly.execution, spec, &flash, Mode::Strict, fujimod_catalog_configuration::RunEngine::Unicorn).unwrap();
         for name in [
             "gpio",
             "resets",
@@ -1298,6 +1409,38 @@ mod tests {
     }
 
     #[test]
+    fn asset_words_and_host_image_dimensions_are_checked_directly() {
+        use fujimod_catalog_run_inputs::hardware_inputs::LiveViewHostImage;
+        let mut assets = BTreeMap::from([("input".into(), vec![0x78, 0x56, 0x34, 0x12])]);
+        assert_eq!(buffer_words(&assets, "input").unwrap(), [0x1234_5678]);
+        let mut image = LiveViewHostImage {
+            asset: "input".into(),
+            basis: "test".into(),
+            width: 1,
+            height: 1,
+            sha256: "unused cache key".into(),
+        };
+        assert!(host_image(&assets, &image).unwrap_err().contains("size"));
+        assets.get_mut("input").unwrap().pop();
+        assert_eq!(host_image(&assets, &image).unwrap(), "785634");
+        for (width, height) in [(0, 1), (1, 0), (u32::MAX, u32::MAX)] {
+            image.width = width;
+            image.height = height;
+            assert!(
+                host_image(&assets, &image)
+                    .unwrap_err()
+                    .contains("dimensions")
+            );
+        }
+        assets.clear();
+        assert!(
+            host_image(&assets, &image)
+                .unwrap_err()
+                .contains("not supplied")
+        );
+    }
+
+    #[test]
     fn a_live_view_host_image_is_checked_and_passed_to_its_unit() {
         use fujimod_catalog_run_inputs::hardware_inputs::LiveViewHostImage;
         let resolved = ResolvedConfiguration::bundled("xt20-211").unwrap();
@@ -1338,21 +1481,12 @@ mod tests {
                 &inputs,
             )
         };
+        assets.get_mut("host").unwrap().pop();
         assert_eq!(
             built(&reset, &assets).err().unwrap(),
-            "live-view image asset host identity differs"
+            "live-view image asset host size differs"
         );
-        let host = reset
-            .live_view_image
-            .as_mut()
-            .unwrap()
-            .host_image
-            .as_mut()
-            .unwrap();
-        host.sha256 = Sha256::digest(&pixels)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
+        assets.insert("host".into(), pixels);
         let nodes = built(&reset, &assets).unwrap();
         let block = nodes
             .iter()
@@ -1760,10 +1894,18 @@ mod tests {
             error(&BTreeMap::new()),
             "statistics buffer asset xt20-211-statistics-window was not supplied"
         );
-        let wrong = BTreeMap::from([("xt20-211-statistics-window".to_string(), vec![0; 320])]);
+        for bytes in [vec![], vec![0; 3], vec![0; 319]] {
+            let wrong = BTreeMap::from([("xt20-211-statistics-window".to_string(), bytes)]);
+            assert_eq!(
+                error(&wrong),
+                "statistics buffer asset xt20-211-statistics-window must contain complete words"
+            );
+        }
+        let changed = BTreeMap::from([("xt20-211-statistics-window".to_string(), vec![0; 320])]);
+        let assembly = xt20(&changed).unwrap();
         assert_eq!(
-            error(&wrong),
-            "statistics buffer asset xt20-211-statistics-window identity differs"
+            node(&assembly.devices, "statistics")["buffers"][0][1],
+            json!(vec![0u32; 80])
         );
         // A run without a hardware selection has no SoC profile to assemble from.
         let mut resolved = ResolvedConfiguration::bundled("xt20-211").unwrap();

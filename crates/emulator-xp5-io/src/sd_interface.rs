@@ -3,6 +3,11 @@
 //! Stopped clocks and alternate inputs refuse. Divider encodings follow the
 //! Marble bridge driver in Fujifilm's published Linux sources:
 //! https://dl.fujifilm-x.com/support/oss/x100vi/ff230002.tar.gz
+//!
+//! The block publishes its clock configuration field on the slot's shared
+//! contacts, so the slot's UHS-I host can tell which base clock it divides.
+use fujimod_emulator_devices::checkpoint::Checkpoint;
+use fujimod_emulator_devices::parts::card_contacts::Contacts;
 use fujimod_emulator_devices::{Cx, Device};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,19 +18,40 @@ struct State {
     divider: u8,
     ports: u32,
 }
+impl State {
+    fn validate(&self) -> Result<(), String> {
+        if self.ports & !0xff0101 != 0 || self.divider > 3 {
+            return Err("Invalid SD interface checkpoint".into());
+        }
+        Ok(())
+    }
+}
 pub struct Interface {
     base: u64,
     state: State,
+    slot: Option<Contacts>,
 }
 impl Interface {
     pub fn new(base: u64) -> Result<Self, String> {
+        Self::for_slot(base, None)
+    }
+    /// The interface block of the slot with these contacts.
+    pub fn for_slot(base: u64, slot: Option<Contacts>) -> Result<Self, String> {
         if base & 0xfff != 0x1e0 {
             return Err("Invalid SD interface register base".into());
         }
-        Ok(Self {
+        let interface = Self {
             base,
             state: State::default(),
-        })
+            slot,
+        };
+        interface.publish();
+        Ok(interface)
+    }
+    fn publish(&self) {
+        if let Some(slot) = &self.slot {
+            slot.select_interface_clock(self.state.divider);
+        }
     }
 }
 impl Device for Interface {
@@ -51,6 +77,7 @@ impl Device for Interface {
             {
                 self.state.selection = value & 0x10000 != 0;
                 self.state.divider = ((value >> 9) & 3) as u8;
+                self.publish();
             }
             (4, 4) if self.state.selection && value & !0xff0101 == 0 => {
                 self.state.ports = value as u32
@@ -63,11 +90,30 @@ impl Device for Interface {
     }
     fn restore(&mut self, value: &Value) -> Result<(), String> {
         let state: State = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
-        if state.ports & !0xff0101 != 0 || state.divider > 3 {
-            return Err("Invalid SD interface checkpoint".into());
-        }
+        state.validate()?;
         self.state = state;
+        self.publish();
         Ok(())
+    }
+    fn checkpoint(&self) -> Result<Checkpoint, String> {
+        Checkpoint::encode(self.name(), &self.state)
+    }
+    fn validate_checkpoint(&self, checkpoint: &Checkpoint) -> Result<(), String> {
+        checkpoint.decode::<State>(self.name())?.validate()
+    }
+    fn restore_checkpoint(&mut self, checkpoint: &Checkpoint) -> Result<(), String> {
+        let state = checkpoint.decode::<State>(self.name())?;
+        state.validate()?;
+        self.state = state;
+        self.publish();
+        Ok(())
+    }
+    fn fingerprint(&self) -> Result<Value, String> {
+        Ok(serde_json::json!({
+            "selection": self.state.selection,
+            "divider": self.state.divider,
+            "ports": self.state.ports,
+        }))
     }
 }
 #[cfg(test)]
@@ -87,6 +133,29 @@ mod tests {
         assert_eq!(device.read(&mut cx, 0xff9b01e4, 4), 0xff0101);
         device.restore(&saved).unwrap();
         assert_eq!(device.save(), saved);
+        let checkpoint = device.checkpoint().unwrap();
+        device.write(&mut cx, 0xff9b01e0, 4, 0);
+        device.validate_checkpoint(&checkpoint).unwrap();
+        device.restore_checkpoint(&checkpoint).unwrap();
+        assert_eq!(device.save(), saved);
+    }
+    /// The slot's shared contacts carry the clock configuration field, also after a restore.
+    #[test]
+    fn clock_configuration_is_published_on_the_slots_contacts() {
+        let slot = Contacts::new(true, false);
+        let mut device = Interface::for_slot(0xff9b01e0, Some(slot.clone())).unwrap();
+        assert_eq!(slot.interface_clock(), 0);
+        let mut host = fujimod_emulator_devices::test_host::recording::RecordingHost::default();
+        let mut cx = Cx::new(&mut host, 0, 0, 0);
+        device.write(&mut cx, 0xff9b01e0, 4, 0x10400);
+        device.write(&mut cx, 0xff9b01e0, 4, 0x400);
+        assert_eq!(cx.refusal(), None);
+        assert_eq!(slot.interface_clock(), 2);
+        assert!(slot.present() && !slot.uhs2_interface());
+        let saved = device.save();
+        slot.select_interface_clock(0);
+        device.restore(&saved).unwrap();
+        assert_eq!(slot.interface_clock(), 2);
     }
     #[test]
     fn divided_clock_configuration_requires_register_selection() {

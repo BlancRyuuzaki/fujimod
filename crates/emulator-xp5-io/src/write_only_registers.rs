@@ -9,14 +9,28 @@ use std::collections::BTreeMap;
 struct State {
     base: u64,
     size: u64,
+    /// Register width in bytes. The word default is left out of the encoding,
+    /// so a default window's state keeps the word-register form.
+    #[serde(default = "word_width", skip_serializing_if = "is_word_width")]
     width: u8,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     allowed_values: Option<Vec<u32>>,
     registers: BTreeMap<u64, u32>,
 }
 
+fn word_width() -> u8 {
+    4
+}
+
+fn is_word_width(width: &u8) -> bool {
+    *width == 4
+}
+
 pub struct WriteOnlyRegisters {
     state: State,
+    /// Emulator-only option (`readback = true`): a read returns the last write, zero before one,
+    /// instead of refusing. Labelled assumption for blocks whose registers are unidentified.
+    readback: bool,
 }
 
 impl WriteOnlyRegisters {
@@ -43,7 +57,13 @@ impl WriteOnlyRegisters {
                 allowed_values,
                 registers: BTreeMap::new(),
             },
+            readback: false,
         })
+    }
+
+    pub fn with_readback(mut self) -> Self {
+        self.readback = true;
+        self
     }
 
     fn allowed_values_valid(width: u8, allowed_values: Option<&[u32]>) -> bool {
@@ -94,7 +114,15 @@ impl Device for WriteOnlyRegisters {
         "write-only-registers"
     }
 
-    fn read(&mut self, cx: &mut Cx<'_>, _: u64, _: u8) -> u64 {
+    fn read(&mut self, cx: &mut Cx<'_>, address: u64, size: u8) -> u64 {
+        if self.readback && size == self.state.width {
+            if let Some(offset) = address
+                .checked_sub(self.state.base)
+                .filter(|offset| self.valid_register_offset(*offset))
+            {
+                return u64::from(self.state.registers.get(&offset).copied().unwrap_or(0));
+            }
+        }
         cx.unmodeled();
         0
     }
@@ -194,6 +222,10 @@ mod tests {
         let mut words = WriteOnlyRegisters::new(0x2000, 0x20, 4, None).unwrap();
         words.write(&mut Cx::new(&mut host, 0, 0, 0), 0x2004, 4, 0x1234_5678);
         assert_eq!(words.save()["registers"]["4"], 0x1234_5678);
+        assert_eq!(
+            words.save(),
+            serde_json::json!({"base": 0x2000, "size": 0x20, "registers": {"4": 0x1234_5678}})
+        );
         assert!(WriteOnlyRegisters::new(0x1001, 0x20, 2, None).is_err());
         assert!(WriteOnlyRegisters::new(0x1000, 0x20, 1, None).is_err());
     }
@@ -234,5 +266,24 @@ mod tests {
         assert_eq!(restored.save(), saved);
         assert!(WriteOnlyRegisters::new(0x3000, 4, 4, Some(Vec::new())).is_err());
         assert!(WriteOnlyRegisters::new(0x3000, 4, 4, Some(vec![1, 1])).is_err());
+    }
+
+    #[test]
+    fn readback_option_returns_the_last_write_and_default_still_refuses() {
+        let mut host = RecordingHost::default();
+        let mut plain = WriteOnlyRegisters::new(0xff960000, 0x10000, 4, None).unwrap();
+        let mut cx = Cx::new(&mut host, 0, 0, 0);
+        plain.write(&mut cx, 0xff96cb30, 4, 7);
+        assert!(cx.refusal().is_none() && !cx.is_unmodeled());
+        plain.read(&mut cx, 0xff96cb30, 4);
+        assert!(cx.is_unmodeled());
+        let mut kept = WriteOnlyRegisters::new(0xff960000, 0x10000, 4, None)
+            .unwrap()
+            .with_readback();
+        let mut cx = Cx::new(&mut host, 0, 0, 0);
+        assert_eq!(kept.read(&mut cx, 0xff96cb30, 4), 0);
+        kept.write(&mut cx, 0xff96cb30, 4, 7);
+        assert_eq!(kept.read(&mut cx, 0xff96cb30, 4), 7);
+        assert!(!cx.is_unmodeled());
     }
 }

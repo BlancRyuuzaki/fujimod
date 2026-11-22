@@ -282,7 +282,14 @@ impl Cpu for Core {
             if flush {
                 e.memory.flush()?;
             }
+            // Accepted shared translation maintenance must reach the owner
+            // before this engine runs again.
+            let maintenance = e
+                .cpu
+                .translation_maintenance_status()
+                .is_ok_and(|s| s.pending != 0 || s.poison != 0);
             if !e.stopped.get()
+                && !maintenance
                 && (flush || e.restart.get().is_some())
                 && e.count.get() < e.cap.get()
             {
@@ -342,25 +349,6 @@ impl Cpu for Core {
     /// registers only, and the board refuses any backing it does not own.
     fn checkpoint_backings(&self) -> Result<Vec<(NonNull<u8>, usize)>, String> {
         Ok(self.execution.memory.backings(self.execution.id.get()))
-    }
-    /// The architectural state in its durable encoding, pending interrupt
-    /// inputs and the identity of the mapped backings' geometry.
-    fn fingerprint(&self) -> Result<serde_json::Value, String> {
-        use sha2::{Digest, Sha256};
-        let e = &self.execution;
-        let saved = self.snapshot(None)?;
-        let architecture = saved.export()?;
-        let mut maps = e
-            .memory
-            .backings(e.id.get())
-            .into_iter()
-            .map(|(_, bytes)| bytes)
-            .collect::<Vec<_>>();
-        maps.sort_unstable();
-        Ok(serde_json::json!({
-            "architecture": {"bytes":architecture.len(),"sha256":format!("{:x}",Sha256::digest(&architecture))},
-            "backings": maps,
-        }))
     }
     fn import_snapshot(&self, bytes: &[u8]) -> Result<Box<dyn Snapshot>, String> {
         let (raw, irq, fiq): (Vec<u8>, bool, bool) = crate::durable::decode(bytes)?;
@@ -426,6 +414,8 @@ impl Cpu for Core {
                 e.cpu.invalidate_code(None)?;
                 None
             }
+            // Owner aborts: the abort settles first, then its observers run.
+            Hook::Exception { .. } if e.owner_aborts.get() => None,
             _ => Some(unsafe { e.cpu.install_hook(hook)? }),
         };
         e.index.borrow_mut().insert(key, hook);

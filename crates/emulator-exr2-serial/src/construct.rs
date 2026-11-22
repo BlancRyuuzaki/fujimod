@@ -1,7 +1,10 @@
 //! EXR II board constructors for this crate's models.
 use crate::{dma, spi};
 use fujimod_emulator_devices::Device;
-use fujimod_emulator_exr2_plan::{Model, SerialEndpoint, construction::{Builder, Built, Constructors, controllers, decode, line}};
+use fujimod_emulator_exr2_plan::{
+    Model, SerialEndpoint,
+    construction::{Builder, Built, Constructors, controllers, decode, line},
+};
 use fujimod_emulator_exr2_resources::wire;
 use fujimod_emulator_parts_lens::{
     lens::{LensUnit, bridge::Bridge},
@@ -67,6 +70,8 @@ fn x_mount_lens(builder: Builder<'_>, model: Model) -> Result<Built, String> {
         transport,
         configuration,
         startup_ticks,
+        busy_ticks,
+        operation_ticks,
         pins,
         gpio,
         controllers: names,
@@ -82,7 +87,11 @@ fn x_mount_lens(builder: Builder<'_>, model: Model) -> Result<Built, String> {
         let device = crate::x_mount_connector::XMountLens::new(
             transport,
             configuration,
-            startup_ticks,
+            fujimod_emulator_parts_lens::x_mount_lens::Timing {
+                startup_ticks,
+                busy_ticks,
+                operation_ticks,
+            },
             pins,
             resources.pads(&gpio)?,
             controllers(built, names)?,
@@ -164,13 +173,14 @@ fn i2c_motor_bridge(builder: Builder<'_>, model: Model) -> Result<Built, String>
         pulses,
         gpio,
         clock_irq,
+        optics,
     } = model
     else {
         return Err("constructor called for another model kind".into());
     };
     Ok(Built::Device({
         let options: fujimod_emulator_parts_lens::lens::bridge::Options = decode(options)?;
-        Box::new(Bridge::new(
+        let mut bridge = Bridge::new(
             options,
             fujimod_emulator_parts_lens::lens::bridge::Wiring {
                 registers: wire!(resources, id, registers, BridgeRegisters),
@@ -178,7 +188,14 @@ fn i2c_motor_bridge(builder: Builder<'_>, model: Model) -> Result<Built, String>
                 gpio: resources.pads(&gpio)?,
                 clock_irq: line(clock_irq)?,
             },
-        )?)
+        )?;
+        if let Some(optics) = optics {
+            if let Some(nd) = &optics.nd {
+                bridge.attach_nd(wire!(resources, id, nd, Aperture));
+            }
+            bridge.attach_aperture(wire!(resources, id, optics.output, Aperture), optics.positions)?;
+        }
+        Box::new(bridge)
     }))
 }
 
@@ -245,6 +262,7 @@ fn spi_endpoint(
             position,
             optics,
             focus,
+            nd,
         } => {
             let options: Box<fujimod_emulator_parts_lens::lens::Options> = decode(options)?;
             let mut lens = LensUnit::new(
@@ -264,6 +282,18 @@ fn spi_endpoint(
                     optics.positions,
                 )?;
             }
+            if let Some(nd) = nd {
+                lens.attach_nd(
+                    fujimod_emulator_parts_lens::lens::NdOptions {
+                        register: nd.register,
+                        insert_mask: nd.insert_mask,
+                        remove_mask: nd.remove_mask,
+                        factor: nd.factor,
+                    },
+                    wire!(resources, id, nd.aperture, Aperture),
+                    wire!(resources, id, nd.transmission, Aperture),
+                )?;
+            }
             if let Some(focus) = focus {
                 lens.attach_focus(
                     wire!(resources, id, focus.output, Focus),
@@ -280,6 +310,22 @@ fn spi_endpoint(
         SerialEndpoint::Registers { options } => {
             let options: fujimod_emulator_parts_io::spi::RegisterOptions = decode(options)?;
             Box::new(RegisterFile::new(options)?)
+        }
+        SerialEndpoint::WakeRegisters {
+            options,
+            clock,
+            ticks_per_second,
+        } => {
+            use std::sync::{Arc, Mutex};
+            let options: fujimod_emulator_parts_io::spi::RegisterOptions = decode(options)?;
+            let alarm = Arc::new(Mutex::new(
+                fujimod_emulator_devices::exr2::wake_alarm::WakeAlarm::new(
+                    ticks_per_second,
+                    fujimod_emulator_devices::exr2::clock::POWER_HOLD_RELEASE_LIMIT_TICKS,
+                )?,
+            ));
+            resources.clock(&clock)?.attach_power(alarm.clone())?;
+            Box::new(crate::power_endpoint::PowerEndpoint::new(options, alarm)?)
         }
         SerialEndpoint::Panel { options } => {
             let options: fujimod_emulator_parts_io::spi::PanelOptions = decode(options)?;

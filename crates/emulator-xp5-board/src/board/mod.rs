@@ -3,21 +3,32 @@
 use fujimod_emulator_devices::graph::{DeviceGraph, DeviceWindow};
 use fujimod_emulator_devices::parts::controls::Controls;
 use fujimod_emulator_xp5_io::{
-    adc, discarded_read, gates, gpio, i2c, mailbox, memory_configuration, reset_handshake,
-    register_input, sd_controller_wrapper, timer, usb_connection_status, write_only_registers,
+    adc, connection_status, discarded_read, gates, gpio, mailbox, memory_configuration,
+    register_input, reset_handshake, sd_controller_wrapper, timer, write_only_registers,
 };
 use fujimod_emulator_xp5_display::{display, panel_clock, panel_serial};
-use fujimod_emulator_xp5_storage::{flash_storage, flash_storage_controller, flash_storage_dma};
+use fujimod_emulator_xp5_storage::{
+    flash_storage,
+    flash_storage_controller,
+    flash_storage_dma,
+    nand_controller,
+};
 use fujimod_emulator_xp5_imaging::serial_sink;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+pub mod audio;
 pub mod clocks;
+pub mod codec;
 pub mod general_dma;
+pub mod i2c;
 pub mod imaging;
+pub mod jpeg;
 pub mod lz;
 pub mod renderer;
 pub mod serial;
 pub mod sd;
+pub mod uart;
+pub mod usb;
 
 pub struct Companion {
     pub pins: mailbox::Pins,
@@ -30,8 +41,10 @@ pub struct Resources {
     pub clocks: fujimod_emulator_devices::xp5::panel_clocks::Clocks,
     pub companion: Option<Companion>,
     /// Verified and decoded image backing, shared by aperture, controller and DMA.
-    pub storage: Option<Arc<Mutex<flash_storage::Storage>>>,
+    pub storage: Option<flash_storage::Medium>,
     pub displays: BTreeMap<u64, display::Config>,
+    /// Extended-timer PWM words, read by the IBIS stage model behind input capture.
+    pub pwm: fujimod_emulator_xp5_io::timer::PwmOutputs,
 }
 fn register_with_resources(
     bus: &mut DeviceGraph,
@@ -71,7 +84,7 @@ fn register_with_resources(
         }
         "sd-interface" => {
             if window.size != 8 || !window.options.is_empty() {return Err("Invalid SD interface window".into());}
-            bus.register(window.base,window.size,Box::new(fujimod_emulator_xp5_io::sd_interface::Interface::new(window.base)?))?;
+            bus.register(window.base,window.size,Box::new(fujimod_emulator_xp5_io::sd_interface::Interface::for_slot(window.base, resources.sd.get(&(window.base & !0xfff)).map(|slot| slot.contacts.clone()))?))?;
         }
         "sd-controller-wrapper" => {
             if window.size != 4
@@ -107,6 +120,7 @@ fn register_with_resources(
             )?;
         }
         "sdhci" => sd::register(bus, window, &mut resources.sd, &resources.pins)?,
+        "sdhci-uhs2" => sd::register_uhs2(bus, window, &resources.sd)?,
         "boot-control" => {
             if window.base != 0xff90e000 || window.size != 4 {
                 return Err("invalid boot-control source window".into());
@@ -137,19 +151,6 @@ fn register_with_resources(
                 )),
             )?;
         }
-        "input-capture" => {
-            if window.size != 0x1000 {
-                return Err("invalid input-capture window size".into());
-            }
-            if window.options.keys().any(|key| key != "dma_transmit") {
-                return Err("invalid input-capture option".into());
-            }
-            bus.register(
-                window.base,
-                window.size,
-                Box::new(fujimod_emulator_xp5_io::input_capture::InputCapture::new(window.base)?),
-            )?;
-        }
         "discarded-read" => {
             if !window.options.is_empty() {
                 return Err("discarded-read takes no options".into());
@@ -164,69 +165,53 @@ fn register_with_resources(
             if !window.options.is_empty() {
                 return Err("USB connection-status takes no options".into());
             }
+            // Bit 0 is set while a USB cable or jig is attached.
             bus.register(
                 window.base,
                 window.size,
-                Box::new(usb_connection_status::UsbConnectionStatus::new(
+                Box::new(connection_status::ConnectionStatus::new(
+                    "usb-connection-status",
                     window.base,
                     window.size,
+                    true,
                 )?),
             )?;
         }
-        "i2c-idle" => {
-            if window.base != 0xff926000 || window.size != 0x1000 {
-                return Err("invalid idle I2C window".into());
+        "usb-device-controller" => {
+            bus.register(window.base, window.size, Box::new(usb::controller(window)?))?;
+        }
+        "usb-phy" => {
+            bus.register(window.base, window.size, Box::new(usb::phy(window)?))?;
+        }
+        "hdmi-hot-plug-status" => {
+            if window.options.keys().any(|key| key != "connected_level") {
+                return Err("unknown HDMI hot-plug status option".into());
             }
-            if window.options.keys().any(|key| key != "idle_lines") {
-                return Err("unknown idle I2C option".into());
-            }
-            let idle_lines = window
+            let connected_level = match window
                 .options
-                .get("idle_lines")
+                .get("connected_level")
                 .and_then(toml::Value::as_integer)
-                .and_then(|value| u32::try_from(value).ok())
-                .ok_or("idle I2C requires idle_lines")?;
+            {
+                Some(0) => false,
+                Some(1) => true,
+                _ => return Err("HDMI hot-plug status requires connected_level 0 or 1".into()),
+            };
             bus.register(
                 window.base,
                 window.size,
-                Box::new(i2c::IdleI2c::new(window.base, idle_lines)?),
+                Box::new(connection_status::ConnectionStatus::new(
+                    "hdmi-hot-plug-status",
+                    window.base,
+                    window.size,
+                    connected_level,
+                )?),
             )?;
         }
-        "i2c-register-clients" => {
-            if !matches!(window.base, 0xff925000 | 0xff926000)
-                || window.size != 0x1000 || window.options.keys().any(|key| {
-                !matches!(key.as_str(), "irq" | "idle_lines" | "addresses" | "writable_registers")
-            }) {
-                return Err("invalid register-client I2C window or options".into());
-            }
-            let integer = |key: &str| -> Result<u32, String> {
-                window.options.get(key)
-                    .and_then(toml::Value::as_integer)
-                    .and_then(|value| u32::try_from(value).ok())
-                    .ok_or_else(|| format!("register-client I2C requires {key}"))
-            };
-            let bytes = |key: &str| -> Result<Vec<u8>, String> {
-                window.options.get(key)
-                    .and_then(toml::Value::as_array)
-                    .ok_or_else(|| format!("register-client I2C requires {key}"))?
-                    .iter().map(|value| {
-                        value.as_integer().and_then(|number| u8::try_from(number).ok())
-                            .ok_or_else(|| format!("invalid register-client I2C {key}"))
-                    }).collect()
-            };
-            bus.register(window.base, window.size, Box::new(
-                i2c::RegisterClientsI2c::new(window.base, integer("irq")?,
-                    integer("idle_lines")?, bytes("addresses")?, bytes("writable_registers")?)?
-            ))?;
-        }
-        "battery-i2c" => {
-            if window.base != 0xff925000 || window.size != 0x1000 {
-                return Err("invalid battery I2C1 window".into());
-            }
+        "i2c-controller" => {
             bus.register(
                 window.base,
                 window.size,
-                Box::new(i2c::BatteryI2c::default()),
+                Box::new(i2c::build(window.base, window.size, &window.options)?),
             )?;
         }
         "soc-temperature" => {
@@ -297,14 +282,100 @@ fn register_with_resources(
                 )?),
             )?;
         }
+        "pl011" => {
+            bus.register(window.base, window.size, Box::new(uart::port(window)?))?;
+        }
+        "bringup-stub" => {
+            let options: fujimod_emulator_xp5_io::bringup_stub::Options =
+                toml::Value::Table(window.options.clone()).try_into().map_err(|e| format!("bring-up stub options: {e}"))?;
+            bus.register(
+                window.base,
+                window.size,
+                Box::new(fujimod_emulator_xp5_io::bringup_stub::BringupStub::new(window.base, window.size, options)?),
+            )?;
+        }
+        "completion-stub" => {
+            let options: fujimod_emulator_xp5_io::completion_stub::Options =
+                toml::Value::Table(window.options.clone()).try_into().map_err(|e| format!("completion stub options: {e}"))?;
+            // XP5 board time is in nanoseconds.
+            let stub = fujimod_emulator_xp5_io::completion_stub::CompletionStub::new(
+                window.base,
+                window.size,
+                options,
+                1000,
+            )?;
+            if window.base == fujimod_emulator_xp5_imaging::imaging::mix::MIX_BASE && window.size == 0x1000 {
+                // MIX 0xffd22000: the same stub that, with XT5_STILL_PATH=real, also writes the
+                // HDR blend and composite (emulator-xp5-imaging imaging_mix.rs). Same device
+                // name and checkpoint, so the manifest and snapshots are unchanged.
+                let mix = fujimod_emulator_xp5_imaging::imaging::mix::Mix::new(stub);
+                bus.register(
+                    window.base,
+                    window.size,
+                    Box::new(if fujimod_emulator_imaging::frame::still_path_real() {
+                        mix.with_still_path()
+                    } else {
+                        mix
+                    }),
+                )?;
+            } else {
+                bus.register(window.base, window.size, Box::new(stub))?;
+            }
+        }
+        "imaging-fcnv" => {
+            // FCNV 0xffd26000: the completion stub that also converts YCbCr 4:2:2 to RGB
+            // (emulator-xp5-imaging imaging_fcnv.rs).
+            if window.base != 0xffd26000 || window.size != 0x1000 {
+                return Err("invalid imaging-fcnv window".into());
+            }
+            let options: fujimod_emulator_xp5_io::completion_stub::Options =
+                toml::Value::Table(window.options.clone()).try_into().map_err(|e| format!("imaging-fcnv options: {e}"))?;
+            let stub = fujimod_emulator_xp5_io::completion_stub::CompletionStub::new(
+                window.base,
+                window.size,
+                options,
+                1000,
+            )?;
+            bus.register(window.base, window.size, Box::new(fujimod_emulator_xp5_imaging::imaging::fcnv::Fcnv::new(stub)))?;
+        }
+        "imaging-tnr" => {
+            // TNR 0xffd24000: the completion stub that, with XT5_MOVIE_PATH=real, also copies
+            // the current picture to the encoder input (emulator-xp5-imaging imaging_movie.rs).
+            // Registered here, in manifest order, so the device graph matches snapshots taken
+            // when the window was a plain completion stub.
+            if window.base != 0xffd24000 || window.size != 0x1000 {
+                return Err("invalid imaging-tnr window".into());
+            }
+            let options: fujimod_emulator_xp5_io::completion_stub::Options =
+                toml::Value::Table(window.options.clone()).try_into().map_err(|e| format!("imaging-tnr options: {e}"))?;
+            let stub = fujimod_emulator_xp5_io::completion_stub::CompletionStub::new(
+                window.base,
+                window.size,
+                options,
+                1000,
+            )?;
+            let tnr = fujimod_emulator_xp5_imaging::imaging::movie::Tnr::new(stub);
+            bus.register(
+                window.base,
+                window.size,
+                Box::new(if fujimod_emulator_imaging::frame::movie_path_real() {
+                    tnr.with_movie_path()
+                } else {
+                    tnr
+                }),
+            )?;
+        }
         "write-only-registers" => {
             if window
                 .options
                 .keys()
-                .any(|option| !matches!(option.as_str(), "width" | "allowed_values"))
+                .any(|option| !matches!(option.as_str(), "width" | "allowed_values" | "readback"))
             {
-                return Err("write-only-registers accepts only width and allowed_values".into());
+                return Err(
+                    "write-only-registers accepts only width, allowed_values and readback".into(),
+                );
             }
+            let readback = window.options.get("readback").and_then(toml::Value::as_bool) == Some(true);
             let width = match window.options.get("width") {
                 None => 4,
                 Some(value) => value.as_integer()
@@ -329,15 +400,16 @@ fn register_with_resources(
                     Some(values)
                 }
             };
+            let registers = write_only_registers::WriteOnlyRegisters::new(
+                window.base,
+                window.size,
+                width,
+                allowed_values,
+            )?;
             bus.register(
                 window.base,
                 window.size,
-                Box::new(write_only_registers::WriteOnlyRegisters::new(
-                    window.base,
-                    window.size,
-                    width,
-                    allowed_values,
-                )?),
+                Box::new(if readback { registers.with_readback() } else { registers }),
             )?;
         }
         "audio-spi-sink" => {
@@ -367,6 +439,9 @@ fn register_with_resources(
         }
         "clock-banks" => clocks::register(bus, window.base, window.size, &window.options)?,
         "lz" => lz::register(bus, window.base, window.size)?,
+        "jpeg-encoder" => jpeg::register(bus, window)?,
+        "jpeg-decoder" => jpeg::register_decoder(bus, window)?,
+        "xp5-codec" => codec::register(bus, window)?,
         "panel-spi" => {
             if window.base != 0xff919000 || window.size != 0x1000 {
                 return Err("invalid SPI9 panel window".into());
@@ -440,7 +515,7 @@ fn register_with_resources(
             bus.register(
                 window.base,
                 window.size,
-                Box::new(timer::Timer::extended(window.base)),
+                Box::new(timer::Timer::extended(window.base).with_pwm_outputs(resources.pwm.clone())),
             )?;
         }
         "timer" | "timer-focus-capture" => {
@@ -489,9 +564,23 @@ fn register_with_resources(
             if window
                 .options
                 .keys()
-                .any(|k| !matches!(k.as_str(), "input_irqs" | "feedback" | "initial_outputs"))
+                .any(|k| {
+                    !matches!(
+                        k.as_str(),
+                        "input_irqs" | "companion_input_irqs" | "feedback" | "initial_outputs" | "initial_inputs" | "pad_model"
+                    )
+                })
             {
                 return Err("unknown GPIO option".into());
+            }
+            if let Some(model) = window.options.get("pad_model") {
+                if window.kind != "gpio" {
+                    return Err("pad_model belongs on the gpio window".into());
+                }
+                let model: fujimod_emulator_devices::xp5::pins::PadModel =
+                    serde_json::from_value(serde_json::to_value(model).map_err(|e| e.to_string())?)
+                        .map_err(|e| format!("GPIO pad_model: {e}"))?;
+                resources.pins.lock().unwrap().pad_model = model;
             }
             let feedback = window
                 .options
@@ -502,6 +591,37 @@ fn register_with_resources(
                 })
                 .transpose()?
                 .unwrap_or_default();
+            let initial_inputs: Vec<gpio::InitialInput> = window
+                .options
+                .get("initial_inputs")
+                .map(|v| {
+                    serde_json::from_value(serde_json::to_value(v).map_err(|e| e.to_string())?)
+                        .map_err(|e| format!("initial GPIO inputs: {e}"))
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let feedback: Vec<fujimod_emulator_devices::parts::gpio::Feedback> = feedback;
+            if initial_inputs.iter().any(|input| {
+                feedback
+                    .iter()
+                    .any(|wire| (wire.input_port, wire.input_pin) == (input.port, input.pin))
+            }) {
+                return Err("a GPIO pad driven by feedback cannot declare an initial input".into());
+            }
+            let companion_input_irqs: Vec<fujimod_emulator_devices::parts::gpio::InputIrq> = window
+                .options
+                .get("companion_input_irqs")
+                .map(|v| {
+                    serde_json::from_value(serde_json::to_value(v).map_err(|e| e.to_string())?)
+                        .map_err(|e| format!("GPIO companion input routes: {e}"))
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let companion_core = if companion_input_irqs.is_empty() {
+                0
+            } else {
+                companion.ok_or("GPIO companion input routes require the companion")?
+            };
             bus.register(
                 window.base,
                 window.size,
@@ -522,7 +642,6 @@ fn register_with_resources(
                             .transpose()?
                             .unwrap_or_default(),
                     )?
-                    .with_feedback(feedback)?
                     .with_initial_outputs(
                         window
                             .options
@@ -535,7 +654,10 @@ fn register_with_resources(
                             })
                             .transpose()?
                             .unwrap_or_default(),
-                    )?,
+                    )?
+                    .with_initial_inputs(initial_inputs)?
+                    .with_core_input_irqs(companion_core, companion_input_irqs)?
+                    .with_feedback(feedback)?,
                 ),
             )?;
         }
@@ -572,7 +694,7 @@ pub fn register_all(
         }
         if w.options
             .keys()
-            .any(|k| !matches!(k.as_str(), "erased_tail" | "seed"))
+            .any(|k| !matches!(k.as_str(), "erased_tail" | "seed" | "seed_file" | "medium"))
         {
             return Err("unknown flash storage option".into());
         }
@@ -586,12 +708,20 @@ pub fn register_all(
         if number("erased_tail")? != 255 {
             return Err("only explicit erased_tail=255 is supported".into());
         }
-        let mut s = resources
+        let medium_name = w
+            .options
+            .get("medium")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("nor");
+        let storage = resources
             .storage
             .as_ref()
-            .ok_or("aperture requires explicit flash storage")?
-            .lock()
-            .unwrap();
+            .ok_or("aperture requires explicit flash storage")?;
+        match (medium_name, storage) {
+            ("nor", flash_storage::Medium::Nor(_)) => {}
+            ("serial-nand", flash_storage::Medium::Nand(_)) => {}
+            _ => return Err("flash storage medium differs from the declared storage".into()),
+        }
         if let Some(seeds) = w.options.get("seed").and_then(toml::Value::as_array) {
             for seed in seeds {
                 let offset = seed
@@ -604,20 +734,58 @@ pub fn register_all(
                     .and_then(toml::Value::as_integer)
                     .and_then(|n| u8::try_from(n).ok())
                     .ok_or("invalid flash storage seed byte")?;
-                s.seed(offset, value)?;
+                storage.seed(offset, value)?;
             }
         }
-        drop(s);
+        // Optional file-backed seeds: `seed_file = [{ offset = N, path = "..." }]`. The file's
+        // bytes are written at the flash offset before the run starts (private inputs stay in
+        // the named file, never in the manifest).
+        if let Some(files) = w.options.get("seed_file").and_then(toml::Value::as_array) {
+            for file in files {
+                let offset = file
+                    .get("offset")
+                    .and_then(toml::Value::as_integer)
+                    .and_then(|n| u64::try_from(n).ok())
+                    .ok_or("invalid flash storage seed_file offset")?;
+                let path = file
+                    .get("path")
+                    .and_then(toml::Value::as_str)
+                    .ok_or("invalid flash storage seed_file path")?;
+                // Optional slice of the file: `file_offset` (default 0) and `length` (default: rest).
+                let slice = |key: &str| {
+                    file.get(key)
+                        .map(|v| {
+                            v.as_integer()
+                                .and_then(|n| usize::try_from(n).ok())
+                                .ok_or_else(|| format!("invalid flash storage seed_file {key}"))
+                        })
+                        .transpose()
+                };
+                let bytes = std::fs::read(path)
+                    .map_err(|error| format!("flash storage seed_file {path}: {error}"))?;
+                let start = slice("file_offset")?.unwrap_or(0);
+                let end = match slice("length")? {
+                    Some(length) => start.checked_add(length),
+                    None => Some(bytes.len()),
+                };
+                let part = end
+                    .and_then(|end| bytes.get(start..end))
+                    .ok_or_else(|| format!("flash storage seed_file {path}: slice outside the file"))?;
+                storage.seed_bytes(offset, part)?;
+            }
+        }
         bus.register(
             w.base,
             w.size,
-            Box::new(flash_storage::Aperture(resources.storage.clone().unwrap())),
+            Box::new(flash_storage::Aperture(storage.clone())),
         )?;
         aperture = true;
     }
     for w in windows
         .iter()
-        .filter(|w| w.kind != "flash-storage" && !general_dma::owns(&w.kind))
+        .filter(|w| {
+            w.kind != "flash-storage" && !general_dma::owns(&w.kind) && !audio::owns(&w.kind)
+        })
     {
         match w.kind.as_str() {
             "imaging-serial-sink"
@@ -629,12 +797,17 @@ pub fn register_all(
             | "imaging-rifp"
             | "imaging-rifp-io"
             | "imaging-preview"
+            | "imaging-buffer"
+            | "imaging-table"
             | "imaging-input"
             | "imaging-reset"
             | "movdc"
             | "imaging-resize"
             | "imaging-statistics"
-            | "imaging-paf" => continue,
+            | "imaging-paf"
+            | "imaging-resz"
+            | "imaging-rzl2"
+            | "imaging-filter-scaler" => continue,
             "clock-banks" => {
                 let specialized: Vec<u64> = windows
                     .iter()
@@ -654,18 +827,31 @@ pub fn register_all(
                     .and_then(|n| u32::try_from(n).ok())
                     .filter(|n| *n <= 0xffffff)
                     .ok_or("flash storage-controller requires jedec_id")?;
-                let descriptor = flash_storage_controller::Descriptor::for_jedec(jedec)?;
-                bus.register(
-                    w.base,
-                    w.size,
-                    Box::new(flash_storage_controller::Controller::new(
-                        resources
-                            .storage
-                            .clone()
-                            .ok_or("controller requires flash storage aperture")?,
-                        descriptor,
-                    )),
-                )?;
+                match resources
+                    .storage
+                    .clone()
+                    .ok_or("controller requires flash storage aperture")?
+                {
+                    flash_storage::Medium::Nor(storage) => {
+                        let part = flash_storage_controller::Part::from_jedec(jedec)?;
+                        bus.register(
+                            w.base,
+                            w.size,
+                            Box::new(flash_storage_controller::Controller::new(storage, part)),
+                        )?;
+                    }
+                    flash_storage::Medium::Nand(storage) => {
+                        // The X-E5 part identifies as W25N01JW-family 0xEFDC21.
+                        if jedec != 0xefdc21 {
+                            return Err("only 0xefdc21 serial-NAND geometry is supported".into());
+                        }
+                        bus.register(
+                            w.base,
+                            w.size,
+                            Box::new(nand_controller::NandController::new(storage, jedec)),
+                        )?;
+                    }
+                }
             }
             "flash-storage-dma" => {
                 if w.base != 0xff939000 || w.size != 0x1000 {
@@ -690,7 +876,11 @@ pub fn register_all(
         windows,
         resources.companion.as_ref().map(|c| c.pins.companion),
         resources.pins.clone(),
+        resources.pwm.clone(),
+        // Only a declared aperture exposes the flash backing on the bus.
+        resources.storage.as_ref().filter(|_| aperture),
     )?;
+    audio::register_all(bus, windows)?;
     // Sensor command completion changes the receiver's active source. No
     // periodic polling deadline is needed to observe that causal edge.
     let sensors: Vec<_> = windows

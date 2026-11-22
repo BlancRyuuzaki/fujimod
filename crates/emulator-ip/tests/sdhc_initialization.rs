@@ -19,6 +19,9 @@ fn options(protocol: Protocol, initialization_fault: InitializationFault) -> Opt
         initialization_fault,
         high_speed: false,
         ram_banks: vec![],
+        dram_alias: true,
+        address_high: None,
+        speed_dividers: None,
         capabilities_1: None,
         initialized_by_boot_rom: false,
         supply: None,
@@ -121,6 +124,29 @@ fn constructor_json_defaults_to_no_fault_and_rejects_unknown_policies() {
     assert_eq!(faulty.initialization_fault, InitializationFault::RejectCmd8);
     json["initialization_fault"] = "unsupported".into();
     assert!(serde_json::from_value::<Options>(json).is_err());
+}
+
+#[test]
+fn cmd8_fault_after_two_responses_survives_checkpoint() {
+    let (mut host, _, mut ram) = host(Protocol::Sdhc, InitializationFault::RejectCmd8OnceAfter(2));
+    setup(&mut host, &mut ram, Protocol::Sdhc);
+    for _ in 0..2 {
+        command(&mut host, &mut ram, 0x081a0000, 0x1aa);
+        due(&mut host, &mut ram);
+        assert_eq!(read(&mut host, &mut ram, 0x30, 2), 1);
+        assert_eq!(read(&mut host, &mut ram, 0x10, 4), 0x1aa);
+    }
+    let saved = host.checkpoint().unwrap();
+    for _ in 0..2 {
+        command(&mut host, &mut ram, 0x081a0000, 0x1aa);
+        due(&mut host, &mut ram);
+        assert_eq!(read(&mut host, &mut ram, 0x30, 2), 0x8000);
+        assert_eq!(read(&mut host, &mut ram, 0x32, 2), 1);
+        command(&mut host, &mut ram, 0x081a0000, 0x1aa);
+        due(&mut host, &mut ram);
+        assert_eq!(read(&mut host, &mut ram, 0x30, 2), 1);
+        host.restore_checkpoint(&saved).unwrap();
+    }
 }
 
 #[test]

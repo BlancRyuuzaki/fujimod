@@ -1,4 +1,5 @@
 //! Python client and transitional devices on the shared runtime.
+use fujimod_catalog_configuration::RunEngine;
 mod boot;
 mod checkpoint;
 mod context;
@@ -40,6 +41,8 @@ fn json<T: serde::de::DeserializeOwned>(value: &str) -> PyResult<T> {
     serde_json::from_str(value).map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
+// One value per board, so the variant size difference costs nothing.
+#[allow(clippy::large_enum_variant)]
 enum Backend {
     Graph(fujimod_emulator_session::Session),
     Xp5(Box<xp5::Opened>),
@@ -93,6 +96,24 @@ pub struct Board {
     last_continuation_stop: Option<fujimod_emulator::board::continuation::ContinuationStop>,
 }
 impl Board {
+    /// A watched contact queue ends a run at its next change.
+    fn watch_contacts(&mut self, watched: bool) -> PyResult<()> {
+        if self.driver.is_some() {
+            return if watched {
+                Err(error("Contact watches require a session run".into()))
+            } else {
+                Ok(())
+            };
+        }
+        match self.session_mut()?.contact_driver.as_mut() {
+            Some(driver) => driver.set_watched(watched),
+            None if watched => {
+                return Err(error("physical input automation is not configured".into()));
+            }
+            None => {}
+        }
+        Ok(())
+    }
     fn begin_continuation(
         &mut self,
         stores: Option<Vec<(u64, u64)>>,
@@ -218,10 +239,10 @@ impl Board {
 impl Drop for Board {
     fn drop(&mut self) {
         self.clear_observation();
-        if let Some(mut driver) = self.driver.take() {
-            if let Ok(session) = self.session() {
-                let _ = session.board.harness_end(&mut driver);
-            }
+        if let Some(mut driver) = self.driver.take()
+            && let Ok(session) = self.session()
+        {
+            let _ = session.board.harness_end(&mut driver);
         }
     }
 }
@@ -243,13 +264,18 @@ impl Board {
         Ok(self.board()?.execution_policy().name())
     }
     #[staticmethod]
-    #[pyo3(signature=(definition, storage_image=None, card_files=Vec::new()))]
+    #[pyo3(signature=(definition, storage_image=None, card_files=Vec::new(), card_media=Vec::new()))]
     fn from_xp4(
         definition: &str,
         storage_image: Option<Vec<u8>>,
         card_files: Vec<(String, Vec<u8>)>,
+        card_media: Vec<(usize, PyRef<'_, CardMedium>)>,
     ) -> PyResult<Self> {
-        let session = xp4_backend::open(definition, storage_image, card_files)?;
+        let card_media = card_media
+            .into_iter()
+            .map(|(host, medium)| (host, medium.0.clone()))
+            .collect();
+        let session = xp4_backend::open(definition, storage_image, card_files, card_media)?;
         Ok(Self {
             driver: None,
             memory_watch: None,
@@ -268,7 +294,7 @@ impl Board {
         Ok(xp4::Xp4 { owner: slf.into() })
     }
     #[pyo3(signature=(entries, quota=4, edge_limit=1<<20, state_limit=1<<16,
-                      return_sites=None, quota_per_edge=false))]
+                      return_sites=None, quota_per_edge=false, instruction_ranges=None))]
     #[allow(clippy::too_many_arguments)]
     fn function_watch_begin(
         &mut self,
@@ -278,6 +304,7 @@ impl Board {
         state_limit: usize,
         return_sites: Option<Vec<u64>>,
         quota_per_edge: bool,
+        instruction_ranges: Option<Vec<(u64, u64)>>,
     ) -> PyResult<()> {
         if self.driver.is_some() {
             return Err(error("Function watch requires a whole-board run".into()));
@@ -297,7 +324,7 @@ impl Board {
         self.function_watch_end()?;
         self.function_watch = Some(
             self.board()?
-                .function_watch_begin(recorder, maps)
+                .function_watch_begin(recorder, maps, instruction_ranges)
                 .map_err(error)?,
         );
         Ok(())
@@ -307,10 +334,14 @@ impl Board {
             .as_ref()
             .map(|watch| {
                 watch.check().map_err(error)?;
-                fujimod_python_base::observation::snapshot(
+                let result = fujimod_python_base::observation::snapshot(
                     py,
                     &watch.recorder.borrow().snapshot(),
-                )
+                )?;
+                if let Some(counts) = &watch.range_counts {
+                    result.set_item("instruction_ranges", counts.borrow().snapshot())?;
+                }
+                Ok(result)
             })
             .transpose()
     }
@@ -342,8 +373,16 @@ impl Board {
         serde_json::to_string(&batch).map_err(|e| error(e.to_string()))
     }
 
-    #[pyo3(signature=(ranges,limit=1_000_000))]
-    fn memory_watch_begin(&mut self, ranges: Vec<(u64, u64)>, limit: usize) -> PyResult<()> {
+    #[pyo3(signature=(ranges,limit=1_000_000,sample_addresses=None,sample_offsets=None,sample_bounds=None,exclude_pcs=None))]
+    fn memory_watch_begin(
+        &mut self,
+        ranges: Vec<(u64, u64)>,
+        limit: usize,
+        sample_addresses: Option<Vec<u64>>,
+        sample_offsets: Option<Vec<u64>>,
+        sample_bounds: Option<(u64, u64)>,
+        exclude_pcs: Option<Vec<(u64, u64)>>,
+    ) -> PyResult<()> {
         if self.memory_watch.is_some() {
             return Err(error("Another memory watch is active".into()));
         }
@@ -352,7 +391,45 @@ impl Board {
                 .map_err(|e| error(e.to_string()))?;
         self.memory_watch = Some(
             self.board()?
-                .memory_watch_begin(ranges, limit, maps)
+                .memory_watch_begin_with_samples(
+                    ranges,
+                    limit,
+                    maps,
+                    sample_addresses.unwrap_or_default(),
+                    sample_offsets.unwrap_or_default(),
+                    sample_bounds,
+                )
+                .map_err(error)?,
+        );
+        if let Some(spans) = exclude_pcs {
+            let excluded = self
+                .memory_watch
+                .as_ref()
+                .unwrap()
+                .records
+                .borrow_mut()
+                .exclude_pcs(spans);
+            if let Err(message) = excluded {
+                let mut watch = self.memory_watch.take().unwrap();
+                self.board()?.memory_watch_end(&mut watch).map_err(error)?;
+                return Err(error(message));
+            }
+        }
+        Ok(())
+    }
+    /// Observe bounded CPU writes, without reads, including on AArch64
+    /// cores. `memory_watch_state` and `memory_watch_end` read and end it.
+    #[pyo3(signature=(ranges,limit=1_000_000))]
+    fn memory_write_watch_begin(&mut self, ranges: Vec<(u64, u64)>, limit: usize) -> PyResult<()> {
+        if self.memory_watch.is_some() {
+            return Err(error("Another memory watch is active".into()));
+        }
+        let maps =
+            serde_json::from_value(self.session()?.definition["execution"]["mappings"].clone())
+                .map_err(|e| error(e.to_string()))?;
+        self.memory_watch = Some(
+            self.board()?
+                .memory_write_watch_begin(ranges, limit, maps)
                 .map_err(error)?,
         );
         Ok(())
@@ -365,15 +442,20 @@ impl Board {
         let value = self
             .memory_watch
             .as_ref()
-            .map(|w| w.records.borrow().state())
-            .unwrap_or_else(
-                || serde_json::json!({"enabled":false,"ranges":[],"records":[],"violation":null}),
-            );
-        py.import("json")?
-            .call_method1("loads", (value.to_string(),))
+            .map(|w| {
+                w.records.borrow().state_json(
+                    (!w.is_live()).then_some("boot restarted while the memory watch was active"),
+                )
+            })
+            .unwrap_or_else(|| {
+                r#"{"enabled":false,"ranges":[],"records":[],"violation":null}"#.to_owned()
+            });
+        py.import("json")?.call_method1("loads", (value,))
     }
     fn memory_watch_end(&mut self) -> PyResult<()> {
-        if let Some(mut watch) = self.memory_watch.take() {
+        if let Some(mut watch) = self.memory_watch.take()
+            && watch.is_live()
+        {
             self.board()?.memory_watch_end(&mut watch).map_err(error)?;
         }
         Ok(())
@@ -384,12 +466,22 @@ impl Board {
                 "Use DriverHarness.observe during an isolated call".into(),
             ));
         }
-        if let Some(mut points) = self.instruction_points.remove(&core) {
-            self.board()?
-                .instruction_points_end(core, &mut points)
-                .map_err(error)?;
-        }
-        if !addresses.is_empty() {
+        if addresses.is_empty() {
+            if let Some(mut points) = self.instruction_points.remove(&core) {
+                self.board()?
+                    .instruction_points_end(core, &mut points)
+                    .map_err(error)?;
+            }
+        } else if let Some(mut points) = self.instruction_points.remove(&core) {
+            let board = self.board()?;
+            if let Err(failure) = board.instruction_points_update(core, &mut points, addresses) {
+                board
+                    .instruction_points_end(core, &mut points)
+                    .map_err(error)?;
+                return Err(error(failure));
+            }
+            self.instruction_points.insert(core, points);
+        } else {
             let points = self
                 .board()?
                 .instruction_points_begin(core, addresses)
@@ -473,15 +565,8 @@ impl Board {
         continue_refusals: bool,
         engine: &str,
     ) -> PyResult<Self> {
-        let engine = match engine {
-            "unicorn" => factory::Engine::Unicorn,
-            "hypervisor" => factory::Engine::Hypervisor,
-            _ => {
-                return Err(PyValueError::new_err(
-                    "engine must be unicorn or hypervisor",
-                ));
-            }
-        };
+        let engine: RunEngine = engine.parse()
+            .map_err(|e| PyValueError::new_err(format!("invalid engine: {e}")))?;
         let mode = match execution_mode {
             "strict" => Mode::Strict,
             "discovery" => Mode::Discovery,
@@ -506,7 +591,7 @@ impl Board {
                 graph
                     .processors
                     .iter()
-                    .filter_map(|p| p.rprofile)
+                    .filter_map(|p| p.rprofile.clone())
                     .flat_map(|p| [p.tcm.atcm.bytes, p.tcm.btcm.bytes]),
             )
             .try_fold(0usize, |sum, bytes| {
@@ -524,17 +609,38 @@ impl Board {
                 ));
             }
             return Self::xp5_graph(
-                graph, devices, assets, read_limit, mode, continue_refusals, engine,
+                graph,
+                devices,
+                assets,
+                read_limit,
+                mode,
+                continue_refusals,
+                engine,
                 serde_json::json!({"execution":json::<serde_json::Value>(execution)?,"devices":json::<serde_json::Value>(devices)?}),
             );
         }
-        if json::<serde_json::Value>(devices)?.get("kind").and_then(serde_json::Value::as_str) == Some("xpp") {
-            if !matches!(engine, factory::Engine::Unicorn) || !models.is_empty()
-                || json::<serde_json::Value>(scene)? != serde_json::json!({}) {
-                return Err(PyValueError::new_err("X-Processor Pro requires its native devices and explicit assets"));
+        if json::<serde_json::Value>(devices)?
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("xpp")
+        {
+            if !models.is_empty()
+                || json::<serde_json::Value>(scene)? != serde_json::json!({})
+            {
+                return Err(PyValueError::new_err(
+                    "X-Processor Pro requires its native devices and explicit assets",
+                ));
             }
-            return Self::xpp_graph(graph, devices, assets, read_limit, mode, continue_refusals,
-                serde_json::json!({"execution":json::<serde_json::Value>(execution)?,"devices":json::<serde_json::Value>(devices)?}));
+            return Self::xpp_graph(
+                graph,
+                devices,
+                assets,
+                read_limit,
+                mode,
+                engine,
+                continue_refusals,
+                serde_json::json!({"execution":json::<serde_json::Value>(execution)?,"devices":json::<serde_json::Value>(devices)?}),
+            );
         }
         if json::<serde_json::Value>(devices)?
             .get("kind")
@@ -595,6 +701,8 @@ impl Board {
                     contact_driver: None,
                     nodes: BTreeMap::new(),
                     contacts: BTreeMap::new(),
+                    power_cycle: None,
+                    window_action: None,
                     recording_frames: Default::default(),
                     resources: Default::default(),
                 })),
@@ -656,11 +764,7 @@ impl Board {
         let mut bus = Bus::from_graph(mode, built.graph).map_err(error)?;
         bus.continue_refusals(continue_refusals).map_err(error)?;
         let mut board = graph
-            .build(
-                factory::Options::new(engine),
-                bus,
-                None,
-            )
+            .build(factory::Options::new(engine), bus, None)
             .map_err(error)?;
         for controller in built.core_interrupts {
             board
@@ -683,6 +787,8 @@ impl Board {
                 contact_driver: None,
                 nodes: built.node_ids,
                 contacts: built.contacts,
+                power_cycle: None,
+                window_action: None,
                 recording_frames: Default::default(),
                 resources: built.resources,
             })),
@@ -706,10 +812,10 @@ impl Board {
     }
     fn __clear__(&mut self) {
         self.clear_observation();
-        if let Some(mut driver) = self.driver.take() {
-            if let Ok(session) = self.session() {
-                let _ = session.board.harness_end(&mut driver);
-            }
+        if let Some(mut driver) = self.driver.take()
+            && let Ok(session) = self.session()
+        {
+            let _ = session.board.harness_end(&mut driver);
         }
         if let Some(Backend::Xp4(session)) = &self.backend {
             session.__clear__();
@@ -768,11 +874,8 @@ impl Board {
         {
             return Err(PyValueError::new_err("isolated call is already active"));
         }
-        if self.session()?.definition["devices"]["kind"] != "none" {
-            return Err(PyValueError::new_err(
-                "Checked routines require a device-free board",
-            ));
-        }
+        // The checked caller admits device access only inside the windows
+        // the options declare; a board with devices and none declared refuses.
         let result=fujimod_emulator::board::harness::arm64::checked::checked_call_with(self.board_mut()?,json(options)?,|hit,snapshots| {
             let callback=callback.as_ref().ok_or("Missing dynamic stub callback")?;
             let snapshots=snapshots.iter().map(|(address,bytes)|(*address,PyBytes::new(py,bytes))).collect::<Vec<_>>();
@@ -829,6 +932,11 @@ impl Board {
     fn raise_irq(&mut self, core: usize, line: u32) -> PyResult<()> {
         self.board_mut()?.raise_irq(core, line).map_err(error)
     }
+    /// Apply an explicit external reset input to a processor core; releasing
+    /// it starts the core from its declared reset state.
+    fn reset_core(&mut self, core: usize, asserted: bool) -> PyResult<()> {
+        self.board_mut()?.reset_core(core, asserted).map_err(error)
+    }
     fn rprofile_identity(&self, core: usize, value: Option<u32>) -> PyResult<u32> {
         self.board()?
             .cpu(core)
@@ -853,6 +961,17 @@ impl Board {
     fn set_adc_samples(&mut self, node: &str, samples: Vec<u16>) -> PyResult<()> {
         self.session_mut()?
             .set_adc_samples(node, &samples)
+            .map_err(error)
+    }
+    fn gravity_g(&self, node: &str) -> PyResult<Vec<f64>> {
+        Ok(self.session()?.gravity_g(node).map_err(error)?.to_vec())
+    }
+    fn set_gravity_g(&mut self, node: &str, gravity: Vec<f64>) -> PyResult<()> {
+        let gravity: [f64; 3] = gravity
+            .try_into()
+            .map_err(|_| error("accelerometer gravity requires three components".into()))?;
+        self.session_mut()?
+            .set_gravity_g(node, gravity)
             .map_err(error)
     }
     fn configure_controls(&mut self, spec: &str) -> PyResult<()> {
@@ -895,6 +1014,7 @@ impl Board {
             .map_err(error)
     }
     fn control_state(&self) -> PyResult<String> {
+        self.board()?.track_contacts();
         serde_json::to_string(&self.session()?.control_state().map_err(error)?)
             .map_err(|e| error(e.to_string()))
     }
@@ -904,16 +1024,16 @@ impl Board {
             .map_err(error)
     }
     fn rotate_control(&mut self, id: &str, steps: i32) -> PyResult<()> {
-        let (node, cycles) = self.session()?.rotation(id, steps).map_err(error)?;
-        self.session_mut()?.rotate(&node, cycles).map_err(error)
+        let (node, edges) = self.session()?.rotation(id, steps).map_err(error)?;
+        self.session_mut()?
+            .rotate_edges(&node, edges)
+            .map_err(error)
     }
     fn touch_script(&mut self, node: &str, script: &str) -> PyResult<()> {
         self.session_mut()?
             .touch(
                 node,
-                &json::<Vec<fujimod_emulator_devices::parts::touch_input::ContactInput>>(
-                    script,
-                )?,
+                &json::<Vec<fujimod_emulator_devices::parts::touch_input::ContactInput>>(script)?,
             )
             .map_err(error)
     }
@@ -1019,6 +1139,9 @@ impl Board {
             })
             .transpose()
     }
+    fn frame_exposure(&self, node: &str) -> PyResult<Option<(u64, f64, f64)>> {
+        self.session()?.frame_exposure(node).map_err(error)
+    }
     fn frame_state(&self, node: &str) -> PyResult<String> {
         serde_json::to_string(&self.session()?.frame_state(node).map_err(error)?)
             .map_err(|e| error(e.to_string()))
@@ -1050,6 +1173,16 @@ impl Board {
             return Ok(session.now());
         }
         Ok(self.board()?.now())
+    }
+    /// Opt in to ending a run when a device deadline passes and every released
+    /// core is still waiting; `idle_stopped` reports that outcome.
+    fn set_idle_stop(&self, enabled: bool) -> PyResult<()> {
+        self.board()?.set_idle_stop(enabled);
+        Ok(())
+    }
+    #[getter]
+    fn idle_stopped(&self) -> PyResult<bool> {
+        Ok(self.board()?.idle_stopped())
     }
     #[getter]
     fn quiescent(&self) -> PyResult<bool> {
@@ -1106,8 +1239,10 @@ impl Board {
                     .ok_or_else(|| error("Read set names an absent device".into()))
             })
             .collect::<PyResult<Vec<_>>>()?;
-        serde_json::to_string(&serde_json::json!({"stores":reads.stores,"devices":names}))
-            .map_err(|e| error(e.to_string()))
+        serde_json::to_string(
+            &serde_json::json!({"stores":reads.stores,"devices":names,"contacts":reads.contacts}),
+        )
+        .map_err(|e| error(e.to_string()))
     }
     /// Return the first stop event from the most recent watched run.
     fn continuation_stop<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
@@ -1120,22 +1255,32 @@ impl Board {
                 range_index,
                 range,
                 address,
+                core,
                 change_confirmed,
             } => {
                 result.set_item("kind", "store")?;
                 result.set_item("range_index", range_index)?;
                 result.set_item("range", vec![range.0, range.1])?;
                 result.set_item("address", address)?;
+                result.set_item("core", core)?;
                 result.set_item("change_confirmed", change_confirmed)?;
             }
             fujimod_emulator::board::continuation::ContinuationStop::Device { id } => {
                 result.set_item("kind", "device")?;
                 result.set_item("id", id)?;
+                let name = self
+                    .session()?
+                    .nodes
+                    .iter()
+                    .find(|(_, node)| *node == id)
+                    .map(|(name, _)| name)
+                    .ok_or_else(|| error("Continuation stop names an absent device".into()))?;
+                result.set_item("device", name)?;
             }
         }
         Ok(Some(result))
     }
-    #[pyo3(signature = (count, quantum, pause_after=None, pause_at_tick=None, store_watches=None, device_watches=None))]
+    #[pyo3(signature = (count, quantum, pause_after=None, pause_at_tick=None, store_watches=None, device_watches=None, contact_watch=false))]
     fn run(
         slf: &Bound<'_, Self>,
         py: Python<'_>,
@@ -1145,6 +1290,7 @@ impl Board {
         pause_at_tick: Option<u64>,
         store_watches: Option<Vec<(u64, u64)>>,
         device_watches: Option<Vec<String>>,
+        contact_watch: bool,
     ) -> PyResult<bool> {
         {
             let owner = slf.try_borrow()?;
@@ -1153,6 +1299,7 @@ impl Board {
                     || pause_at_tick.is_some()
                     || store_watches.is_some()
                     || device_watches.is_some()
+                    || contact_watch
                 {
                     return Err(PyValueError::new_err(
                         "XP4 execution does not support pause boundaries",
@@ -1164,12 +1311,14 @@ impl Board {
         let mut owner = slf.try_borrow_mut()?;
         owner.last_continuation_stop = None;
         owner.begin_continuation(store_watches, device_watches)?;
+        owner.watch_contacts(contact_watch)?;
         let result = owner.run_graph(py, count, quantum, pause_after, pause_at_tick);
+        let unwatched = owner.watch_contacts(false);
         owner.last_continuation_stop = owner.board()?.continuation_stop();
         let cleanup = owner.board_mut()?.continuation_end().map_err(error);
-        result.and(cleanup)
+        result.and(unwatched).and(cleanup)
     }
-    #[pyo3(signature = (end, quantum, pause_after=None, pause_at_tick=None, store_watches=None, device_watches=None))]
+    #[pyo3(signature = (end, quantum, pause_after=None, pause_at_tick=None, store_watches=None, device_watches=None, contact_watch=false))]
     fn run_window(
         &mut self,
         py: Python<'_>,
@@ -1179,6 +1328,7 @@ impl Board {
         pause_at_tick: Option<u64>,
         store_watches: Option<Vec<(u64, u64)>>,
         device_watches: Option<Vec<String>>,
+        contact_watch: bool,
     ) -> PyResult<bool> {
         if self.driver.is_some() {
             return Err(error(
@@ -1187,6 +1337,7 @@ impl Board {
         }
         self.last_continuation_stop = None;
         self.begin_continuation(store_watches, device_watches)?;
+        self.watch_contacts(contact_watch)?;
         let result = run::window(
             py,
             self.session_mut()?,
@@ -1195,9 +1346,10 @@ impl Board {
             pause_after,
             pause_at_tick,
         );
+        let unwatched = self.watch_contacts(false);
         self.last_continuation_stop = self.board()?.continuation_stop();
         let cleanup = self.board_mut()?.continuation_end().map_err(error);
-        self.outcome(result).and(cleanup)
+        self.outcome(result).and(unwatched).and(cleanup)
     }
     fn reg_read(&self, core: usize, register: &str) -> PyResult<u64> {
         if let Some(Backend::Xp4(session)) = &self.backend {
@@ -1225,6 +1377,33 @@ impl Board {
             .coprocessor(json::<arm::Coprocessor>(selector)?, value)
             .map_err(error)
     }
+    /// Resolve a virtual address using the selected processor's current mappings.
+    fn translate(&self, core: usize, address: u64, access: &str) -> PyResult<u64> {
+        use fujimod_emulator_cpu::Access;
+        let access = match access {
+            "read" => Access::Read,
+            "write" => Access::Write,
+            "fetch" => Access::Fetch,
+            _ => return Err(PyValueError::new_err("invalid translation access")),
+        };
+        self.board()?.cpu(core).map_err(error)?.translate(address, access).map_err(error)
+    }
+    fn read_virtual<'py>(
+        &self, py: Python<'py>, core: usize, address: u64, size: usize,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        self.check_read(size)?;
+        let cpu = self.board()?.cpu(core).map_err(error)?;
+        let result = PyBytes::new_with(py, size, |bytes| {
+            cpu.read_virtual(address, fujimod_emulator_cpu::Access::Read, bytes)
+                .map_err(error)
+        })?;
+        fujimod_perf::add_bytes(fujimod_perf::ByteCounter::GuestToPythonBytes, size as u64);
+        Ok(result)
+    }
+    fn take_console(&mut self) -> PyResult<Vec<String>> {
+        Ok(self.board_mut()?.take_console())
+    }
+
     fn mem_read<'py>(
         &self,
         py: Python<'py>,
@@ -1236,16 +1415,25 @@ impl Board {
         if let Some(Backend::Xp4(session)) = &self.backend {
             let address = u32::try_from(address)
                 .map_err(|_| PyValueError::new_err("ARMv7-A virtual address exceeds 32 bits"))?;
-            return session.read_virtual(py, core, address, size);
+            let result = session.read_virtual(py, core, address, size)?;
+            fujimod_perf::add_bytes(fujimod_perf::ByteCounter::GuestToPythonBytes, size as u64);
+            return Ok(result);
         }
-        PyBytes::new_with(py, size, |out| {
+        let result = PyBytes::new_with(py, size, |out| {
             self.board()?.read_memory(core, address, out).map_err(error)
-        })
+        })?;
+        fujimod_perf::add_bytes(fujimod_perf::ByteCounter::GuestToPythonBytes, size as u64);
+        Ok(result)
     }
     fn mem_write(&self, core: usize, address: u64, bytes: &[u8]) -> PyResult<()> {
         self.board()?
             .write_memory(core, address, bytes)
-            .map_err(error)
+            .map_err(error)?;
+        fujimod_perf::add_bytes(
+            fujimod_perf::ByteCounter::PythonToGuestBytes,
+            bytes.len() as u64,
+        );
+        Ok(())
     }
     fn physical_read<'py>(
         &self,
@@ -1257,11 +1445,15 @@ impl Board {
         if let Some(Backend::Xp4(session)) = &self.backend {
             let address = usize::try_from(address)
                 .map_err(|_| PyValueError::new_err("Physical address exceeds host size"))?;
-            return session.read(py, address, size);
+            let result = session.read(py, address, size)?;
+            fujimod_perf::add_bytes(fujimod_perf::ByteCounter::GuestToPythonBytes, size as u64);
+            return Ok(result);
         }
-        PyBytes::new_with(py, size, |out| {
+        let result = PyBytes::new_with(py, size, |out| {
             self.board()?.read_physical(address, out).map_err(error)
-        })
+        })?;
+        fujimod_perf::add_bytes(fujimod_perf::ByteCounter::GuestToPythonBytes, size as u64);
+        Ok(result)
     }
     /// Read physical memory that an active wait observes but does not depend on.
     fn physical_inspect<'py>(
@@ -1303,9 +1495,21 @@ impl Board {
         if let Some(Backend::Xp4(session)) = &self.backend {
             let address = usize::try_from(address)
                 .map_err(|_| PyValueError::new_err("Physical address exceeds host size"))?;
-            return session.write(address, bytes);
+            session.write(address, bytes)?;
+            fujimod_perf::add_bytes(
+                fujimod_perf::ByteCounter::PythonToGuestBytes,
+                bytes.len() as u64,
+            );
+            return Ok(());
         }
-        self.board()?.write_physical(address, bytes).map_err(error)
+        self.board()?
+            .write_physical(address, bytes)
+            .map_err(error)?;
+        fujimod_perf::add_bytes(
+            fujimod_perf::ByteCounter::PythonToGuestBytes,
+            bytes.len() as u64,
+        );
+        Ok(())
     }
     fn input_level(&mut self, name: &str, high: bool) -> PyResult<()> {
         self.session_mut()?.logic_input(name, high).map_err(error)
@@ -1345,11 +1549,8 @@ impl Board {
     fn guest_profile(&self) -> PyResult<String> {
         serde_json::to_string(&self.board()?.guest_profile()).map_err(|e| error(e.to_string()))
     }
-    fn start_host_profile(&self) -> PyResult<()> {
-        self.board()?.start_host_profile().map_err(error)
-    }
-    fn host_profile(&self) -> PyResult<String> {
-        serde_json::to_string(&self.board()?.host_profile()).map_err(|e| error(e.to_string()))
+    fn exit_counters(&self) -> PyResult<String> {
+        serde_json::to_string(&self.board()?.exit_counters()).map_err(|e| error(e.to_string()))
     }
     fn encoder_cycles(&mut self, name: &str, cycles: i32) -> PyResult<()> {
         self.session_mut()?.rotate(name, cycles).map_err(error)
@@ -1554,10 +1755,7 @@ impl Board {
     }
     fn failure(&self, py: Python<'_>) -> PyResult<String> {
         if let Some(Backend::Xp4(session)) = &self.backend {
-            let state = session.state(py, false)?;
-            let failure = state
-                .get_item("failure")?
-                .ok_or_else(|| PyRuntimeError::new_err("XP4 state is missing failure"))?;
+            let failure = session.failure();
             return py
                 .import("json")?
                 .call_method1("dumps", (failure,))?
@@ -1575,15 +1773,23 @@ impl Board {
             .map_err(error)?;
         Ok((n.irq, n.undefined, n.data_abort, n.prefetch_abort))
     }
+    fn display_frame_count(&self, output: usize) -> PyResult<u64> {
+        self.board()?.display_frame_count(output).map_err(error)
+    }
     fn device_states(&self, kind: &str) -> PyResult<String> {
         serde_json::to_string(&self.board()?.device_states(kind).map_err(error)?)
             .map_err(|e| error(e.to_string()))
     }
-    fn device_fingerprints(&self, kind: &str) -> PyResult<String> {
-        serde_json::to_string(&self.board()?.device_fingerprints(kind).map_err(error)?)
+    fn device_state_values(&self, kind: &str) -> PyResult<String> {
+        serde_json::to_string(&self.board()?.device_state_values(kind).map_err(error)?)
             .map_err(|e| error(e.to_string()))
     }
-    fn device_buffer<'py>(&self, py: Python<'py>, kind: &str, name: &str) -> PyResult<Bound<'py, PyBytes>> {
+    fn device_buffer<'py>(
+        &self,
+        py: Python<'py>,
+        kind: &str,
+        name: &str,
+    ) -> PyResult<Bound<'py, PyBytes>> {
         let bytes = self.board()?.device_buffer(kind, name).map_err(error)?;
         Ok(PyBytes::new(py, &bytes))
     }
@@ -1616,6 +1822,57 @@ impl Board {
                 gpio.set_input(port, pin, high)
             })
             .map_err(error)
+    }
+    /// Change a declared register supplied by an X-Processor Pro I2C part.
+    /// Firmware sees the new value only through its normal I2C transactions.
+    fn xpp_i2c_part_input(
+        &mut self,
+        node: &str,
+        address: u16,
+        register: u8,
+        value: u16,
+    ) -> PyResult<()> {
+        let id = self.xpp_node(node)?;
+        let model_kind = self
+            .session()?
+            .definition
+            .get("devices")
+            .and_then(|devices| devices.get("nodes"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|nodes| {
+                nodes.iter().find(|candidate| {
+                    candidate.get("name").and_then(serde_json::Value::as_str) == Some(node)
+                })
+            })
+            .and_then(|candidate| candidate.get("model"))
+            .and_then(|model| model.get("kind"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| error(format!("XPP I2C model for node {node} is not declared")))?
+            .to_owned();
+        let result = match model_kind.as_str() {
+            "i2c" => self
+                .board_mut()?
+                .with_device_inputs::<
+                    fujimod_emulator_ip::dw_i2c::Controller<
+                        fujimod_emulator_xpp::i2c::Parts,
+                    >,
+                    _,
+                >(id, |controller, _| {
+                    controller.set_register_input(address, register, value)
+                }),
+            "xt20-touch-i2c" => self
+                .board_mut()?
+                .with_device_inputs::<fujimod_emulator_xpp::touch_xt20::Xt20TouchI2c, _>(
+                    id,
+                    |controller, _| controller.set_register_input(address, register, value),
+                ),
+            _ => {
+                return Err(error(format!(
+                    "XPP I2C input is unsupported for node {node} model {model_kind}"
+                )));
+            }
+        };
+        result.map_err(error)
     }
     /// Scale the scene light a device declares (1.0 = the declared scene) on
     /// the stopped board.
@@ -1699,6 +1956,10 @@ impl Board {
             })
             .collect())
     }
+    /// Digest a physical RAM range without routing a guest access.
+    fn range_digest(&self, address: u64, length: u64) -> PyResult<String> {
+        Ok(self.board()?.range_digest(address, length).to_string())
+    }
     fn state(&self, py: Python<'_>) -> PyResult<String> {
         if let Some(Backend::Xp4(session)) = &self.backend {
             return py
@@ -1716,9 +1977,37 @@ impl Board {
         }
         serde_json::to_string(&state).map_err(|e| error(e.to_string()))
     }
-    fn fingerprint(&self) -> PyResult<String> {
-        serde_json::to_string(&self.session()?.fingerprint().map_err(error)?)
+    /// Complete stopped-session state for direct comparison.
+    fn complete_state(&self) -> PyResult<BoardState> {
+        Ok(BoardState {
+            state: self.session()?.complete_state().map_err(error)?,
+        })
+    }
+}
+
+#[pyclass(module = "fujimod._native.emulator")]
+pub struct BoardState {
+    state: fujimod_emulator_session::SessionState,
+}
+#[pymethods]
+impl BoardState {
+    fn __eq__(&self, other: PyRef<'_, BoardState>) -> bool {
+        self.state == other.state
+    }
+    fn __ne__(&self, other: PyRef<'_, BoardState>) -> bool {
+        self.state != other.state
+    }
+    /// First structural difference, or None when the states are equal.
+    fn diff(&self, other: PyRef<'_, BoardState>) -> Option<String> {
+        self.state.diff(&other.state)
+    }
+    /// Readable direct-state JSON; binary content stays in the typed checkpoint.
+    fn json(&self) -> PyResult<String> {
+        serde_json::to_string(&self.state.to_json().map_err(error)?)
             .map_err(|e| error(e.to_string()))
+    }
+    fn __repr__(&self) -> &'static str {
+        "BoardState(complete stopped session state)"
     }
 }
 

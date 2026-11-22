@@ -16,6 +16,14 @@ class AdcConditionVariant1(TypedDict, total=False):
     kind: Required[Literal["self_active"]]
 
 
+class AdcEncoderCalibration(TypedDict, total=False):
+    centers: Required[list[int]]
+    direction: Required[int]
+    edges_per_step: Required[int]
+    hysteresis: Required[int]
+    offset: Required[int]
+
+
 type AdcInterval = AdcIntervalVariant0 | AdcIntervalVariant1
 
 
@@ -33,6 +41,11 @@ class AdcIntervalVariant1(TypedDict, total=False):
     unless: NotRequired[list[AdcInterval]]
     upper: Required[int]
     when: NotRequired[AdcCondition | None]
+
+
+class AdcTerm(TypedDict, total=False):
+    connection_id: Required[str]
+    interval: Required[AdcInterval]
 
 
 class AdditionalUiModes(TypedDict, total=False):
@@ -59,6 +72,10 @@ class AddressMapping(TypedDict, total=False):
     permissions: Required[int]
     physical: Required[int]
     size: Required[RegionSize]
+
+
+class AlarmInterval(TypedDict, total=False):
+    seconds: Required[list[int]]
 
 
 class AlarmRegisters(TypedDict, total=False):
@@ -401,6 +418,11 @@ class BootCombination(TypedDict, total=False):
     usb: NotRequired[bool | None]
 
 
+class BootFlag(TypedDict, total=False):
+    address: Required[int]
+    mask: Required[int]
+
+
 class BootHold(TypedDict, total=False):
     id: Required[str]
     stage: NotRequired[str | None]
@@ -483,6 +505,13 @@ class CacheGeometry(TypedDict, total=False):
     l2_bytes: Required[int]
 
 
+class CacheSynchronization(TypedDict, total=False):
+    data_barrier: Required[int]
+    data_clean: Required[int]
+    instruction_barrier: Required[int]
+    instruction_invalidate: Required[int]
+
+
 class CaptureScope(TypedDict, total=False):
     basis: Required[str]
     name: Required[str]
@@ -526,6 +555,9 @@ class CompanionMailbox(TypedDict, total=False):
     status: Required[int]
 
 
+type Configuration = ConfigurationVariant0 | ConfigurationVariant1
+
+
 class ConfigurationCheck(TypedDict, total=False):
     offset: Required[int]
     value: Required[int]
@@ -544,6 +576,16 @@ class ConfigurationLocationVariant0(TypedDict, total=False):
 class ConfigurationLocationVariant1(TypedDict, total=False):
     address: Required[int]
     kind: Required[Literal["direct"]]
+
+
+class ConfigurationVariant0(TypedDict, total=False):
+    address: Required[int]
+    mechanism: Required[Literal["pointer"]]
+
+
+class ConfigurationVariant1(TypedDict, total=False):
+    address: Required[int]
+    mechanism: Required[Literal["fixed"]]
 
 
 class ConfigurationWindow(TypedDict, total=False):
@@ -987,8 +1029,9 @@ class ConstructionModelVariant8(TypedDict, total=False):
 
 
 class ConstructionModelVariant9(TypedDict, total=False):
+    adc: NotRequired[str | None]
     counter: NotRequired[str | None]
-    gpio: Required[str]
+    gpio: NotRequired[str | None]
     kind: Required[Literal["encoder"]]
 
 
@@ -1165,6 +1208,11 @@ ConstructionWireVariant0 = TypedDict(
 class ConstructionWiring(TypedDict, total=False):
     decoder: Required[int]
     selections: Required[list[ConstructionSelections]]
+
+
+class ContactCamPosition(TypedDict, total=False):
+    contacts: Required[list[bool]]
+    run_ticks: Required[int]
 
 
 class ContactPosition(TypedDict, total=False):
@@ -1368,6 +1416,12 @@ class CursorLayout(TypedDict, total=False):
     status_width: Required[int]
 
 
+class DataCacheGeometry(TypedDict, total=False):
+    line_bytes: Required[int]
+    sets: Required[int]
+    ways: Required[int]
+
+
 class DebugKey(TypedDict, total=False):
     event: Required[int]
     name: Required[str]
@@ -1459,6 +1513,7 @@ type DeviceKind = Literal[
     "QuadratureCounters",
     "RawConversionRegisters",
     "RawStatisticsControl",
+    "SataHost",
     "StillProcessor",
     "SPI1SerialBus",
     "SPI2Serial",
@@ -1503,16 +1558,80 @@ class DmaMapping(TypedDict, total=False):
     size: Required[RegionSize]
 
 
+class EarlyBootConstants(TypedDict, total=False):
+    exr2_restart_alarm_enable: Required[int]
+    exr2_restart_alarm_high: Required[int]
+    exr2_restart_alarm_low: Required[int]
+    exr2_restart_gpio_banks: Required[int]
+    exr2_restart_gpio_base: Required[int]
+    exr2_restart_gpio_config: Required[int]
+    exr2_restart_gpio_inactive_mask: Required[int]
+    exr2_restart_gpio_mode1: Required[int]
+    exr2_restart_gpio_mode2: Required[int]
+    exr2_restart_gpio_mode3: Required[int]
+    exr2_restart_gpio_mode4: Required[int]
+    exr2_restart_gpio_output: Required[int]
+    exr2_restart_gpio_stride: Required[int]
+    exr2_restart_packet_bytes: Required[int]
+    exr2_restart_packet_register: Required[int]
+    exr2_restart_power_command: Required[int]
+    exr2_restart_power_hold: Required[int]
+    exr2_restart_power_hold_mask: Required[int]
+    exr2_restart_power_off_value: Required[int]
+    exr2_restart_spi_base: Required[int]
+    exr2_restart_spi_busy: Required[int]
+    exr2_restart_spi_control: Required[int]
+    exr2_restart_spi_count_mask: Required[int]
+    exr2_restart_spi_enable: Required[int]
+    exr2_restart_spi_fifo_control: Required[int]
+    exr2_restart_spi_fifo_reset: Required[int]
+    exr2_restart_spi_format: Required[int]
+    exr2_restart_spi_rx: Required[int]
+    exr2_restart_spi_rx_count: Required[int]
+    exr2_restart_spi_rx_ready: Required[int]
+    exr2_restart_spi_status: Required[int]
+    exr2_restart_spi_status_clear: Required[int]
+    exr2_restart_spi_tx: Required[int]
+    exr2_restart_spi_tx_count: Required[int]
+    exr2_restart_write: Required[int]
+    restart_gpio_pin: Required[int]
+    restart_panel_gpio_bank: Required[int]
+    restart_power_gpio_bank: Required[int]
+    restart_spi_format_value: Required[int]
+    restart_spi_idle_control: Required[int]
+
+
+type EarlyBootMechanism = EarlyBootMechanismVariant0
+
+
+class EarlyBootMechanismVariant0(TypedDict, total=False):
+    code_checks: Required[list[CodeCheck]]
+    constants: Required[EarlyBootConstants]
+    kind: Required[Literal["exr2_polled_alarm"]]
+    spi_channel: Required[int]
+
+
 type ElectricalInput = (
     ElectricalInputVariant0
     | ElectricalInputVariant1
     | ElectricalInputVariant2
     | ElectricalInputVariant3
     | ElectricalInputVariant4
+    | ElectricalInputVariant5
+    | ElectricalInputVariant6
+    | ElectricalInputVariant7
+    | ElectricalInputVariant8
 )
 
 
 class ElectricalInputVariant0(TypedDict, total=False):
+    callback: Required[int]
+    expected_result: Required[int]
+    kind: Required[Literal["adc_conjunction"]]
+    terms: Required[list[AdcTerm]]
+
+
+class ElectricalInputVariant1(TypedDict, total=False):
     callback: NotRequired[int | None]
     connection_id: Required[str]
     expected_result: NotRequired[int | None]
@@ -1520,14 +1639,21 @@ class ElectricalInputVariant0(TypedDict, total=False):
     kind: Required[Literal["adc"]]
 
 
-class ElectricalInputVariant1(TypedDict, total=False):
+class ElectricalInputVariant2(TypedDict, total=False):
     connection_id: Required[str]
     expected_level: Required[bool]
     kind: Required[Literal["gpio"]]
     scanner: Required[GpioScanner]
 
 
-class ElectricalInputVariant2(TypedDict, total=False):
+class ElectricalInputVariant3(TypedDict, total=False):
+    callback: Required[int]
+    connection_id: Required[str]
+    expected_levels: Required[list[bool]]
+    kind: Required[Literal["gpio_contacts"]]
+
+
+class ElectricalInputVariant4(TypedDict, total=False):
     connection_id: Required[str]
     decoder_event: Required[int]
     guard: Required[int]
@@ -1538,13 +1664,32 @@ class ElectricalInputVariant2(TypedDict, total=False):
     transitions: Required[list[int]]
 
 
-class ElectricalInputVariant3(TypedDict, total=False):
+class ElectricalInputVariant5(TypedDict, total=False):
+    connection_id: Required[str]
+    decoder_event: Required[int]
+    guard: Required[int]
+    kind: Required[Literal["gpio_transition"]]
+    phase_map: Required[list[int]]
+    threshold: Required[int]
+    transitions: Required[list[int]]
+
+
+class ElectricalInputVariant6(TypedDict, total=False):
+    calibration_offsets: Required[AdcEncoderCalibration]
+    connection_id: Required[str]
+    decoder_event: Required[int]
+    kind: Required[Literal["adc_transition"]]
+    phase_map: Required[list[int]]
+    transitions: Required[list[int]]
+
+
+class ElectricalInputVariant7(TypedDict, total=False):
     connection_id: Required[str]
     cycle_sign: Required[int]
     kind: Required[Literal["gpio_fixed_cycle"]]
 
 
-class ElectricalInputVariant4(TypedDict, total=False):
+class ElectricalInputVariant8(TypedDict, total=False):
     active_value: Required[int]
     connection_id: Required[str]
     endpoint: Required[int]
@@ -1553,11 +1698,39 @@ class ElectricalInputVariant4(TypedDict, total=False):
     register: Required[int]
 
 
+class EncoderLevels(TypedDict, total=False):
+    high: Required[int]
+    low: Required[int]
+
+
+type EncoderOutputs = EncoderOutputsVariant0 | EncoderOutputsVariant1
+
+
+class EncoderOutputsVariant0(TypedDict, total=False):
+    kind: Required[Literal["gpio"]]
+
+
+class EncoderOutputsVariant1(TypedDict, total=False):
+    channels: Required[list[int]]
+    kind: Required[Literal["adc"]]
+    levels: Required[list[EncoderLevels]]
+
+
 class EventTranslation(TypedDict, total=False):
     address: Required[int]
     rows: Required[list[TranslatedKey]]
     sha256: Required[str]
     stride: Required[int]
+
+
+type ExecutionMechanism = ExecutionMechanismVariant0
+
+
+class ExecutionMechanismVariant0(TypedDict, total=False):
+    allocation: Required[HeapAllocation]
+    cache: Required[CacheSynchronization]
+    code_checks: Required[list[CodeCheck]]
+    kind: Required[Literal["exr2_query_heap"]]
 
 
 Firmware = TypedDict(
@@ -1733,6 +1906,22 @@ class FirmwareEntry(TypedDict, total=False):
 
 
 type FirmwareEntryLevel = Literal["el1h", "el2h", "el3h", "el3t"]
+
+
+FirmwareExecution = TypedDict(
+    "FirmwareExecution",
+    {
+        "$schema": Required["str"],
+        "code_alias": Required["int"],
+        "firmware_id": Required["str"],
+        "id": Required["str"],
+        "internal_version": Required["str"],
+        "mechanism": Required["ExecutionMechanism"],
+        "product": Required["str"],
+        "schema": Required["int"],
+    },
+    total=False,
+)
 
 
 FirmwareFacts = TypedDict(
@@ -2286,10 +2475,12 @@ class HardwareAtcm(TypedDict, total=False):
 
 
 class HardwareBlockParameters(TypedDict, total=False):
+    byte_ns: NotRequired[int | None]
     command_latency_us: NotRequired[int | None]
     commit_ticks: NotRequired[int | None]
     companion_irq_base: NotRequired[int | None]
     configuration_word: NotRequired[int | None]
+    interrupt: NotRequired[int | None]
     receive_request: NotRequired[int | None]
     source_hz: NotRequired[int | None]
     ticks_per_second: NotRequired[int | None]
@@ -2396,6 +2587,12 @@ class HardwareCoreWindow(TypedDict, total=False):
     size: Required[int]
 
 
+class HardwareCurtains(TypedDict, total=False):
+    first_output: Required[int]
+    light_offset_seconds: Required[int]
+    second_output: Required[int]
+
+
 class HardwareDecompressor(TypedDict, total=False):
     base: Required[int]
     basis: NotRequired[str | None]
@@ -2500,14 +2697,16 @@ class HardwareDramController(TypedDict, total=False):
 
 
 class HardwareEncoder(TypedDict, total=False):
+    adc: NotRequired[str | None]
     counter: NotRequired[str | None]
     name: Required[str]
     options: Required[HardwareEncoderTiming]
 
 
 class HardwareEncoderTiming(TypedDict, total=False):
+    outputs: NotRequired[EncoderOutputs | None]
     phase_ticks: Required[int]
-    pins: Required[list[PartAssemblyPin]]
+    pins: NotRequired[list[PartAssemblyPin] | None]
     rest_phase: Required[int]
 
 
@@ -2604,6 +2803,14 @@ class HardwareGpio(TypedDict, total=False):
     size: Required[int]
 
 
+class HardwareH264Encoder(TypedDict, total=False):
+    base: Required[int]
+    basis: Required[str]
+    irq_route: Required[int]
+    run_ticks: Required[int]
+    size: Required[int]
+
+
 class HardwareHdmiTransmitter(TypedDict, total=False):
     base: Required[int]
     basis: Required[str]
@@ -2618,6 +2825,7 @@ class HardwareImaging(TypedDict, total=False):
     focus_imaging: NotRequired[HardwareFocusImaging | None]
     iris_mechanics: NotRequired[HardwareIrisMechanics | None]
     iris_optics: NotRequired[HardwareIrisOptics | None]
+    nd_filter: NotRequired[HardwareNdFilter | None]
     sensor_capture: NotRequired[HardwareSensorCapture | None]
 
 
@@ -2635,6 +2843,7 @@ class HardwareImagingRegisters(TypedDict, total=False):
     error_irqs: Required[list[int]]
     input_buffer: Required[HardwareInputBuffer]
     normal_irqs: Required[list[int]]
+    raw_dma_irqs: NotRequired[list[int] | None]
     receiver_base: Required[int]
     reset_ticks: Required[int]
     timing_irqs: Required[list[int]]
@@ -2695,6 +2904,7 @@ class HardwareIrisMechanics(TypedDict, total=False):
 
 
 class HardwareIrisOptics(TypedDict, total=False):
+    actuator: NotRequired[str | None]
     output: Required[str]
     positions: Required[list[list[int]]]
 
@@ -2733,6 +2943,15 @@ class HardwareNandBootLayout(TypedDict, total=False):
     name: Required[str]
 
 
+class HardwareNdFilter(TypedDict, total=False):
+    basis: Required[str]
+    factor: Required[int]
+    insert_mask: Required[int]
+    output: Required[str]
+    register: Required[int]
+    remove_mask: Required[int]
+
+
 class HardwareOptics(TypedDict, total=False):
     maximum_radius: Required[int]
     pulses_per_radius: Required[int]
@@ -2741,6 +2960,7 @@ class HardwareOptics(TypedDict, total=False):
 
 class HardwarePartAssemblies(TypedDict, total=False):
     contact_actuators: NotRequired[list[str] | None]
+    contact_cams: NotRequired[list[str] | None]
     serial_outputs: NotRequired[list[str] | None]
     serial_part: Required[list[str]]
 
@@ -2802,13 +3022,20 @@ class HardwareProjection(TypedDict, total=False):
     subject_distance_mm: Required[int]
 
 
+class HardwareRadiometricCalibration(TypedDict, total=False):
+    reference_white: Required[list[int]]
+    saturation_lux_seconds: Required[int]
+
+
 class HardwareRadiometry(TypedDict, total=False):
+    curtains: NotRequired[HardwareCurtains | None]
+    live_view: NotRequired[HardwareRadiometricCalibration | None]
     mode_change_frames: Required[int]
     pixel_clock_hz: Required[int]
-    projection: Required[HardwareProjection]
+    projection: NotRequired[HardwareProjection | None]
     rolling_references: Required[list[HardwareRollingReference]]
     saturation_lux_seconds: Required[int]
-    shutter: Required[HardwareShutter]
+    shutter: NotRequired[HardwareShutter | None]
     shutter_output: Required[int]
     ticks_per_second: Required[int]
     white_luminance: Required[int]
@@ -2881,6 +3108,7 @@ class HardwareRegisterLayouts(TypedDict, total=False):
     frame_sync: NotRequired[HardwareFrameSync | None]
     gic: NotRequired[HardwareGic | None]
     gpio: NotRequired[HardwareGpio | None]
+    h264_encoder: NotRequired[HardwareH264Encoder | None]
     hdmi_tx: NotRequired[HardwareHdmiTransmitter | None]
     imaging: NotRequired[HardwareImagingRegisters | None]
     imaging_control: NotRequired[HardwareImagingControl | None]
@@ -2900,11 +3128,13 @@ class HardwareRegisterLayouts(TypedDict, total=False):
     register_blocks: NotRequired[list[HardwareRegisterBlock]]
     reset_gates: NotRequired[HardwareResetGates | None]
     sd_host_clocks: NotRequired[HardwareSdHostClocks | None]
+    sd_hosts: NotRequired[list[HardwareSdHost]]
     serial_flash: NotRequired[HardwareSerialFlash | None]
     serial_ports: NotRequired[HardwareSerialPorts | None]
     spi: NotRequired[dict[str, HardwareSpi] | None]
     temperature: NotRequired[HardwareAdc | None]
     usb: NotRequired[HardwareUsbRegisters | None]
+    usb_phy: NotRequired[HardwareUsbPhy | None]
     xpp_i2c: NotRequired[HardwareXppI2cBuses | None]
     xpp_sd: NotRequired[HardwareXppSdHost | None]
     xpp_usb: NotRequired[HardwareXppUsb | None]
@@ -2946,13 +3176,35 @@ class HardwareRollingReference(TypedDict, total=False):
     vertical: Required[int]
 
 
+class HardwareSdHost(TypedDict, total=False):
+    base: Required[int]
+    basis: Required[str]
+    capabilities: Required[int]
+    capabilities_2: Required[int]
+    clock_ticks: Required[int]
+    irq_route: NotRequired[int | None]
+    size: Required[int]
+    slot_and_version: Required[int]
+    transfer_ticks: Required[int]
+    vendor_offsets: NotRequired[list[int]]
+
+
 class HardwareSdHostClocks(TypedDict, total=False):
     basis: Required[str]
     settle_ticks: Required[int]
     words: Required[list[int]]
 
 
+class HardwareSecondaryBusRegisterChip(TypedDict, total=False):
+    address: Required[int]
+    basis: Required[str]
+    modes: Required[list[int]]
+    values: Required[list[list[int]]]
+    write_masks: Required[list[list[int]]]
+
+
 class HardwareSecondaryBusRegisters(TypedDict, total=False):
+    extra_registers: NotRequired[list[HardwareSecondaryBusRegisterChip] | None]
     pwic_address: Required[int]
     pwic_modes: Required[list[int]]
     pwic_read_prefixes: Required[list[tuple[int, str]]]
@@ -3078,6 +3330,12 @@ class HardwareUsb(TypedDict, total=False):
     transfer_ticks: Required[int]
 
 
+class HardwareUsbPhy(TypedDict, total=False):
+    base: Required[int]
+    basis: Required[str]
+    size: Required[int]
+
+
 class HardwareUsbRegisters(TypedDict, total=False):
     basis: NotRequired[str | None]
     core: Required[int]
@@ -3124,6 +3382,12 @@ class HardwareXppUsb(TypedDict, total=False):
     transaction_ticks: Required[int]
 
 
+class HeapAllocation(TypedDict, total=False):
+    allocate: Required[int]
+    configuration: Required[Configuration]
+    release: Required[int]
+
+
 class HomeSwitch(TypedDict, total=False):
     side: NotRequired[HomeSwitchSide | None]
     threshold: Required[int]
@@ -3132,7 +3396,7 @@ class HomeSwitch(TypedDict, total=False):
 type HomeSwitchSide = Literal["above", "below"]
 
 
-type InputBinding = InputBindingVariant0 | InputBindingVariant1
+type InputBinding = InputBindingVariant0 | InputBindingVariant1 | InputBindingVariant2
 
 
 class InputBindingVariant0(TypedDict, total=False):
@@ -3143,6 +3407,11 @@ class InputBindingVariant0(TypedDict, total=False):
 class InputBindingVariant1(TypedDict, total=False):
     kind: Required[Literal["native_input"]]
     name: Required[str]
+
+
+class InputBindingVariant2(TypedDict, total=False):
+    kind: Required[Literal["scanner_row"]]
+    row: Required[str]
 
 
 class InputReaders(TypedDict, total=False):
@@ -3754,6 +4023,7 @@ type PartModel = (
     | PartModelVariant7
     | PartModelVariant8
     | PartModelVariant9
+    | PartModelVariant10
 )
 
 
@@ -3774,6 +4044,16 @@ class PartModelVariant1(TypedDict, total=False):
     kind: Required[Literal["contact-actuator"]]
     positions: Required[list[ContactPosition]]
     settle_ticks: Required[int]
+
+
+class PartModelVariant10(TypedDict, total=False):
+    hold_drives: Required[list[int]]
+    kind: Required[Literal["contact-cam"]]
+    latch_overrun_ticks: Required[int]
+    positions: Required[list[ContactCamPosition]]
+    release_drives: Required[list[int]]
+    release_ticks: Required[int]
+    run_drive: Required[int]
 
 
 class PartModelVariant2(TypedDict, total=False):
@@ -3850,6 +4130,7 @@ type PeripheralPart = (
     | PeripheralPartVariant9
     | PeripheralPartVariant10
     | PeripheralPartVariant11
+    | PeripheralPartVariant12
 )
 
 
@@ -3873,6 +4154,14 @@ class PeripheralPartVariant11(TypedDict, total=False):
     jedec_id: NotRequired[int | None]
     kind: Required[Literal["serial-nor-flash"]]
     page_bytes: NotRequired[int | None]
+
+
+class PeripheralPartVariant12(TypedDict, total=False):
+    jedec_id: NotRequired[int | None]
+    kind: Required[Literal["serial-nand-flash"]]
+    page_bytes: NotRequired[int | None]
+    pages_per_block: NotRequired[int | None]
+    spare_bytes: NotRequired[int | None]
 
 
 class PeripheralPartVariant2(TypedDict, total=False):
@@ -3997,7 +4286,7 @@ class PhysicalControlsVariant0(TypedDict, total=False):
     service: NotRequired[BootCombination]
 
 
-type PictureLayout = Literal["bgra8888-straight"]
+type PictureLayout = Literal["abgr8888-straight"]
 
 
 type PixelFormat = Literal["bgra8888"]
@@ -4013,12 +4302,14 @@ class PowerControlAssembly(TypedDict, total=False):
 
 class PowerOff(TypedDict, total=False):
     alarm: Required[AlarmRegisters]
+    boot_flag: NotRequired[BootFlag | None]
     deadline_parameter: NotRequired[int | None]
     entry: Required[int]
+    fixed_interval: NotRequired[AlarmInterval | None]
     halt: Required[int]
     power_cut: Required[int]
-    request_deadline_offset: Required[int]
-    rollover_parameter: Required[int]
+    request_deadline_offset: NotRequired[int | None]
+    rollover_parameter: NotRequired[int | None]
 
 
 type ProcessorArchitecture = Literal["arm32", "aarch64"]
@@ -4083,6 +4374,7 @@ class ProfileFieldSourceVariant3(TypedDict, total=False):
 class ProfileRecord(TypedDict, total=False):
     block: Required[int]
     bytes: Required[int]
+    copies: NotRequired[int | None]
     defaults: Required[UpdateRange]
     defaults_offset: Required[int]
     fields: Required[list[SettingsField]]
@@ -4121,6 +4413,7 @@ class RProfileState(TypedDict, total=False):
     atcm: Required[TcmState]
     btcm: Required[TcmState]
     cp14_identity: Required[int]
+    data_cache: NotRequired[DataCacheGeometry | None]
 
 
 class ReadinessAddresses(TypedDict, total=False):
@@ -4202,6 +4495,7 @@ class ResolvedSelection(TypedDict, total=False):
     bulk: NotRequired[FirmwareBulk | None]
     card_files: NotRequired[FirmwareCard | None]
     control_ids: NotRequired[FirmwareControlIds | None]
+    execution: NotRequired[FirmwareExecution | None]
     firmware: Required[Firmware]
     first_start: NotRequired[FirstStartMenu | None]
     flash: NotRequired[FirmwareFlash | None]
@@ -4239,14 +4533,15 @@ class Resources(TypedDict, total=False):
 
 
 class RestartMechanism(TypedDict, total=False):
-    deadline_offset: Required[int]
+    deadline_offset: NotRequired[int | None]
     deferred_timer: NotRequired[DeferredTimer | None]
-    parameter_bytes: Required[int]
+    early_boot: NotRequired[EarlyBootMechanism | None]
+    parameter_bytes: NotRequired[int | None]
     power_off: Required[PowerOff]
-    request: Required[int]
-    request_offset: Required[int]
-    sender: Required[int]
-    transport: Required[RequestTransport]
+    request: NotRequired[int | None]
+    request_offset: NotRequired[int | None]
+    sender: NotRequired[int | None]
+    transport: NotRequired[RequestTransport | None]
     ui: Required[RecIdle]
 
 
@@ -4391,6 +4686,9 @@ type RunExecutionScope = Literal[
 type RunFaceRegisterMode = Literal["retained_words"]
 
 
+type RunFaceResultProfile = Literal["empty", "box64x20", "box172x120"]
+
+
 type RunFaceStopProfile = Literal["declared-armed-face-dma-idle-abort-unmeasured"]
 
 
@@ -4400,6 +4698,7 @@ class RunFactoryOptions(TypedDict, total=False):
     auxiliary_control_ticks: NotRequired[int | None]
     backdrop_profile: NotRequired[RunBackdropProfile | None]
     camera_settings: NotRequired[dict[str, str] | None]
+    capability_reply: NotRequired[list[int] | None]
     clear_profile: NotRequired[RunClearProfile | None]
     clock_seconds_2000: NotRequired[int | None]
     control_bus_profile: NotRequired[RunControlBusProfile | None]
@@ -4408,6 +4707,7 @@ class RunFactoryOptions(TypedDict, total=False):
     display_frame_ticks: NotRequired[int | None]
     entry: NotRequired[RunEntry | None]
     face_register_mode: NotRequired[RunFaceRegisterMode | None]
+    face_result_profile: NotRequired[RunFaceResultProfile | None]
     face_stop_profile: NotRequired[RunFaceStopProfile | None]
     graphics_profile: NotRequired[RunGraphicsProfile | None]
     hdmi_sink: NotRequired[RunHdmiSink | None]
@@ -5101,7 +5401,10 @@ class RunSceneVariant2(TypedDict, total=False):
     statistics: Required[list[ApplicationStatisticsInput]]
 
 
-type RunSdCardProfile = Literal["declared-blank-sdhc-default-speed-unmeasured"]
+type RunSdCardProfile = Literal[
+    "declared-blank-sdhc-default-speed-unmeasured",
+    "declared-blank-sdhc-high-speed-unmeasured",
+]
 
 
 type RunSecondaryBusProfile = Literal[
@@ -5123,7 +5426,9 @@ type RunSettings = Literal["default", "owner"]
 type RunSpi0InputProfile = Literal["absent-hot-shoe-flash-fixed-low-miso"]
 
 
-type RunStart = RunStartVariant0 | RunStartVariant1 | RunStartVariant2
+type RunStart = (
+    RunStartVariant0 | RunStartVariant1 | RunStartVariant2 | RunStartVariant3
+)
 
 
 class RunStartVariant0(TypedDict, total=False):
@@ -5136,6 +5441,10 @@ class RunStartVariant1(TypedDict, total=False):
 
 class RunStartVariant2(TypedDict, total=False):
     kind: Required[Literal["sd_card"]]
+
+
+class RunStartVariant3(TypedDict, total=False):
+    kind: Required[Literal["setup"]]
 
 
 class RunStatistics(TypedDict, total=False):
@@ -5350,6 +5659,8 @@ class SettingsField(TypedDict, total=False):
 class SettingsProfile(TypedDict, total=False):
     derived_fields: NotRequired[list[ProfileField]]
     header: Required[UpdateRange]
+    loader_offset: NotRequired[int | None]
+    power_register: NotRequired[int | None]
     records: Required[dict[str, ProfileRecord]]
 
 
@@ -5425,6 +5736,7 @@ class SocHardware(TypedDict, total=False):
     companion: NotRequired[CompanionHardware | None]
     interrupt_controller: NotRequired[InterruptControllerHardware | None]
     interrupt_inputs: Required[list[ControllerInterruptInput]]
+    power_on_ram_fill: NotRequired[int | None]
     profiles: NotRequired[dict[str, SocProfile]]
 
 

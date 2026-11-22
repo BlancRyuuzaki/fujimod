@@ -7,7 +7,9 @@ pub mod durable;
 pub mod history;
 pub mod inputs;
 pub mod nand;
+pub mod power_cycle;
 pub mod scanout;
+pub mod state;
 #[cfg(test)]
 mod tests;
 pub mod usb;
@@ -18,6 +20,14 @@ use fujimod_emulator_exr2_resources::{Resources, SensorFrame};
 use std::collections::BTreeMap;
 use fujimod_emulator_devices::capability::{HdmiOutput, SerialStatus};
 
+pub use state::SessionState;
+
+/// Hosted synchronization whose scheduling interval is measured in guest ticks.
+pub struct WindowAction {
+    pub interval: std::num::NonZeroU64,
+    pub synchronize: Box<dyn FnMut(&Board) -> Result<(), String>>,
+}
+
 pub struct Session {
     pub definition: serde_json::Value,
     pub board: Board,
@@ -26,25 +36,20 @@ pub struct Session {
     pub resources: Resources,
     pub nodes: BTreeMap<String, usize>,
     pub contacts: BTreeMap<String, Contacts>,
+    pub power_cycle: Option<power_cycle::PowerCycle>,
+    pub window_action: Option<WindowAction>,
     /// Host rendering memo; excluded from checkpoints, fingerprints and modeled state.
     pub recording_frames: std::cell::RefCell<
         BTreeMap<
             (String, usize, bool),
             fujimod_recording::cache::CaptureCache<
+                serde_json::Value,
                 Option<std::sync::Arc<fujimod_framebuffer::frame::Frame>>,
             >,
         >,
     >,
 }
 impl Session {
-    pub fn fingerprint(&self) -> Result<serde_json::Value, String> {
-        let mut value = serde_json::json!({"schema":1,"definition":self.definition,
-            "controls":self.controls.as_ref().map(|p| serde_json::json!({"spec":p.spec(),"positions":p.positions()})),
-            "contact_driver":self.contact_driver.as_ref().map(|d|d.fingerprint()).transpose()?});
-        value["board"] = self.board.fingerprint()?;
-        value["resources"] = self.resources.fingerprint()?;
-        Ok(value)
-    }
     pub fn logic_input(&mut self, name: &str, high: bool) -> Result<(), String> {
         let level = self.resources.logic_level(name)?;
         let users = self.resources.wire_users(name)?;
@@ -101,6 +106,12 @@ impl Session {
                 self.node(name)?,
                 |frames| Ok(frames.frame_state()),
             )
+    }
+    /// Observe the latched sensor exposure and its live frame index.
+    pub fn frame_exposure(&self, name: &str) -> Result<Option<(u64, f64, f64)>, String> {
+        self.board.inspect_capability::<dyn fujimod_emulator_devices::capability::FrameSource, _>(
+            self.node(name)?, |frames| frames.frame_exposure(),
+        )
     }
     /// Pure diagnostic sampling of the immutable physical frame before ISP
     /// digital gain, color processing or display encoding. `name` is a frame source.
@@ -167,6 +178,12 @@ impl Session {
         self.resources
             .encoder(name)?
             .queue_cycles(self.board.now(), cycles)?;
+        self.board.inputs_changed(self.node(name)?)
+    }
+    pub fn rotate_edges(&mut self, name: &str, edges: i32) -> Result<(), String> {
+        self.resources
+            .encoder(name)?
+            .queue_edges(self.board.now(), edges)?;
         self.board.inputs_changed(self.node(name)?)
     }
     fn image_inputs_changed(&mut self, name: &str) -> Result<(), String> {

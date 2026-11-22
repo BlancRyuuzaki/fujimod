@@ -51,20 +51,15 @@ From the repository root:
 ```sh
 mise install
 uv sync --locked
-npm ci
-npm --prefix bindings/javascript ci
-npm --prefix packages/emulator-ui ci
-npm --prefix apps/web ci
-npm --prefix apps/usb-sharing ci
-rustup target add wasm32-unknown-unknown
-npm --prefix bindings/javascript run setup:tooling
+pnpm install --frozen-lockfile
+pnpm --filter fujimod run setup:tooling
 
 mise run python-lint
 mise run python-format-check
 mise run python-typecheck
 mise run rust-format-check
 mise run rust-check
-npm --prefix bindings/javascript run build
+pnpm --filter fujimod run build
 mise run javascript-lint
 mise run web-check
 mise run javascript-format-check
@@ -93,9 +88,9 @@ build validation. Pyodide also needs its pure Python wheel:
 
 ```sh
 node bindings/python/scripts/build-web-wheel.ts --out target/web-wheels
-npm --prefix apps/web exec -- playwright install --with-deps chromium webkit
+pnpm --filter fujimod-web exec -- playwright install --with-deps chromium webkit
 mise run javascript-browser-test
-npm --prefix bindings/javascript run test:pyodide:browser
+pnpm --filter fujimod run test:pyodide:browser
 mise run web-coverage
 mise run web-build
 node scripts/ci/package-tests.ts apps/web
@@ -132,8 +127,6 @@ offers `native-coverage` and `javascript-coverage` downloads; generated files st
 under ignored `target/coverage/`. To reproduce native coverage:
 
 ```sh
-rustup component add llvm-tools-preview
-cargo install cargo-llvm-cov --version 0.9.1 --locked
 export CARGO_TARGET_DIR="$PWD/target/llvm-cov-target"
 export CARGO_LLVM_COV_TARGET_DIR="$CARGO_TARGET_DIR"
 mise run rust-coverage

@@ -5,7 +5,6 @@ import {
   type CardState,
   type CardTree,
   type ControlInput,
-  type Fingerprint,
   type InputLog,
   type TouchPhase,
 } from 'fujimod/emulator';
@@ -153,9 +152,10 @@ export class WasmEngine implements Engine {
       case 'progress':
         this.progress?.(event.message, event.percent, event.assets);
         return;
-      case 'state':
-        if (event.state.poweredOn !== this.latestPower) {
-          this.latestPower = event.state.poweredOn;
+      case 'state': {
+        const powered = event.state.poweredOn && event.supplyOn;
+        if (powered !== this.latestPower) {
+          this.latestPower = powered;
           this.powerListeners.emit(this.latestPower);
         }
         this.latestCard = event.state.card;
@@ -164,6 +164,7 @@ export class WasmEngine implements Engine {
         this.cardListeners.emit(event.state.card);
         this.connectionListeners.emit([]);
         return;
+      }
       case 'metrics':
         this.metricListeners.emit({
           ...event.metrics,
@@ -244,8 +245,8 @@ export class WasmEngine implements Engine {
   replayHistory(bytes: Uint8Array) {
     return this.rpc({ action: 'replay_history', bytes });
   }
-  fingerprint() {
-    return this.rpc<Fingerprint>({ action: 'fingerprint' });
+  completeState() {
+    return this.rpc<Uint8Array>({ action: 'complete_state' });
   }
   prepare(config: EngineConfig) {
     void this.rpc({ action: 'prepare', bundle: this.absolute(config).bundle }).catch(() => {});
@@ -260,6 +261,8 @@ export class WasmEngine implements Engine {
     this.sceneInput = config.sceneInput;
     this.firmwareId = config.firmwareId;
     progress('Loading Wasm runtime…');
+    // The runtime downloads while the SD card files download.
+    this.prepare(config);
     const [files, seedIdentity] = await Promise.all([
       media?.load() ?? Promise.resolve([]),
       media?.identities ?? Promise.resolve([]),

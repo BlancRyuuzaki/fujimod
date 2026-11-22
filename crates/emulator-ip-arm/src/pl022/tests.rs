@@ -236,7 +236,7 @@ fn explicit_fixed_wire_input_is_sampled_only_after_the_programmed_frame() {
 }
 
 #[test]
-fn active_retiming_and_disabling_unread_data_refuse_without_discarding_state() {
+fn active_retiming_refuses_and_disabling_keeps_unread_data() {
     let mut c = controller();
     let mut h = RecordingHost::default();
     configure(&mut c, &mut h, true);
@@ -249,13 +249,14 @@ fn active_retiming_and_disabling_unread_data_refuse_without_discarding_state() {
         assert_eq!(c.save(), before);
     }
     tick(&mut c, &mut h, 1000);
-    let before = c.save();
-    let mut cx = Cx::new(&mut h, 0, 0, 0);
-    c.write(&mut cx, BASE + 4, 2, 0);
-    assert!(cx.is_unmodeled());
-    assert_eq!(c.save(), before);
+    // Disable (with SOD) while the reply is unread: the FIFO keeps it.
+    write(&mut c, &mut h, 4, 8);
+    assert_eq!(read(&mut c, &mut h, 0xc) & 4, 4);
+    let mut other = controller();
+    other.restore(&c.save()).unwrap();
     assert_eq!(read(&mut c, &mut h, 8), 0x67);
-    write(&mut c, &mut h, 4, 0);
+    assert_eq!(read(&mut other, &mut h, 8), 0x67);
+    // Retiming still needs empty FIFOs; now they are.
     write(&mut c, &mut h, 0x10, 4);
 }
 #[test]
@@ -273,4 +274,121 @@ fn interrupt_fanout_and_checkpoint_wiring_are_explicit() {
     other.interrupts = c.interrupts.clone();
     other.restore(&c.save()).unwrap();
     assert_eq!(other.save(), c.save());
+}
+
+#[test]
+fn unconnected_interrupt_output_drives_nothing_and_undeclared_output_refuses() {
+    let clock = Clock {
+        source_hz: 48_000_000,
+        ticks_per_second: 1_000_000_000,
+    };
+    let unconnected = || {
+        Controller::new(BASE, clock, vec![], Box::new(Unconnected))
+            .unwrap()
+            .with_unconnected_interrupt()
+            .unwrap()
+    };
+    // Enabled with an empty transmit FIFO, unmasking the transmit interrupt raises it.
+    let mut h = RecordingHost::default();
+    let mut c = unconnected();
+    configure(&mut c, &mut h, false);
+    write(&mut c, &mut h, 0x14, 0xf);
+    assert_eq!(read(&mut c, &mut h, 0x1c) & 8, 8);
+    assert!(h.irqs.is_empty() && h.core_irqs.is_empty());
+    let mut c = Controller::new(BASE, clock, vec![], Box::new(Unconnected)).unwrap();
+    let mut h = RecordingHost::default();
+    configure(&mut c, &mut h, false);
+    let mut cx = Cx::new(&mut h, 0, 0x1234, 0);
+    c.write(&mut cx, BASE + 0x14, 2, 0xf);
+    assert!(cx.is_unmodeled());
+    let connected = Controller::new(BASE, clock, vec![InterruptLine::Shared(77)], Box::new(Unconnected))
+        .unwrap()
+        .with_unconnected_interrupt();
+    assert!(connected.is_err());
+}
+/// Each published register as the CPU would see it through the fast path:
+/// offset, width and value.
+fn published(c: &Controller) -> Vec<(u64, u8, u64)> {
+    use fujimod_emulator_devices::bus::FastReadValue;
+    use std::sync::atomic::Ordering;
+    c.fast_reads(BASE, 0x1000)
+        .into_iter()
+        .map(|word| match word.value {
+            FastReadValue::AtomicU32(value) => (word.offset, 4, value.load(Ordering::Acquire) as u64),
+            FastReadValue::AtomicU16(value) => (word.offset, 2, value.load(Ordering::Acquire) as u64),
+            _ => panic!("PL022 publishes only atomic registers"),
+        })
+        .collect()
+}
+fn read_sized(c: &mut Controller, h: &mut RecordingHost, offset: u64, size: u8) -> u64 {
+    let mut cx = Cx::new(h, 0, 0x1234, 0);
+    let value = c.read(&mut cx, BASE + offset, size);
+    assert_eq!(cx.refusal(), None);
+    value
+}
+/// The fast path must equal an ordinary read after every write, DMA
+/// transfer, deadline and receive. A snapshot left stale by any of them fails.
+fn assert_published(c: &mut Controller, h: &mut RecordingHost, step: &str) {
+    let fast = published(c);
+    let mut offsets: Vec<_> = fast.iter().map(|(offset, _, _)| *offset).collect();
+    offsets.dedup();
+    assert_eq!(offsets, vec![0, 4, 0xc, 0x10, 0x14, 0x18, 0x1c, 0x24], "{step}");
+    assert_eq!(fast.len(), 16, "{step}: both widths of each register");
+    for (offset, size, value) in fast {
+        assert_eq!(
+            value,
+            read_sized(c, h, offset, size),
+            "{step}: offset {offset:#x} width {size}"
+        );
+    }
+}
+#[test]
+fn published_registers_match_reads_after_every_state_change() {
+    let mut h = RecordingHost::default();
+    let mut c = controller();
+    assert_published(&mut c, &mut h, "reset");
+    write(&mut c, &mut h, 0, 0xc7);
+    assert_published(&mut c, &mut h, "CR0");
+    write(&mut c, &mut h, 0x10, 6);
+    write(&mut c, &mut h, 0x24, 3);
+    write(&mut c, &mut h, 0x14, 0xf);
+    assert_published(&mut c, &mut h, "CPSR/DMACR/IMSC");
+    write(&mut c, &mut h, 4, 3);
+    assert_published(&mut c, &mut h, "CR1");
+    let p = c.port();
+    for value in 0..3 {
+        p.lock().unwrap().transmit(0, 1, value).unwrap();
+    }
+    assert_published(&mut c, &mut h, "DMA transmit");
+    write(&mut c, &mut h, 8, 0x55);
+    assert_published(&mut c, &mut h, "DR write");
+    // Until the frame's deadline the published SR stays what a read returns.
+    let deadline = c.next_deadline(0).unwrap();
+    tick(&mut c, &mut h, deadline - 1);
+    assert_published(&mut c, &mut h, "before deadline");
+    tick(&mut c, &mut h, deadline);
+    assert_published(&mut c, &mut h, "deadline");
+    tick(&mut c, &mut h, 20_000);
+    assert_published(&mut c, &mut h, "drained");
+    p.lock().unwrap().receive(20_000, 1).unwrap();
+    assert_published(&mut c, &mut h, "DMA receive");
+    read(&mut c, &mut h, 8);
+    assert_published(&mut c, &mut h, "DR read");
+    write(&mut c, &mut h, 0x20, 3);
+    assert_published(&mut c, &mut h, "ICR");
+    let saved = c.save();
+    let mut restored = controller();
+    restored.restore(&saved).unwrap();
+    assert_eq!(published(&restored), published(&c));
+}
+#[test]
+fn data_and_clear_registers_are_never_published() {
+    let c = controller();
+    let offsets: Vec<_> = c.fast_reads(BASE, 0x1000).into_iter().map(|w| w.offset).collect();
+    assert!(!offsets.contains(&8) && !offsets.contains(&0x20));
+    // A window that covers only part of the aperture publishes only that part.
+    let part: Vec<_> = c.fast_reads(BASE + 0xc, 4).into_iter().map(|w| w.offset).collect();
+    assert_eq!(part, vec![0, 0]);
+    let half: Vec<_> = c.fast_reads(BASE + 0xc, 2).into_iter().map(|w| w.value.width()).collect();
+    assert_eq!(half, vec![2]);
 }

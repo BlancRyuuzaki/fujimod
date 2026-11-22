@@ -25,6 +25,7 @@ fn setup() -> (XMountLens, gpio::Gpio, irq::InterruptController, TestHost) {
         gpio::Options {
             input_levels: levels,
             output_levels: vec![],
+            high_port_input_levels: None,
         },
         gpio::Wiring { irqs: vec![] },
     )
@@ -48,12 +49,13 @@ fn setup() -> (XMountLens, gpio::Gpio, irq::InterruptController, TestHost) {
         serial_dma::Options {
             serial_base: 0x5000,
             dma_base: 0x4000,
-            routing_base: 0x8000,
+            routing_base: Some(0x8000),
             channels: [2, 3],
             transmit_request: 9,
             receive_request: 8,
             frame_ticks: 64,
             irq_targets: vec![],
+            completion: Default::default(),
         },
         x_mount_link::Configuration {
             peer_parameters: 0xb801,
@@ -64,8 +66,14 @@ fn setup() -> (XMountLens, gpio::Gpio, irq::InterruptController, TestHost) {
             focus_ring: 0xffff,
             detail_status: 0x14,
             read_catalogs: vec![],
+            fixed_replies: vec![],
+            operation_families: vec![],
         },
-        100,
+        x_mount_lens::Timing {
+            startup_ticks: 100,
+            busy_ticks: None,
+            operation_ticks: None,
+        },
         options(),
         gpio.pads(),
         vec![(0, inputs)],
@@ -253,7 +261,8 @@ fn serial_pad_loss_refuses_and_checkpoint_wiring_validation_is_atomic() {
     host.now = 101;
     write(&mut gpio, &mut host, gpio::BASE + 2 * 64, 0x10000000);
     advance(&mut lens, &mut host, 101);
-    assert!(
+    // The byte cut off by the power loss receives the undriven line.
+    assert_eq!(
         port.finish(
             token,
             Frame {
@@ -263,8 +272,8 @@ fn serial_pad_loss_refuses_and_checkpoint_wiring_validation_is_atomic() {
             },
             102
         )
-        .unwrap_err()
-        .contains("lost power")
+        .unwrap(),
+        0xff
     );
 }
 

@@ -1,4 +1,5 @@
 use super::*;
+use fujimod_catalog_controls::{ElectricalInput, InputTarget};
 use fujimod_catalog_configuration::Exr2RunScene;
 
 /// The reference X70's NAND sections in the catalog.
@@ -65,6 +66,14 @@ fn startup_presentation_uses_active_outputs_and_rejects_inactive_buffers() {
     state["instances"][1]["graphics"][0]["channels"][0]["enabled"] = json!(true);
     state["instances"][1]["graphics"][0]["channels"][0]["configured"] = json!(false);
     assert!(presented_instances(&state).is_empty());
+}
+
+#[test]
+fn display_timing_does_not_publish_an_output_hold_wire() {
+    let prepared = prepare("x70-110-rec", &[]).unwrap();
+    assert!(!prepared.plan.wires.contains_key("display_output_hold"));
+    assert!(prepared.devices_value["wires"].get("display_output_hold").is_none());
+    assert!(model(&prepared, "display_timing")["options"].get("output_hold").is_none());
 }
 
 #[test]
@@ -266,12 +275,13 @@ fn settings_validate_marker_checksum_and_route_extent() {
 }
 
 #[test]
-fn selected_files_are_bounded_and_hash_checked() {
+fn selected_files_are_bounded_and_size_checked() {
     let path = std::env::temp_dir().join(format!("fujimod-boot-input-{}", std::process::id()));
     std::fs::write(&path, b"abc").unwrap();
     assert_eq!(checked(&path, &Content::identify(b"abc")).unwrap(), b"abc");
     assert!(read(&path, 2).is_err());
-    assert!(checked(&path, &Content::identify(b"abd")).is_err());
+    // Loading checks the declared byte count; the digest is a build/cache key.
+    assert_eq!(checked(&path, &Content::identify(b"abd")).unwrap(), b"abc");
     std::fs::remove_file(path).unwrap();
 }
 
@@ -504,14 +514,12 @@ fn shipped_preparation_opens_the_same_board_as_selected_files() {
             session.board.instruction_counts(),
             session.board.now(),
             Content::identify(&kernel).sha256,
-            session.board.fingerprint().unwrap(),
+            session.board.complete_state().unwrap(),
         )
     };
 
     let direct = snapshot(
-        open(Options {
-            configuration_id: CONFIGURATION.into(),
-            overlays: vec![],
+        open_exr2(ResolvedConfiguration::with_overlays(CONFIGURATION, &[]).unwrap(), Options {
             update: PathBuf::from(&update),
             boot_rom: PathBuf::from(&boot_rom),
             nand: None,
@@ -519,7 +527,9 @@ fn shipped_preparation_opens_the_same_board_as_selected_files() {
             clock_seconds_2000: None,
             preferred_languages: vec![],
             camera: Some(reference_camera()),
-        })
+            access_point: None,
+            capability_reply: None,
+        }, Mode::Strict)
         .unwrap(),
     );
     assert!(direct.1.iter().sum::<u64>() >= INSTRUCTIONS);
@@ -538,6 +548,52 @@ fn shipped_preparation_opens_the_same_board_as_selected_files() {
     };
     let shipped = snapshot(open_prepared(restored, inputs).unwrap());
     assert_eq!(shipped, direct);
+}
+
+#[test]
+fn restart_payload_reconstructs_the_rom_board_after_wake() {
+    use fujimod_emulator_cpu::arm;
+    let (Some(update), Some(boot_rom), Some(payload)) = (
+        std::env::var_os("FUJIMOD_TEST_UPDATE"),
+        std::env::var_os("FUJIMOD_TEST_BOOT_ROM"),
+        std::env::var_os("FUJIMOD_TEST_RESTART_IMAGE"),
+    ) else { return };
+    let mut session = open_exr2(ResolvedConfiguration::with_overlays("x70-110-rec", &[]).unwrap(), Options {
+        update: update.into(), boot_rom: boot_rom.into(), nand: None, settings: None,
+        clock_seconds_2000: None, preferred_languages: vec![], camera: Some(reference_camera()),
+        access_point: None, capability_reply: None,
+    }, Mode::Strict).unwrap();
+    session.run_with_limits(5_000_000, 1000, None, None).unwrap();
+    session.logic_input("usb_cable", true).unwrap();
+    let image = std::fs::read(payload).unwrap();
+    session.board.write_physical(0x20000, &image).unwrap();
+    session.board.write_physical(0x22000, &0xe320f003u32.to_le_bytes()).unwrap();
+    session.board.write_register(1, arm::CORE[15], 0x22000).unwrap();
+    let entry = std::env::var("FUJIMOD_TEST_RESTART_ENTRY").unwrap().parse::<u64>().unwrap();
+    session.board.write_register(0, arm::CORE[15], entry).unwrap();
+    session.board.write_register(0, arm::CORE[13], 0x2e000).unwrap();
+    session.run_with_limits(20_000, 1000, None, None).unwrap();
+    let alarm = session.resources.clock("clocks").unwrap().power_alarm().unwrap().unwrap();
+    let due = alarm.lock().unwrap().next_deadline().unwrap();
+    session.run_window(u64::MAX, 1000, None, Some(due)).unwrap();
+    assert!(session.board.is_powered_off());
+    let wake = alarm.lock().unwrap().next_deadline().unwrap();
+    let counts = session.board.instruction_counts();
+    session.run_window(u64::MAX, 1000, None, Some(wake)).unwrap();
+    assert_eq!(session.board.instruction_counts(), counts);
+    assert!(session.board.epoch_is_unexecuted());
+    assert!(session.resources.logic_level("usb_cable").unwrap().high());
+    assert_eq!(session.board.read_register(0, arm::CORE[15]).unwrap(), 0);
+    let packet = session.resources.clock("clocks").unwrap().power_alarm().unwrap().unwrap()
+        .lock().unwrap().packet().unwrap();
+    assert_eq!(&packet[..4], &[1, 0, 0, 0]);
+    assert_eq!(packet[13], 0);
+    assert_eq!(packet.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)), 0);
+    let mut memory = vec![0; image.len()];
+    session.board.read_physical(0x20000, &mut memory).unwrap();
+    assert_ne!(memory, image);
+    session.run_with_limits(1000, 100, None, None).unwrap();
+    assert!(!session.board.epoch_is_unexecuted());
 }
 
 #[test]
@@ -777,7 +833,7 @@ fn serial_spi1_refuses_a_shift_with_both_chip_selects_low() {
     let shift = |panel_high: bool, configuration: u64, word: u64| {
         let mut document = spec.devices_value.clone();
         document["nodes"].as_array_mut().unwrap().retain(|n| {
-            ["irq0", "irq1", "serial_gpio", "serial_spi1"].contains(&n["name"].as_str().unwrap())
+            ["irq0", "irq1", "clocks", "serial_gpio", "serial_spi1"].contains(&n["name"].as_str().unwrap())
         });
         fujimod_emulator_exr2_board::register_board_builder();
         fujimod_emulator_models::register();
@@ -987,3 +1043,56 @@ fn statistics_dma_uses_its_selected_latency_instead_of_the_scene_frame_period() 
 
 #[path = "tests/output_timing.rs"]
 mod output_timing;
+
+#[test]
+fn exr2_image_transfer_maps_cpu_pages_and_keeps_device_register_bounds() {
+    // The image-transfer block occupies 32 bytes, smaller than a CPU page.
+    let prepared = crate::prepare("x70-110-rec", &[]).unwrap();
+    for core in 0..2 {
+        let aperture = prepared
+            .execution
+            .peripherals
+            .iter()
+            .find(|p| {
+                p.core == core
+                    && p.address <= 0xfff64000
+                    && p.address + p.size as u64 >= 0xfff65000
+            })
+            .expect("both CPUs must map the image-transfer page");
+        assert_eq!(aperture.address % 0x1000, 0);
+        assert_eq!(aperture.physical % 0x1000, 0);
+        assert_eq!(aperture.size % 0x1000, 0);
+    }
+    let window = prepared.devices_value["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|node| node["windows"].as_array().unwrap())
+        .find(|window| window["base"] == 0xfff64000u64)
+        .unwrap();
+    assert_eq!(window["size"], 0x20);
+}
+
+#[cfg(all(feature = "xp5-startup", not(target_arch = "wasm32")))]
+#[test]
+fn common_open_checks_generation_before_loading_startup_files() {
+    let resolved = ResolvedConfiguration::with_overlays("x70-110-rec", &[]).unwrap();
+    let inputs = StartupInputs::Xp5(xp5::Startup {
+        update: "unavailable.dat".into(),
+        manifest: None,
+        boot_rom: None,
+        card_image: None,
+        card_files: vec![],
+        second_card_image: None,
+        second_card_files: vec![],
+        scene: None,
+        output: None, viewer_port: None, viewer_keys: None,
+        mode: Mode::Strict,
+        quantum: None,
+        camera_settings: Default::default(),
+    });
+    assert_eq!(
+        open(resolved, inputs).err().unwrap(),
+        "startup inputs do not match configuration x70-110-rec"
+    );
+}

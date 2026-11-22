@@ -1,6 +1,5 @@
 """Executable illustrated guides. Camera adapters own execution and observation."""
 
-import hashlib
 import importlib
 import importlib.abc
 import importlib.machinery
@@ -10,13 +9,14 @@ import math
 import os
 import sys
 import types
-from collections.abc import Callable, Generator, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from string.templatelib import Template
 from typing import Literal, NotRequired, Protocol, Self, TypedDict, cast
 
+from .. import perf
 from ..recording import Frame
 from .menu import MenuScreen
 from .overlays import CardOverlay, CardSnapshot, DisplayOverlay
@@ -100,7 +100,7 @@ class Step(TypedDict):
     title: list[Token]
     text: list[Token]
     screenshot: str
-    screenshot_sha256: str
+    capture_index: int
     video_start: float
     video_end: float
     hold: float
@@ -145,6 +145,7 @@ class Report(TypedDict):
     still: NotRequired[int]
     hero: NotRequired[list[Hero]]
     steps: list[Step]
+    captures: NotRequired[list[dict[str, object]]]
     inputs: list[Input]
     interactions: list[Interaction]
     fixtures: list[Fixture]
@@ -154,7 +155,6 @@ class Report(TypedDict):
     error: NotRequired[str]
     video: NotRequired[str]
     presentation: NotRequired[Presentation]
-    artifacts: NotRequired[dict[str, str]]
     overlays: NotRequired[list[dict[str, object]]]
 
 
@@ -314,7 +314,7 @@ def discover(path: str | Path) -> list[Walkthrough]:
     )
     package = (
         "_walkthrough_"
-        + hashlib.sha256(str(directory).encode()).hexdigest()
+        + "_".join(part for part in directory.name.split() if part)
         + "_"
         + str(next(_discoveries))
     )
@@ -352,14 +352,6 @@ def discover(path: str | Path) -> list[Walkthrough]:
                 value, Walkthrough(source, name, value.walkthrough_title, value)
             )
     return list(found.values())
-
-
-def _digest(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 class Guide[C: RecordingCamera]:
@@ -417,9 +409,13 @@ class Guide[C: RecordingCamera]:
         self._hero = hero
         self._card_overlay: CardOverlay | None = None
 
+    def _saved_report(self) -> Mapping[str, object]:
+        """The report to serialize. The run keeps using its live observations."""
+        return self.report
+
     def save(self) -> None:
         temporary = self.output / ".guide.json.tmp"
-        temporary.write_text(json.dumps(self.report, indent=2) + "\n")
+        temporary.write_text(json.dumps(dict(self._saved_report()), separators=(",", ":")) + "\n")
         os.replace(temporary, self.output / "guide.json")
 
     def _overlay_event(self, event: dict[str, object]) -> None:
@@ -582,7 +578,7 @@ class Guide[C: RecordingCamera]:
                 return
             number = len(self.report["steps"]) + 1
             name = f"screenshots/{number:03d}.png"
-            digest = self.recording.screenshot(frame, name)
+            self.recording.screenshot(frame, name)
             self.recording.still(frame, hold)
             self.report["steps"].append(
                 dict(
@@ -590,7 +586,7 @@ class Guide[C: RecordingCamera]:
                     title=title_tokens,
                     text=text_tokens,
                     screenshot=name,
-                    screenshot_sha256=digest,
+                    capture_index=len(self.report.get("captures", [])) - 1,
                     video_start=start,
                     video_end=self.recording.seconds,
                     hold=hold,
@@ -646,6 +642,7 @@ class Guide[C: RecordingCamera]:
         try:
             self._preparing = True
             self.camera.start_recording(self)
+            perf.snapshot_counters(getattr(self.camera, "board", None))
             # Prerequisites whose end state the camera was resumed from; their
             # own recordings passed, and they are not executed again here.
             for name in restored:
@@ -657,10 +654,11 @@ class Guide[C: RecordingCamera]:
                 print("Replaying prerequisite: " + name, flush=True)
                 entry: Prerequisite = dict(walkthrough=name, passed=False)
                 self.report["prerequisites"].append(entry)
-                prepare(self.camera, self)
-                if self._failures:
-                    raise self._failures[0]
-                entry["passed"] = True
+                with perf.span("prerequisite", board=getattr(self.camera, "board", None)):
+                    prepare(self.camera, self)
+                    if self._failures:
+                        raise self._failures[0]
+                    entry["passed"] = True
             self.recording.card_panel(None)
             self.recording.display_panel(None)
             self._card_overlay = None
@@ -722,12 +720,7 @@ class Guide[C: RecordingCamera]:
                 if self.input_badges is not None
                 else None,
             )
-            artifacts = {
-                str(p.relative_to(self.output)): _digest(p)
-                for p in self.output.rglob("*")
-                if p.is_file() and p.name not in ("guide.json", ".guide.json.tmp")
-            }
-            self.report["artifacts"] = artifacts
+            self.report["performance"] = perf.end_guide(getattr(self.camera, "board", None))
             self.save()
         if error is not None:
             raise error

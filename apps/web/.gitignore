@@ -6,6 +6,9 @@ dist-local-preview/
 public/artifacts/
 public/runtime/
 .env.local
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
 build/
 
 # Local simulator captures retained independently of build cleanup.
@@ -14,3 +17,4 @@ browser-bug-reports/
 public/site-assets.json
 .site-assets-*/
 public/review/
+public/docs/sdk/focal/

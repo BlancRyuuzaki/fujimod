@@ -91,8 +91,8 @@ impl Cpu for Core {
             })
             .collect())
     }
-    fn fingerprint(&self) -> Result<serde_json::Value, String> {
-        self.execution.fingerprint()
+    fn state(&self) -> Result<fujimod_emulator_cpu::CpuState, String> {
+        self.direct_state()
     }
     fn model(&self) -> Model {
         Model::CortexR5F
@@ -148,6 +148,9 @@ impl Cpu for Core {
                 .execution
                 .pmu_access(r.crm, r.opc2, value)
                 .map(u64::from);
+        }
+        if value.is_some() {
+            self.execution.cache_spans_stale.set(true);
         }
         self.execution.cpu.coprocessor(r, value)
     }
@@ -700,6 +703,11 @@ impl Cpu for Core {
         counters.insert(
             "loop_proofs_failed_cpsr_e_or_j",
             l.proofs_failed_cpsr_e_or_j.get(),
+        );
+        counters.insert("loop_proofs_failed_it_block", l.proofs_failed_it_block.get());
+        counters.insert(
+            "loop_proofs_failed_inputs_changed",
+            l.proofs_failed_inputs_changed.get(),
         );
         counters.insert(
             "loop_proofs_failed_loop_condition_not_taken",

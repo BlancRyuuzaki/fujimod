@@ -31,6 +31,8 @@ pub struct Wiring {
     pub parameters: Option<ParameterHandle>,
     pub memory_outputs: Option<MemoryOutputHandle>,
     pub edges: fujimod_emulator_imaging::scene::FramePhases,
+    /// Comparator output wires: high once fired, low when started again.
+    pub comparator_outputs: [Option<fujimod_emulator_devices::signals::Level>; 6],
     pub start_tick: u64,
 }
 #[derive(Serialize, Deserialize)]
@@ -56,6 +58,14 @@ struct State {
     dma: Transfer,
     raw3_dma: Transfer,
     raw_origins: std::collections::BTreeMap<u64, [usize; 2]>,
+    /// Sensor-clock frame edge held until its RAW channel-2 readout completes,
+    /// for sensors whose capture frames end at readout.
+    #[serde(default)]
+    readout_edge: Option<FrameEdge>,
+    /// Guest tick at which each started comparator reaches its point in the
+    /// sensor frame. Firing clears its started bit (16) and drives its output.
+    #[serde(default)]
+    comparator_due: [Option<u64>; 6],
 }
 pub struct ImageInput {
     state: State,
@@ -93,7 +103,7 @@ impl ImageInput {
             || options
                 .command_controls
                 .iter()
-                .any(|v| ![0, 2, 0x1000000, 0x1030000].contains(v))
+                .any(|v| ![0, 2, 0x30000, 0x1000000, 0x1030000].contains(v))
         {
             return Err("image input timing/command options are invalid".into());
         }
@@ -139,6 +149,8 @@ impl ImageInput {
                 dma: Transfer::default(),
                 raw3_dma: Transfer::default(),
                 raw_origins: Default::default(),
+                readout_edge: None,
+                comparator_due: [None; 6],
             },
             options,
             wiring,
@@ -296,6 +308,15 @@ impl ImageInput {
         }
         Ok(())
     }
+    /// Publish one sensor-clock frame edge to every enabled phase gate.
+    fn publish_frame_edge(&mut self, edge: FrameEdge, cx: &mut Cx<'_>) -> Result<(), String> {
+        for (i, enabled) in self.clock_gates().into_iter().enumerate() {
+            if enabled {
+                self.publish_phase(i, edge, cx)?;
+            }
+        }
+        self.publish_record_phase(cx)
+    }
     fn selected_period(&self, fixed: u64) -> Result<u64, String> {
         let period = self
             .wiring
@@ -367,7 +388,9 @@ impl ImageInput {
         // Other source controls and partial-field modes remain unsupported.
         let (packing, pitch) = match (r[0x394 / 4], r[0x3ac / 4], r[0x39c / 4]) {
             (0x1000000, 0xc003, 0x40000) => (Packing::U16, r[0x3a4 / 4] as usize),
-            (0x1000100, 0xc004, 0) => (
+            // X30 1.03 reads back its packed12 still RAW (written with 0x4
+            // bit 16) through burst selector 0xc003 rather than 0xc004.
+            (0x1000100, 0xc004 | 0xc003, 0) => (
                 Packing::Packed12,
                 Packing::Packed12.row_bytes(r[0x3a4 / 4] as usize),
             ),
@@ -382,7 +405,7 @@ impl ImageInput {
         src.validate(packing.row_bytes(src.width))?;
         if src.width < 6
             || src.height < 6
-            || src.width % 2 != 0
+            || !src.width.is_multiple_of(2)
             || src.address & 1 != 0
             || r[0x3a4 / 4] & 1 != 0
         {
@@ -602,6 +625,13 @@ impl ImageInput {
         } else {
             v
         };
+        if let Some(i) = Self::phase(o) {
+            if v & 0x10000 == 0 {
+                self.state.comparator_due[i] = None;
+            } else if let Some(output) = &self.wiring.comparator_outputs[i] {
+                output.drive(false);
+            }
+        }
         if matches!(o, 0x28 | 0x2c) {
             self.publish_grid()?;
         }
@@ -613,6 +643,44 @@ impl ImageInput {
                 (self.state.r[0x28 / 4] & 0xfff) as usize + 1,
                 (self.state.r[0x2c / 4] & 0x3fff) as usize + 1,
             ];
+        }
+        Ok(())
+    }
+    /// A started comparator (bit 16) fires once, at its point in the sensor
+    /// frame that begins at `frame_start`: line (bits 0..13) times the
+    /// receiver's horizontal period plus clock (bits 16..29), in sensor pixel
+    /// clocks. Without a sensor frame clock no point has a guest time.
+    fn arm_comparators(&mut self, frame_start: u64) -> Result<(), String> {
+        let Some(sensor) = &self.wiring.sensor else {
+            return Ok(());
+        };
+        let horizontal = u64::from((self.state.r[0x54 / 4] & 0x3fff) + 1);
+        for i in 0..6 {
+            let o = 0xc4 + i * 0x14;
+            if self.state.r[o / 4] & 0x10000 == 0 || self.state.comparator_due[i].is_some() {
+                continue;
+            }
+            let point = self.state.r[(o + 4) / 4];
+            let clocks = u64::from(point & 0x3fff) * horizontal + u64::from(point >> 16 & 0x3fff);
+            if let Some(ticks) = sensor.pixel_clock_ticks(clocks) {
+                self.state.comparator_due[i] = Some(due(frame_start, ticks.max(1))?);
+            }
+        }
+        Ok(())
+    }
+    fn fire_comparators(&mut self, now: u64) -> Result<(), String> {
+        for i in 0..6 {
+            let Some(tick) = self.state.comparator_due[i].filter(|&t| now >= t) else {
+                continue;
+            };
+            self.state.comparator_due[i] = None;
+            self.state.r[(0xc4 + i * 0x14) / 4] &= !0x10000;
+            if let Some(output) = &self.wiring.comparator_outputs[i] {
+                output.drive(true);
+            }
+            if let Some(sensor) = &mut self.wiring.sensor {
+                sensor.comparator_edge(i, tick)?;
+            }
         }
         Ok(())
     }
@@ -661,11 +729,20 @@ impl ImageInput {
             raw3_ack,
             ..
         } = &mut self.state;
-        if r[1] & 1 != 0 && r[0x35c / 4] & 1 != 0 && !*capture_ack && dma.deadline().is_none() {
+        // A cleared input window has no sample pairs to transfer. The channel
+        // can already be enabled while the sensor continues clocking frames
+        // and the receiver is being programmed for its next readout.
+        let window_programmed = r[0x14 / 4] != 0 || r[0x18 / 4] != 0;
+        if window_programmed
+            && r[1] & 1 != 0
+            && r[0x35c / 4] & 1 != 0
+            && !*capture_ack
+            && dma.deadline().is_none()
+        {
             *dma = Self::prepare_raw_channel(
                 cx.now(),
                 self.options.raw_dma_ticks,
-                &r,
+                r,
                 sensor,
                 0x354,
                 0x358,
@@ -673,22 +750,37 @@ impl ImageInput {
                 "RAW channel2",
             )?;
             *raw_exposure = sensor.physical_exposure();
-            raw_origins.insert(physical(r[0x358 / 4] as u64, 1)?,
-                [(r[0x14 / 4] >> 16 & 0x3fff) as usize, (r[0x18 / 4] >> 16 & 0x3fff) as usize]);
+            raw_origins.insert(
+                physical(r[0x358 / 4] as u64, 1)?,
+                [
+                    (r[0x14 / 4] >> 16 & 0x3fff) as usize,
+                    (r[0x18 / 4] >> 16 & 0x3fff) as usize,
+                ],
+            );
         }
-        if r[1] & 1 != 0 && r[0x378 / 4] & 1 != 0 && !*raw3_ack && raw3_dma.deadline().is_none() {
+        if window_programmed
+            && r[1] & 1 != 0
+            && r[0x378 / 4] & 1 != 0
+            && !*raw3_ack
+            && raw3_dma.deadline().is_none()
+        {
             *raw3_dma = Self::prepare_raw_channel(
                 cx.now(),
                 self.options.raw_dma_ticks,
-                &r,
+                r,
                 sensor,
                 0x370,
                 0x374,
                 0x37c,
                 "RAW channel3",
             )?;
-            raw_origins.insert(physical(r[0x374 / 4] as u64, 1)?,
-                [(r[0x14 / 4] >> 16 & 0x3fff) as usize, (r[0x18 / 4] >> 16 & 0x3fff) as usize]);
+            raw_origins.insert(
+                physical(r[0x374 / 4] as u64, 1)?,
+                [
+                    (r[0x14 / 4] >> 16 & 0x3fff) as usize,
+                    (r[0x18 / 4] >> 16 & 0x3fff) as usize,
+                ],
+            );
         }
         Ok(true)
     }
@@ -713,15 +805,16 @@ impl ImageInput {
         } else {
             Packing::U16
         };
-        let width = (r[0x24 / 4] & 0x3fff) as usize;
+        // Active columns (0x24) bound the readout; the window count (0x14)
+        // may narrow it.
+        let width = (r[0x24 / 4] & 0x3fff).min((r[0x14 / 4] & 0x1fff) + 1) as usize;
         let height = (r[0x18 / 4] & 0x3fff) as usize + 1;
         let left = (r[0x14 / 4] >> 16 & 0x3fff) as usize;
         let top = (r[0x18 / 4] >> 16 & 0x3fff) as usize;
         if r[0x14 / 4] & !0x3fff1fff != 0
             || r[0x18 / 4] & !0x3fff3fff != 0
             || width == 0
-            || width % 2 != 0
-            || width > (r[0x14 / 4] & 0x1fff) as usize + 1
+            || !width.is_multiple_of(2)
             || left + width > sensor.width
             || top + height > sensor.height
         {
@@ -769,6 +862,7 @@ impl ImageInput {
                 self.state.r[o / 4] |= 3;
             }
         }
+        self.fire_comparators(now)?;
         self.sync_clocks(now)?;
         let mut record_edge = false;
         for i in 0..2 {
@@ -813,23 +907,23 @@ impl ImageInput {
                     .checked_mul(period)
                     .ok_or("sensor clock overflow")?,
             )?);
-            if self.frame(cx)? && self.uses_sensor_clock() {
-                let edge = self
-                    .wiring
-                    .sensor
-                    .as_ref()
-                    .unwrap()
+            let idle = self.state.dma.deadline().is_none();
+            let latched = self.frame(cx)?;
+            self.arm_comparators(old)?;
+            if latched && self.uses_sensor_clock() {
+                let sensor = self.wiring.sensor.as_ref().unwrap();
+                let at_readout_end = sensor.edge_at_raw_readout_end();
+                let edge = sensor
                     .frames
                     .lock()
                     .map_err(|_| "sensor frame clock poisoned")?
                     .edge
                     .unwrap();
-                for (i, enabled) in self.clock_gates().into_iter().enumerate() {
-                    if enabled {
-                        self.publish_phase(i, edge, cx)?;
-                    }
+                if idle && self.state.dma.deadline().is_some() && at_readout_end {
+                    self.state.readout_edge = Some(edge);
+                } else {
+                    self.publish_frame_edge(edge, cx)?;
                 }
-                self.publish_record_phase(cx)?;
             }
         }
         if self.state.dma.write(cx)? {
@@ -841,6 +935,13 @@ impl ImageInput {
         {
             self.wiring.raw_irq.raise(cx)?;
             self.state.capture_irq_sent = true;
+        }
+        // The held capture frame ends when its RAW readout lands, after the
+        // RAW completion interrupt above.
+        if self.state.dma.deadline().is_none()
+            && let Some(edge) = self.state.readout_edge.take()
+        {
+            self.publish_frame_edge(FrameEdge { tick: now, ..edge }, cx)?;
         }
         if self.state.raw3_dma.write(cx)? {
             self.state.raw3_ack = true;
@@ -961,12 +1062,14 @@ impl Device for ImageInput {
             dma,
             raw3_dma,
             raw_origins,
+            readout_edge,
+            comparator_due,
         } = &self.state;
         let state = serde_json::json!({"r":r,"reset":reset,"command_due":command_due,"command_armed":command_armed,
-            "raw_exposure":raw_exposure,"command_done":command_done,"command_bytes":fujimod_emulator_devices::fingerprint::bytes(command_bytes),"phases":phases,
+            "raw_exposure":raw_exposure,"command_done":command_done,"command_bytes":fujimod_emulator_devices::state::bytes(command_bytes),"phases":phases,
             "phase_due":phase_due,"phase_pending":phase_pending,"phase_period":phase_period,"sensor_due":sensor_due,"capture_ack":capture_ack,
             "capture_irq_sent":capture_irq_sent,"raw3_ack":raw3_ack,"raw3_irq_sent":raw3_irq_sent,
-            "readback_due":readback_due,"stop_due":stop_due,"dma":dma.fingerprint(),"raw3_dma":raw3_dma.fingerprint(),"raw_origins":raw_origins});
+            "readback_due":readback_due,"stop_due":stop_due,"dma":dma.fingerprint(),"raw3_dma":raw3_dma.fingerprint(),"raw_origins":raw_origins,"readout_edge":readout_edge,"comparator_due":comparator_due});
         let sensor = self.wiring.sensor.as_ref().map(|s| s.fingerprint());
         let outputs = self
             .wiring
@@ -975,7 +1078,7 @@ impl Device for ImageInput {
             .map(|s| s.lock().unwrap().fingerprint());
         Ok(
             serde_json::json!({"state":state,"edges":*self.wiring.edges.lock().unwrap(),"sensor":sensor,
-            "frame_period":self.wiring.frame_period.is_some(),"statistics_grid":self.wiring.statistics_grid.is_some(),"outputs":outputs,"cfa":self.cfa,"film":self.film,"source":fujimod_emulator_devices::fingerprint::bytes(&self.source)}),
+            "frame_period":self.wiring.frame_period.is_some(),"statistics_grid":self.wiring.statistics_grid.is_some(),"outputs":outputs,"cfa":self.cfa,"film":self.film,"source":fujimod_emulator_devices::state::bytes(&self.source)}),
         )
     }
 
@@ -1048,6 +1151,7 @@ impl Device for ImageInput {
             .chain(s.raw3_dma.deadline())
             .chain(s.readback_due)
             .chain(s.stop_due)
+            .chain(s.comparator_due.into_iter().flatten())
             .min()
     }
     fn advance(&mut self, cx: &mut Cx<'_>) {

@@ -19,8 +19,38 @@ pub trait Controls: Send + Sync {
     fn register_sample(&self, _register: u8) -> Option<u16> {
         None
     }
+    /// Every power-controller register these controls drive, in ascending
+    /// order: the register ladders plus any register whose bits a switch
+    /// drives or whose count a dial accumulates.
+    fn driven_registers(&self) -> Vec<u8> {
+        self.register_ladders()
+    }
+    /// Value of a driven register given its current value, or `None` to leave
+    /// it unchanged. Host inspection never advances the controls.
+    fn drive_register(&self, register: u8, _current: u16) -> Option<u16> {
+        self.register_sample(register)
+    }
+    /// Value one guest read of a counting register returns. The read consumes
+    /// what it returns; `None` for any register that does not count.
+    fn take_register(&self, _register: u8) -> Option<u16> {
+        None
+    }
     fn save(&self) -> Value;
     fn restore(&self, state: &Value) -> Result<(), String>;
+    /// Exact future-affecting state, including held keys and queued edges.
+    /// Diagnostic `save()` is not a restore source.
+    fn checkpoint(&self) -> Result<crate::checkpoint::Checkpoint, String> {
+        Err("physical controls have no exact checkpoint implementation".into())
+    }
+    fn validate_checkpoint(
+        &self,
+        _: &crate::checkpoint::Checkpoint,
+    ) -> Result<(), String> {
+        Err("physical controls have no exact checkpoint implementation".into())
+    }
+    fn restore_checkpoint(&self, _: &crate::checkpoint::Checkpoint) -> Result<(), String> {
+        Err("physical controls have no exact checkpoint implementation".into())
+    }
 }
 
 /// A physical input queue is a non-MMIO source on the same device timeline.
@@ -55,5 +85,14 @@ impl crate::Device for Source {
     }
     fn restore(&mut self, state: &Value) -> Result<(), String> {
         self.0.restore(state)
+    }
+    fn checkpoint(&self) -> Result<crate::checkpoint::Checkpoint, String> {
+        self.0.checkpoint()
+    }
+    fn validate_checkpoint(&self, saved: &crate::checkpoint::Checkpoint) -> Result<(), String> {
+        self.0.validate_checkpoint(saved)
+    }
+    fn restore_checkpoint(&mut self, saved: &crate::checkpoint::Checkpoint) -> Result<(), String> {
+        self.0.restore_checkpoint(saved)
     }
 }

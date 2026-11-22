@@ -116,7 +116,7 @@ impl Pixels {
     fn fingerprint(&self) -> serde_json::Value {
         match self {
             Self::Packed(p) => {
-                serde_json::json!({"packed":fujimod_emulator_devices::fingerprint::bytes(p)})
+                serde_json::json!({"packed":fujimod_emulator_devices::state::bytes(p)})
             }
             Self::Sensor(image) => serde_json::json!({"sensor":image.fingerprint()}),
         }
@@ -143,6 +143,12 @@ struct ImageState {
 #[derive(Clone)]
 pub struct ImageFrames(pub Arc<Mutex<ImageFrame>>);
 impl ImageFrames {
+    /// Reconstruct an immutable image only for readable diagnostics.
+    pub fn decoded(saved: &Checkpoint, sensor: Option<&SensorDecoders>) -> Result<Self, String> {
+        Ok(Self(Arc::new(Mutex::new(Self::from_checkpoint(
+            saved, sensor,
+        )?))))
+    }
     pub fn checkpoint(&self) -> Result<fujimod_emulator_devices::checkpoint::Checkpoint, String> {
         let frame = self.0.lock().map_err(|_| "image-frame poisoned")?;
         let state = ImageState {
@@ -216,7 +222,7 @@ impl ImageFrames {
     pub fn fingerprint(&self) -> serde_json::Value {
         let frame = self.0.lock().unwrap();
         serde_json::json!({"edge":frame.edge,"layout":[frame.layout.width,frame.layout.height,frame.layout.stride],
-            "pixels":frame.pixels.fingerprint(),"prepared":frame.prepared.as_ref().map(|b|fujimod_emulator_devices::fingerprint::bytes(b)),"source":frame.source,
+            "pixels":frame.pixels.fingerprint(),"prepared":frame.prepared.as_ref().map(|b|fujimod_emulator_devices::state::bytes(b)),"source":frame.source,
             "radiance":frame.radiance.as_ref().map(|f|f.fingerprint())})
     }
     pub fn new(layout: ImageLayout) -> Result<Self, String> {
@@ -325,6 +331,14 @@ pub struct StatisticsFrame {
 #[derive(Clone)]
 pub struct StatisticsFrames(pub Arc<Mutex<StatisticsFrame>>);
 impl StatisticsFrames {
+    /// Reconstruct statistics only for readable diagnostics.
+    pub fn decoded(
+        saved: &fujimod_emulator_devices::checkpoint::Checkpoint,
+    ) -> Result<Self, String> {
+        Ok(Self(Arc::new(Mutex::new(
+            saved.decode("statistics-frame")?,
+        ))))
+    }
     pub fn checkpoint(&self) -> Result<fujimod_emulator_devices::checkpoint::Checkpoint, String> {
         fujimod_emulator_devices::checkpoint::Checkpoint::encode(
             "statistics-frame",
@@ -350,7 +364,7 @@ impl StatisticsFrames {
     pub fn fingerprint(&self) -> serde_json::Value {
         let frame = self.0.lock().unwrap();
         serde_json::json!({"edge":frame.edge,"spans":frame.spans.iter().map(|s|serde_json::json!({
-            "destination":s.destination,"offset":s.offset,"bytes":fujimod_emulator_devices::fingerprint::bytes(&s.bytes)})).collect::<Vec<_>>()})
+            "destination":s.destination,"offset":s.offset,"bytes":fujimod_emulator_devices::state::bytes(&s.bytes)})).collect::<Vec<_>>()})
     }
     pub fn new(spans: Vec<StatisticsSpan>) -> Result<Self, String> {
         let mut total = 0usize;

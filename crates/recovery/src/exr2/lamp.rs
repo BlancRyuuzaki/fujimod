@@ -6,7 +6,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
-const PROGRAM: &[u8] = include_bytes!("../../assets/startup-lamp.generated.bin");
+const PROGRAM: &[u8] = include_bytes!("../../assets/sd-boot-v1-startup-lamp.generated.bin");
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartupLamp {
@@ -22,88 +22,6 @@ pub struct StartupLamp {
     pub gpio_edits: Vec<Edit>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::image::{Compression, Region, Source};
-
-    fn fixture() -> (StartupLamp, Plan, Vec<u8>) {
-        let mut ram = vec![0; 0x210000];
-        for (at, value) in [
-            (0x20, 0x1800),
-            (0x200104, 1),
-            (0x200108, 0xf0002),
-            (0x200080, 0xebffffde),
-            (0x200500, 0x200300),
-            (0x200504, 0x200400),
-            (0x1900, 0xffff0004),
-        ] {
-            put(&mut ram, at, value).unwrap();
-        }
-        let proof = |address, size| Proof {
-            address,
-            size,
-            sha256: fujimod_firmware::sha256(&ram[address..address + size]),
-        };
-        let lamp = StartupLamp {
-            gpio: 0xfff893c0,
-            pin: 2,
-            reset_vector: 0x20,
-            reset: proof(0x1800, 4),
-            descriptor: proof(0x200100, 28),
-            writer: proof(0x200000, 4),
-            ready: [proof(0x200300, 4), proof(0x200400, 4)],
-            ready_slots: [0x200500, 0x200504],
-            writes: vec![0x200080],
-            gpio_edits: vec![Edit {
-                address: 0x1900,
-                old: 0xffff0004,
-                new: 0xffff0000,
-                what: "Green startup output".into(),
-            }],
-        };
-        let plan = Plan {
-            size: ram.len(),
-            entry: 0,
-            bss: vec![],
-            edits: vec![],
-            regions: vec![Region {
-                name: "application".into(),
-                address: 0x200000,
-                source: Source {
-                    dat_offset: 0,
-                    size: 0x1000,
-                    compression: Compression::Raw,
-                    decoded_size: 0x1000,
-                    sha256: String::new(),
-                    initialized_prefix: None,
-                },
-            }],
-        };
-        (lamp, plan, ram)
-    }
-
-    #[test]
-    fn preserves_stock_handlers_and_checks_every_binding_before_installing() {
-        let (lamp, plan, ram) = fixture();
-        let mut installed = ram.clone();
-        lamp.install(&plan, &mut installed).unwrap();
-        assert_ne!(word(&installed, 0x20).unwrap(), 0x1800);
-        assert_ne!(word(&installed, 0x200500).unwrap(), 0x200300);
-        assert_eq!(&installed[0x200000..0x200004], &ram[0x200000..0x200004]);
-        assert_eq!(word(&installed, 0x1900).unwrap(), 0xffff0000);
-        for at in [
-            0x20, 0x1800, 0x1900, 0x200000, 0x200080, 0x200104, 0x200300, 0x200400, 0x200500,
-            0x101000,
-        ] {
-            let mut changed = ram.clone();
-            changed[at] ^= 1;
-            let before = changed.clone();
-            assert!(lamp.install(&plan, &mut changed).is_err(), "{at:x}");
-            assert_eq!(changed, before, "rejected input changed at {at:x}");
-        }
-    }
-}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Layout {
@@ -120,7 +38,7 @@ struct Layout {
 impl StartupLamp {
     pub(crate) fn install(&self, plan: &Plan, ram: &mut [u8]) -> Result<()> {
         let layout: Layout =
-            serde_json::from_str(include_str!("../../assets/startup-lamp.generated.json"))
+            serde_json::from_str(include_str!("../../assets/sd-boot-v1-startup-lamp.generated.json"))
                 .map_err(|e| image::Error::Invalid(e.to_string()))?;
         require(
             layout.schema == 1
@@ -234,5 +152,88 @@ impl StartupLamp {
             put(ram, edit.address, edit.new)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::image::{Compression, Region, Source};
+
+    fn fixture() -> (StartupLamp, Plan, Vec<u8>) {
+        let mut ram = vec![0; 0x210000];
+        for (at, value) in [
+            (0x20, 0x1800),
+            (0x200104, 1),
+            (0x200108, 0xf0002),
+            (0x200080, 0xebffffde),
+            (0x200500, 0x200300),
+            (0x200504, 0x200400),
+            (0x1900, 0xffff0004),
+        ] {
+            put(&mut ram, at, value).unwrap();
+        }
+        let proof = |address, size| Proof {
+            address,
+            size,
+            sha256: fujimod_firmware::sha256(&ram[address..address + size]),
+        };
+        let lamp = StartupLamp {
+            gpio: 0xfff893c0,
+            pin: 2,
+            reset_vector: 0x20,
+            reset: proof(0x1800, 4),
+            descriptor: proof(0x200100, 28),
+            writer: proof(0x200000, 4),
+            ready: [proof(0x200300, 4), proof(0x200400, 4)],
+            ready_slots: [0x200500, 0x200504],
+            writes: vec![0x200080],
+            gpio_edits: vec![Edit {
+                address: 0x1900,
+                old: 0xffff0004,
+                new: 0xffff0000,
+                what: "Green startup output".into(),
+            }],
+        };
+        let plan = Plan {
+            size: ram.len(),
+            entry: 0,
+            bss: vec![],
+            edits: vec![],
+            regions: vec![Region {
+                name: "application".into(),
+                address: 0x200000,
+                source: Source {
+                    dat_offset: 0,
+                    size: 0x1000,
+                    compression: Compression::Raw,
+                    decoded_size: 0x1000,
+                    sha256: String::new(),
+                    initialized_prefix: None,
+                },
+            }],
+        };
+        (lamp, plan, ram)
+    }
+
+    #[test]
+    fn preserves_stock_handlers_and_checks_every_binding_before_installing() {
+        let (lamp, plan, ram) = fixture();
+        let mut installed = ram.clone();
+        lamp.install(&plan, &mut installed).unwrap();
+        assert_ne!(word(&installed, 0x20).unwrap(), 0x1800);
+        assert_ne!(word(&installed, 0x200500).unwrap(), 0x200300);
+        assert_eq!(&installed[0x200000..0x200004], &ram[0x200000..0x200004]);
+        assert_eq!(word(&installed, 0x1900).unwrap(), 0xffff0000);
+        for at in [
+            0x20, 0x1800, 0x1900, 0x200000, 0x200080, 0x200104, 0x200300, 0x200400, 0x200500,
+            0x101000,
+        ] {
+            let mut changed = ram.clone();
+            changed[at] ^= 1;
+            let before = changed.clone();
+            assert!(lamp.install(&plan, &mut changed).is_err(), "{at:x}");
+            assert_eq!(changed, before, "rejected input changed at {at:x}");
+        }
     }
 }

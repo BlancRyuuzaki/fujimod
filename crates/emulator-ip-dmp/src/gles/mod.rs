@@ -162,17 +162,51 @@ fn read_guest_draw_memory(
     Ok(bytes)
 }
 
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct Publication {
+    registers: BTreeMap<u16, u32>,
+    vertices_executed: u64,
+    last_output: Option<[[Option<f32>; 4]; 16]>,
+    code_words: usize,
+    host_rasterizer: &'static str,
+    host_shader_cache: Option<ShaderCachePublication>,
+}
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+struct ShaderCachePublication {
+    vertex_modules: usize,
+    fragment_modules: usize,
+    pipelines: usize,
+}
+
 impl Engine {
-    pub fn diagnostics(&self) -> serde_json::Value {
+    /// Exact viewer publication without serializing register or shader state.
+    pub fn publication_state(&self) -> Publication {
         #[cfg(not(target_os = "emscripten"))]
         let host_shader_cache = {
             let (vertex_modules, fragment_modules, pipelines) =
                 gpu_draw::shader_cache_creation_counts();
-            serde_json::json!({"vertex_modules":vertex_modules,"fragment_modules":fragment_modules,"pipelines":pipelines})
+            Some(ShaderCachePublication {
+                vertex_modules,
+                fragment_modules,
+                pipelines,
+            })
         };
         #[cfg(target_os = "emscripten")]
-        let host_shader_cache = serde_json::Value::Null;
-        serde_json::json!({"registers":self.regs,"vertices_executed":self.vertices_executed,"last_output":self.last_output,"code_words":self.code.len(),"host_rasterizer":"CPU","host_shader_cache":host_shader_cache})
+        let host_shader_cache = None;
+        Publication {
+            registers: self.regs.clone(),
+            vertices_executed: self.vertices_executed,
+            // JSON represents nonfinite floats as null; preserve that equality.
+            last_output: self.last_output.map(|vectors| {
+                vectors.map(|vector| vector.map(|value| value.is_finite().then_some(value)))
+            }),
+            code_words: self.code.len(),
+            host_rasterizer: "CPU",
+            host_shader_cache,
+        }
+    }
+    pub fn diagnostics(&self) -> serde_json::Value {
+        serde_json::to_value(self.publication_state()).expect("typed GLES publication")
     }
     pub fn reg(&self, index: u16) -> u32 {
         self.regs.get(&index).copied().unwrap_or(0)
@@ -425,7 +459,7 @@ impl Engine {
         read: &mut Reader<'_>,
         out: &mut raster::Targets,
     ) -> Result<(), String> {
-        if !matches!(index, 0x200|0x210|0x240..=0x244|0x247..=0x256|0x258..=0x259|0x264..=0x268|0x26d..=0x273|0x278|0x280..=0x285|0x287|0x289|0x28d..=0x28e|0x291..=0x297|0x299|0x2c0..=0x2c4|0x2c8..=0x2cc|0x2e0..=0x2e4|0x2e6|0x2e8|0x2f0|0x300..=0x309|0x312..=0x31e|0x320|0x400..=0x41a|0x427..=0x435|0x438|0x43a|0x451..=0x453|0x45e..=0x45f|0x480..=0x484|0x489..=0x48d|0x48f..=0x498|0x49b..=0x4a3|0x4a5..=0x4ad)
+        if !matches!(index, 0x200|0x210|0x240..=0x244|0x247..=0x256|0x258..=0x259|0x264..=0x268|0x26d..=0x273|0x278|0x280..=0x285|0x287..=0x289|0x28d..=0x28e|0x291..=0x299|0x2b1..=0x2b4|0x2c0..=0x2c4|0x2c8..=0x2cc|0x2e0..=0x2e4|0x2e6|0x2e8|0x2f0|0x300..=0x309|0x30b|0x310|0x312..=0x31f|0x320|0x400..=0x41a|0x427..=0x435|0x438|0x43a|0x451..=0x453|0x45e..=0x45f|0x480..=0x484|0x489..=0x48d|0x48f..=0x498|0x49b..=0x4a3|0x4a5..=0x4ad)
         {
             return Err(format!("DMP unsupported 3D register {index:#x}"));
         }
@@ -442,6 +476,34 @@ impl Engine {
                     "DMP unsupported cache/engine control {index:#x}={value:#x}"
                 ));
             }
+            // Stock XPP drivers write these in every fragment-state snapshot
+            // (0xda81f8 on X-T20 2.11). Only the observed values are modeled:
+            // 0x30b keeps its context-initial 0x100, 0x310 carries the target
+            // descriptor's tiled layout code 0xb (the raster writes 8x8 Morton
+            // tiles), and 0x31f=1 follows each primitive submission, whose
+            // writes this model has already completed.
+            0x30b if value != 0x100 => {
+                return Err(format!("DMP unsupported fragment control 0x30b={value:#x}"));
+            }
+            0x310 if value != 0xb => {
+                return Err(format!("DMP unsupported target layout 0x310={value:#x}"));
+            }
+            0x31f if value != 1 => {
+                return Err(format!("DMP unsupported target control 0x31f={value:#x}"));
+            }
+            // The stock texture-unit emitter (0xdae8cc on X-T20 2.11) writes
+            // 0x288/0x298 from texture-object +0x208 right after the unit's
+            // dimensions; only a copy of those dimensions is modeled.
+            0x288 | 0x298 if value != self.reg(index - 6) => {
+                return Err(format!(
+                    "DMP unsupported texture extent {index:#x}={value:#x}, dimensions {:#x}",
+                    self.reg(index - 6)
+                ));
+            }
+            // 0x2b1..0x2b4 are stored without effect. Their stock defaults
+            // contain BT.601 YUV-to-RGB coefficients x256 (298, 408, 516), so
+            // they most likely configure YUV sampling; every sampler format
+            // outside the modeled RGB/luminance/alpha set is refused.
             0x28d if value > 1 => return Err("DMP unsupported sampler latch control".into()),
             0x48d if value & !7 != 0 => return Err("DMP unsupported output flags".into()),
             0x431 | 0x45f if value > 1 => return Err("DMP unsupported primitive trigger".into()),

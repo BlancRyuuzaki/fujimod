@@ -1279,6 +1279,13 @@
           "additionalProperties": false,
           "description": "encoder hardware.",
           "properties": {
+            "adc": {
+              "description": "Optional ADC output connection.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "counter": {
               "description": "counter.",
               "type": [
@@ -1287,8 +1294,11 @@
               ]
             },
             "gpio": {
-              "description": "gpio.",
-              "type": "string"
+              "description": "Optional GPIO output connection.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "kind": {
               "const": "encoder",
@@ -1296,8 +1306,7 @@
             }
           },
           "required": [
-            "kind",
-            "gpio"
+            "kind"
           ],
           "type": "object"
         },
@@ -3364,6 +3373,11 @@
           "type": "string"
         },
         {
+          "const": "SataHost",
+          "description": "SATA host controller register block.",
+          "type": "string"
+        },
+        {
           "const": "StillProcessor",
           "description": "Shared still processor with body-declared CFA.",
           "type": "string"
@@ -3523,6 +3537,80 @@
         "connection_id"
       ],
       "type": "object"
+    },
+    "EncoderLevels": {
+      "additionalProperties": false,
+      "description": "Raw ADC codes for one encoder phase channel.",
+      "properties": {
+        "high": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "low": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "low",
+        "high"
+      ],
+      "type": "object"
+    },
+    "EncoderOutputs": {
+      "description": "Physical encoder output levels; channel order is high phase bit, low phase bit.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "gpio",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "channels": {
+              "items": {
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "maxItems": 2,
+              "minItems": 2,
+              "type": "array"
+            },
+            "kind": {
+              "const": "adc",
+              "type": "string"
+            },
+            "levels": {
+              "items": {
+                "$ref": "#/$defs/EncoderLevels"
+              },
+              "maxItems": 2,
+              "minItems": 2,
+              "type": "array"
+            }
+          },
+          "required": [
+            "kind",
+            "channels",
+            "levels"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "FocusAxis": {
       "additionalProperties": false,
@@ -4134,6 +4222,35 @@
       ],
       "type": "object"
     },
+    "HardwareCurtains": {
+      "additionalProperties": false,
+      "description": "Declared focal-plane curtain facts.",
+      "properties": {
+        "first_output": {
+          "description": "Image-input comparator output that releases the first curtain.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "light_offset_seconds": {
+          "description": "Light added to the interval between the two comparator edges, seconds.",
+          "format": "double",
+          "type": "number"
+        },
+        "second_output": {
+          "description": "Image-input comparator output that releases the second curtain.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "first_output",
+        "second_output",
+        "light_offset_seconds"
+      ],
+      "type": "object"
+    },
     "HardwareDecompressor": {
       "additionalProperties": false,
       "description": "Declared decompressor facts.",
@@ -4611,6 +4728,13 @@
       "additionalProperties": false,
       "description": "Declared encoders facts.",
       "properties": {
+        "adc": {
+          "description": "ADC connection for an analog encoder.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "counter": {
           "description": "Declared counter.",
           "type": [
@@ -4637,6 +4761,17 @@
       "additionalProperties": false,
       "description": "Declared encoders options facts.",
       "properties": {
+        "outputs": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EncoderOutputs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Explicit output choice; absent means GPIO for existing bodies."
+        },
         "phase_ticks": {
           "description": "Declared phase ticks.",
           "format": "uint64",
@@ -4648,7 +4783,10 @@
           "items": {
             "$ref": "#/$defs/PartAssemblyPin"
           },
-          "type": "array"
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "rest_phase": {
           "description": "Declared rest phase.",
@@ -4659,7 +4797,6 @@
       },
       "required": [
         "phase_ticks",
-        "pins",
         "rest_phase"
       ],
       "type": "object"
@@ -5139,6 +5276,48 @@
       ],
       "type": "object"
     },
+    "HardwareH264Encoder": {
+      "additionalProperties": false,
+      "description": "X-Processor Pro movie H.264 encoder.",
+      "properties": {
+        "base": {
+          "description": "Declared base.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "basis": {
+          "description": "Declared basis.",
+          "type": "string"
+        },
+        "irq_route": {
+          "description": "Interrupt line of the completion status.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "run_ticks": {
+          "description": "Time from a start to the completion of its run, in device ticks.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "size": {
+          "description": "Declared size.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "base",
+        "basis",
+        "irq_route",
+        "run_ticks",
+        "size"
+      ],
+      "type": "object"
+    },
     "HardwareHdmiTransmitter": {
       "additionalProperties": false,
       "description": "DesignWare HDMI TX controller with no sink attached.",
@@ -5248,6 +5427,17 @@
           ],
           "description": "Declared iris optics."
         },
+        "nd_filter": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HardwareNdFilter"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Declared neutral-density filter."
+        },
         "sensor_capture": {
           "anyOf": [
             {
@@ -5342,6 +5532,18 @@
             "type": "integer"
           },
           "type": "array"
+        },
+        "raw_dma_irqs": {
+          "description": "Completion interrupt lines of the two RAW read-out DMA channels\n(command window +0x40 and +0xc0). Left out, the channels refuse.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
         },
         "receiver_base": {
           "description": "Declared receiver base.",
@@ -5604,8 +5806,7 @@
         "travel_limits": {
           "description": "Declared travel limits.",
           "items": {
-            "format": "uint64",
-            "minimum": 0,
+            "format": "int64",
             "type": "integer"
           },
           "type": "array"
@@ -5621,6 +5822,13 @@
       "additionalProperties": false,
       "description": "Declared iris optics facts.",
       "properties": {
+        "actuator": {
+          "description": "What moves the iris: `lens` (the lens unit's second motor, the default)\nor `bridge` (the stepper behind the bus1 motor bridge).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "output": {
           "description": "Declared output.",
           "type": "string"
@@ -5783,6 +5991,52 @@
       ],
       "type": "object"
     },
+    "HardwareNdFilter": {
+      "additionalProperties": false,
+      "description": "A neutral-density filter swung in by a lens-unit output register.",
+      "properties": {
+        "basis": {
+          "description": "Why the actuator and its factor are believed.",
+          "type": "string"
+        },
+        "factor": {
+          "description": "Light reduction while the filter is in (8 = 3 EV).",
+          "format": "double",
+          "type": "number"
+        },
+        "insert_mask": {
+          "description": "Coil bit that swings the filter in.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output": {
+          "description": "Wire that publishes the current transmission factor.",
+          "type": "string"
+        },
+        "register": {
+          "description": "Lens-unit output register that drives the actuator.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "remove_mask": {
+          "description": "Coil bit that swings the filter out.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "basis",
+        "factor",
+        "insert_mask",
+        "output",
+        "register",
+        "remove_mask"
+      ],
+      "type": "object"
+    },
     "HardwareOptics": {
       "additionalProperties": false,
       "description": "Declared optics facts.",
@@ -5819,6 +6073,16 @@
       "properties": {
         "contact_actuators": {
           "description": "Declared contact actuators.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "contact_cams": {
+          "description": "Declared motor-driven contact cams.",
           "items": {
             "type": "string"
           },
@@ -6142,10 +6406,57 @@
       ],
       "type": "object"
     },
+    "HardwareRadiometricCalibration": {
+      "additionalProperties": false,
+      "description": "Declared calibration of one radiometric path.",
+      "properties": {
+        "reference_white": {
+          "description": "Raw response to the reference white, per colour.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "saturation_lux_seconds": {
+          "description": "Exposure that saturates the reference white.",
+          "format": "double",
+          "type": "number"
+        }
+      },
+      "required": [
+        "reference_white",
+        "saturation_lux_seconds"
+      ],
+      "type": "object"
+    },
     "HardwareRadiometry": {
       "additionalProperties": false,
       "description": "Declared radiometry facts.",
       "properties": {
+        "curtains": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HardwareCurtains"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Declared focal-plane curtains; absent for a leaf-shutter body."
+        },
+        "live_view": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HardwareRadiometricCalibration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Live-view calibration declared separately from the still readout."
+        },
         "mode_change_frames": {
           "description": "Invalid readouts while a sensor drive-mode change acquires sync.",
           "format": "uint8",
@@ -6160,8 +6471,15 @@
           "type": "integer"
         },
         "projection": {
-          "$ref": "#/$defs/HardwareProjection",
-          "description": "Declared projection."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HardwareProjection"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Declared lens projection; absent when no lens is mounted."
         },
         "rolling_references": {
           "description": "Declared rolling references.",
@@ -6176,8 +6494,15 @@
           "type": "number"
         },
         "shutter": {
-          "$ref": "#/$defs/HardwareShutter",
-          "description": "Declared shutter."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HardwareShutter"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Declared leaf shutter; absent for a focal-plane body."
         },
         "shutter_output": {
           "description": "Declared shutter output.",
@@ -6199,11 +6524,9 @@
       },
       "required": [
         "pixel_clock_hz",
-        "projection",
         "rolling_references",
         "mode_change_frames",
         "saturation_lux_seconds",
-        "shutter",
         "shutter_output",
         "ticks_per_second",
         "white_luminance"
@@ -6664,6 +6987,17 @@
           ],
           "description": "Declared gpio."
         },
+        "h264_encoder": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HardwareH264Encoder"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Declared X-Processor Pro movie H.264 encoder."
+        },
         "hdmi_tx": {
           "anyOf": [
             {
@@ -6867,6 +7201,13 @@
           ],
           "description": "Declared sd host clocks."
         },
+        "sd_hosts": {
+          "description": "Declared X-Processor 4 SD hosts.",
+          "items": {
+            "$ref": "#/$defs/HardwareSdHost"
+          },
+          "type": "array"
+        },
         "serial_flash": {
           "anyOf": [
             {
@@ -6920,6 +7261,17 @@
             }
           ],
           "description": "Declared usb."
+        },
+        "usb_phy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HardwareUsbPhy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Declared XP4 USB PHY programming port."
         },
         "xpp_i2c": {
           "anyOf": [
@@ -7022,6 +7374,87 @@
       ],
       "type": "object"
     },
+    "HardwareSdHost": {
+      "additionalProperties": false,
+      "description": "X-Processor 4 SD host: one standard SDHCI register bank at the window base.",
+      "properties": {
+        "base": {
+          "description": "Declared base.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "basis": {
+          "description": "Declared basis.",
+          "type": "string"
+        },
+        "capabilities": {
+          "description": "Capabilities register (+0x40).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "capabilities_2": {
+          "description": "Capabilities 2 register (+0x44).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "clock_ticks": {
+          "description": "Ticks for the internal clock to report stable.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "irq_route": {
+          "description": "Interrupt line of the SDHCI status, when it is known.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "size": {
+          "description": "Declared size.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "slot_and_version": {
+          "description": "Slot status halfword (+0xfc) and host controller version (+0xfe).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "transfer_ticks": {
+          "description": "Ticks of one command or data transfer.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "vendor_offsets": {
+          "description": "Offsets of vendor words beyond the standard bank that read back their\nlast write.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "base",
+        "basis",
+        "capabilities",
+        "capabilities_2",
+        "clock_ticks",
+        "size",
+        "slot_and_version",
+        "transfer_ticks"
+      ],
+      "type": "object"
+    },
     "HardwareSdHostClocks": {
       "additionalProperties": false,
       "description": "Declared sd host clocks facts.",
@@ -7053,10 +7486,77 @@
       ],
       "type": "object"
     },
+    "HardwareSecondaryBusRegisterChip": {
+      "additionalProperties": false,
+      "description": "One further register chip on the secondary bus.",
+      "properties": {
+        "address": {
+          "description": "Seven-bit chip address.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "basis": {
+          "description": "Why this chip and its registers are believed.",
+          "type": "string"
+        },
+        "modes": {
+          "description": "Bus modes in which the chip answers.",
+          "items": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "values": {
+          "description": "Initial register values, each `[register, value]`.",
+          "items": {
+            "items": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "write_masks": {
+          "description": "Writable bits, each `[register, mask]`.",
+          "items": {
+            "items": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "address",
+        "basis",
+        "modes",
+        "values",
+        "write_masks"
+      ],
+      "type": "object"
+    },
     "HardwareSecondaryBusRegisters": {
       "additionalProperties": false,
       "description": "Declared control bus1 replies facts.",
       "properties": {
+        "extra_registers": {
+          "description": "Further register chips on the bus, each with its own register map.",
+          "items": {
+            "$ref": "#/$defs/HardwareSecondaryBusRegisterChip"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "pwic_address": {
           "description": "Declared pwic address.",
           "format": "uint64",
@@ -7702,6 +8202,34 @@
         "out_endpoints",
         "packet_bytes",
         "transfer_ticks"
+      ],
+      "type": "object"
+    },
+    "HardwareUsbPhy": {
+      "additionalProperties": false,
+      "description": "XP4 USB PHY programming port, separate from the device controller.",
+      "properties": {
+        "base": {
+          "description": "Declared base of the indexed control, parallel and readback words.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "basis": {
+          "description": "Declared basis.",
+          "type": "string"
+        },
+        "size": {
+          "description": "Declared size.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "base",
+        "basis",
+        "size"
       ],
       "type": "object"
     },

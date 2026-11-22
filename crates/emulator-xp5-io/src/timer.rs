@@ -1,6 +1,7 @@
 //! X100VI 48 MHz general/PWM and reload timers (ff908000), plus six
 //! extended general channels (ff909000). Finder logical17 uses general6/IRQ42.
 //! External capture inputs are not synthesized.
+use fujimod_emulator_devices::checkpoint::Checkpoint;
 use fujimod_emulator_devices::{Cx, Device};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -58,6 +59,10 @@ impl General {
     }
 }
 
+/// Extended-timer general-channel words (initial count, period, first and second
+/// compare) shared read-only with models of what the PWM outputs drive.
+pub type PwmOutputs = std::sync::Arc<std::sync::Mutex<[[u32; 4]; 6]>>;
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct Timer {
     #[serde(skip)]
@@ -75,6 +80,8 @@ pub struct Timer {
     companion_cpu: Option<usize>,
     #[serde(skip)]
     focus_capture: Option<fujimod_emulator_devices::xp5::pins::SharedPins>,
+    #[serde(skip)]
+    pwm: Option<PwmOutputs>,
 }
 impl Timer {
     pub fn new(base: u64) -> Self {
@@ -144,6 +151,20 @@ impl Timer {
         self.focus_capture = Some(pins);
         self
     }
+    /// Publish the general-channel words of an extended timer to `outputs`.
+    pub fn with_pwm_outputs(mut self, outputs: PwmOutputs) -> Self {
+        self.pwm = Some(outputs);
+        self.publish_pwm();
+        self
+    }
+    fn publish_pwm(&self) {
+        if let Some(outputs) = &self.pwm {
+            let mut outputs = outputs.lock().unwrap();
+            for (n, output) in outputs.iter_mut().enumerate() {
+                *output = self.general[n].words;
+            }
+        }
+    }
     fn schedule(&self, cx: &mut Cx<'_>, channel: usize) {
         let c = &self.counters[channel];
         if c.enabled {
@@ -162,6 +183,20 @@ impl Timer {
             None
         }
     }
+}
+#[derive(Serialize)]
+struct TimerSnapshotRef<'a> {
+    counters: &'a [Counter; 16],
+    general: &'a [General; 16],
+    routing: &'a [u32; 2],
+    group: &'a u32,
+}
+#[derive(Deserialize)]
+struct TimerSnapshot {
+    counters: [Counter; 16],
+    general: [General; 16],
+    routing: [u32; 2],
+    group: u32,
 }
 impl Device for Timer {
     fn name(&self) -> &'static str {
@@ -194,16 +229,21 @@ impl Device for Timer {
             return (g.control | ((g.pending as u32) << 16)) as u64;
         }
         if let Some((n, w)) = self.general_register(offset) {
-            if n == 9 && w == 0 && self.general[n].control & 3 == 3 {
-                if let Some(pins) = &self.focus_capture {
-                    // Logical18/selector33 -> general9. The timer scales
-                    // the captured low13 bits by8 to compare with lens steps.
-                    let pulses = pins.lock().unwrap().focus_pulses;
-                    return self.general[n].words[0].wrapping_add(
-                        (pulses.wrapping_sub(self.general[n].capture_origin) / 8) as u32,
-                    ) as u64;
-                }
+            if n == 9
+                && w == 0
+                && self.general[n].control & 3 == 3
+                && let Some(pins) = &self.focus_capture
+            {
+                // Logical18/selector33 -> general9. The timer scales
+                // the captured low13 bits by8 to compare with lens steps.
+                let pulses = pins.lock().unwrap().focus_pulses;
+                return self.general[n].words[0]
+                    .wrapping_add((pulses.wrapping_sub(self.general[n].capture_origin) / 8) as u32)
+                    as u64;
             }
+            // While a general channel runs, word 0 reads its live down-count.
+            // X-T5 4.31 stage0's microsecond delay (0xFF80196C) polls 0x110
+            // after loading 0xFFFFFFFF there and enabling channel 1.
             if w == 0 && self.general[n].count.enabled {
                 return self.general[n]
                     .count
@@ -300,10 +340,10 @@ impl Device for Timer {
             g.words[w] = value;
             if w == 0 {
                 g.count.value = value;
-                if n == 9 {
-                    if let Some(pins) = &self.focus_capture {
-                        g.capture_origin = pins.lock().unwrap().focus_pulses;
-                    }
+                if n == 9
+                    && let Some(pins) = &self.focus_capture
+                {
+                    g.capture_origin = pins.lock().unwrap().focus_pulses;
                 }
             }
             if w == 1 {
@@ -311,6 +351,7 @@ impl Device for Timer {
             }
             g.count.generation += 1;
             self.schedule_general(cx, n);
+            self.publish_pwm();
             return;
         }
         if self.extended {
@@ -380,14 +421,40 @@ impl Device for Timer {
         cx.set_irq(52 + n as u32, false);
         // M-core routing maps reload channels 8..15 to IRQs 9..16; reload channels
         // 0..7 have no M-core route.
-        if n >= 8 {
-            if let Some(cpu) = self.companion_cpu {
-                if let Err(e) = cx.raise_irq(cpu, (n + 1) as u32) {
-                    cx.fail(e);
-                }
-            }
+        if n >= 8
+            && let Some(cpu) = self.companion_cpu
+            && let Err(e) = cx.raise_irq(cpu, (n + 1) as u32)
+        {
+            cx.fail(e);
         }
         self.schedule(cx, n);
+    }
+    // Field-for-field the `checkpoint_fields!` encoding, written out so a restore
+    // also republishes the PWM words.
+    fn checkpoint(&self) -> Result<Checkpoint, String> {
+        Checkpoint::encode(self.name(), &TimerSnapshotRef {
+            counters: &self.counters,
+            general: &self.general,
+            routing: &self.routing,
+            group: &self.group,
+        })
+    }
+    fn validate_checkpoint(&self, saved: &Checkpoint) -> Result<(), String> {
+        let _: TimerSnapshot = saved.decode(self.name())?;
+        if !saved.blobs().is_empty() {
+            return Err("device snapshot blob lengths differ".into());
+        }
+        Ok(())
+    }
+    fn restore_checkpoint(&mut self, saved: &Checkpoint) -> Result<(), String> {
+        self.validate_checkpoint(saved)?;
+        let TimerSnapshot { counters, general, routing, group } = saved.decode(self.name())?;
+        self.counters = counters;
+        self.general = general;
+        self.routing = routing;
+        self.group = group;
+        self.publish_pwm();
+        Ok(())
     }
     fn save(&self) -> Value {
         serde_json::to_value(self).expect("timer state")
@@ -398,7 +465,9 @@ impl Device for Timer {
         saved.base = self.base;
         saved.companion_cpu = self.companion_cpu;
         saved.focus_capture = self.focus_capture.clone();
+        saved.pwm = self.pwm.clone();
         *self = saved;
+        self.publish_pwm();
         Ok(())
     }
 }
@@ -423,34 +492,6 @@ mod tests {
             c.deadline(Duration::from_nanos(10_000_021)),
             Duration::from_nanos(20_000_021)
         );
-    }
-    #[test]
-    fn running_general_word0_reads_the_live_count() {
-        let mut timer = Timer::new(0);
-        let mut host = Host::default();
-        for (offset, value) in [
-            (0x14, 0x10000),
-            (0x110, u32::MAX),
-            (0x114, u32::MAX),
-            (0, 0x20002),
-        ] {
-            timer.write(
-                &mut Cx::new(&mut host, 0, 0, 0),
-                offset,
-                4,
-                u64::from(value),
-            );
-        }
-        host.now = Duration::from_micros(2000);
-        let elapsed = u64::from(u32::MAX) - timer.read(&mut Cx::new(&mut host, 0, 0, 0), 0x110, 4);
-        assert_eq!(elapsed, 2000 * 48);
-        assert_eq!(
-            timer.read(&mut Cx::new(&mut host, 0, 0, 0), 0x114, 4),
-            u64::from(u32::MAX)
-        );
-        timer.write(&mut Cx::new(&mut host, 0, 0, 0), 0, 4, 0x20000);
-        timer.write(&mut Cx::new(&mut host, 0, 0, 0), 0x110, 4, 1234);
-        assert_eq!(timer.read(&mut Cx::new(&mut host, 0, 0, 0), 0x110, 4), 1234);
     }
     #[derive(Default)]
     struct Host {
@@ -509,6 +550,31 @@ mod tests {
         assert_eq!(restored.read(&mut Cx::new(&mut host, 0, 0, 0), 0x190, 4), 4);
         restored.write(&mut Cx::new(&mut host, 0, 0, 0), 0x190, 4, 0);
         assert_eq!(restored.read(&mut Cx::new(&mut host, 0, 0, 0), 0x190, 4), 0);
+    }
+    #[test]
+    fn running_general_word0_reads_the_live_count() {
+        let mut timer = Timer::new(0);
+        let mut host = Host::default();
+        // X-T5 4.31 stage0 delay: clear status, load both words, enable channel 1.
+        for (o, v) in [
+            (0x14, 0x10000),
+            (0x110, u32::MAX),
+            (0x114, u32::MAX),
+            (0, 0x20002),
+        ] {
+            timer.write(&mut Cx::new(&mut host, 0, 0, 0), o, 4, u64::from(v));
+        }
+        host.now = Duration::from_micros(2000);
+        let elapsed = u64::from(u32::MAX) - timer.read(&mut Cx::new(&mut host, 0, 0, 0), 0x110, 4);
+        assert_eq!(elapsed, 2000 * 48);
+        // The reload word and a stopped channel's word 0 still read back as written.
+        assert_eq!(
+            timer.read(&mut Cx::new(&mut host, 0, 0, 0), 0x114, 4),
+            u64::from(u32::MAX)
+        );
+        timer.write(&mut Cx::new(&mut host, 0, 0, 0), 0, 4, 0x20000);
+        timer.write(&mut Cx::new(&mut host, 0, 0, 0), 0x110, 4, 1234);
+        assert_eq!(timer.read(&mut Cx::new(&mut host, 0, 0, 0), 0x110, 4), 1234);
     }
     #[test]
     fn finder_period_expiry_ack_and_cancel() {

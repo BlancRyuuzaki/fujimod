@@ -3,7 +3,6 @@ use crate::flash_storage::Shared;
 use fujimod_emulator_devices::{Cx, Device};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
 #[derive(Serialize, Deserialize)]
 struct State {
     regs: Vec<u32>,
@@ -14,83 +13,113 @@ struct State {
     #[serde(default)]
     rx_fifo: std::collections::VecDeque<u8>,
     configuration_complete: bool,
-    volatile_registers: BTreeMap<u32, u8>,
+    /// Dummy cycles the part's volatile configuration register selects for its
+    /// fast reads, once the controller has written it.
+    #[serde(default)]
+    volatile_dummy_cycles: Option<u8>,
 }
-#[derive(Clone, Copy)]
-struct VolatileRegisterWrite {
-    opcode: u8,
-    address: u32,
-    value: u8,
+/// One installed serial NOR part: its identity and the opcodes, address bytes
+/// and dummy cycles the controller is allowed to issue to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Part {
+    /// JEDEC 0x20bb20, a quad-I/O NOR part. Its aperture read setup is not
+    /// yet checked by this model.
+    Quad20bb20,
+    /// JEDEC 0x2c5b1b, Micron MT35XU01GBBA: 128 MiB octal NOR, addressed with
+    /// four address bytes.
+    MicronMt35xu01g,
 }
-/// Explicit command vocabulary and erase geometry for a selected NOR device.
-#[derive(Clone, Copy)]
-pub struct Descriptor {
-    jedec: u32,
-    reads: &'static [u8],
-    programs: &'static [u8],
-    erases: &'static [(u8, usize)],
-    volatile_register_writes: &'static [VolatileRegisterWrite],
+/// One read opcode served through the memory-mapped aperture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ApertureRead {
+    pub opcode: u8,
+    pub address_bytes: u8,
+    pub dummy_cycles: u8,
 }
-impl Descriptor {
-    pub fn for_jedec(jedec: u32) -> Result<Self, String> {
-        let (reads, programs, erases, volatile_register_writes):
-            (&[u8], &[u8], &[(u8, usize)], &[VolatileRegisterWrite]) = match jedec {
-            0x20bb20 => (
-                &[0x03, 0x13, 0x0b, 0x0c, 0xeb, 0xec],
-                &[0x02, 0x12, 0x32, 0x34],
-                &[
-                    (0x20, 0x1000),
-                    (0x21, 0x1000),
-                    (0xd8, 0x10000),
-                    (0xdc, 0x10000),
-                ],
-                &[],
-            ),
-            0x2c5b1b => (
-                &[0x13, 0xfd, 0xcc],
-                &[0x12],
-                &[(0x21, 0x1000), (0xdc, 0x20000)],
-                &[VolatileRegisterWrite {
-                    opcode: 0x81,
-                    address: 1,
-                    value: 0x14,
-                }],
-            ),
-            _ => return Err(format!("unsupported serial-flash descriptor {jedec:#x}")),
-        };
-        Ok(Self {
-            jedec,
-            reads,
-            programs,
-            erases,
-            volatile_register_writes,
-        })
+impl Part {
+    pub fn from_jedec(jedec: u32) -> Result<Self, String> {
+        match jedec {
+            0x20bb20 => Ok(Self::Quad20bb20),
+            0x2c5b1b => Ok(Self::MicronMt35xu01g),
+            other => Err(format!("unsupported serial NOR part {other:#08x}")),
+        }
     }
-    fn reads(self, cmd: u8) -> bool {
-        self.reads.contains(&cmd)
+    pub fn jedec(self) -> u32 {
+        match self {
+            Self::Quad20bb20 => 0x20bb20,
+            Self::MicronMt35xu01g => 0x2c5b1b,
+        }
     }
-    fn programs(self, cmd: u8) -> bool {
-        self.programs.contains(&cmd)
+    /// Commands the PIO path issues: status/identity, reads, programs and erases.
+    fn pio(self, cmd: u8) -> Option<Command> {
+        use Command::*;
+        match (self, cmd) {
+            (_, 0x06) => Some(WriteEnable),
+            (_, 0x04) => Some(WriteDisable),
+            (_, 0x05) => Some(Status),
+            (_, 0x9f) => Some(Identity),
+            (Self::Quad20bb20, 0x03 | 0x13 | 0x0b | 0x0c | 0xeb | 0xec) => Some(Read),
+            (Self::Quad20bb20, 0x02 | 0x12 | 0x32 | 0x34) => Some(Program),
+            (Self::Quad20bb20, 0x20 | 0x21) => Some(Erase(0x1000)),
+            (Self::Quad20bb20, 0xd8 | 0xdc) => Some(Erase(0x10000)),
+            // MT35XU: 4-byte read, octal-output and octal-I/O 4-byte fast reads,
+            // 4-byte page program, 4 KiB and 128 KiB 4-byte erases, and the
+            // volatile configuration register write.
+            (Self::MicronMt35xu01g, 0x13) => Some(Read),
+            (Self::MicronMt35xu01g, 0xcc | 0xfd) => Some(FastRead),
+            (Self::MicronMt35xu01g, 0x81) => Some(WriteVolatile),
+            (Self::MicronMt35xu01g, 0x12) => Some(Program),
+            (Self::MicronMt35xu01g, 0x21) => Some(Erase(0x1000)),
+            (Self::MicronMt35xu01g, 0xdc) => Some(Erase(0x20000)),
+            _ => None,
+        }
     }
-    fn erase_size(self, cmd: u8) -> Option<usize> {
-        self.erases
-            .iter()
-            .find_map(|&(opcode, size)| (opcode == cmd).then_some(size))
+    /// The dummy cycles a fast read of this part runs with, as its volatile
+    /// configuration register selects them. Only the dummy-cycle register
+    /// (address 1) and the 20-cycle setting of its aperture reads are modeled.
+    fn volatile_dummy_cycles(self, address: u32, value: u8) -> Result<u8, String> {
+        let reads = self.aperture_reads().unwrap_or(&[]);
+        if address == 1 && reads.iter().any(|r| r.dummy_cycles == value) {
+            Ok(value)
+        } else {
+            Err(format!(
+                "serial NOR part {:#08x} volatile register {address:#x} write {value:#x} is not modeled",
+                self.jedec()
+            ))
+        }
     }
-    fn volatile_register_write(self, cmd: u8) -> Option<VolatileRegisterWrite> {
-        self.volatile_register_writes
-            .iter()
-            .copied()
-            .find(|write| write.opcode == cmd)
+    /// Aperture read setups the part answers, or None while unchecked.
+    pub fn aperture_reads(self) -> Option<&'static [ApertureRead]> {
+        match self {
+            Self::Quad20bb20 => None,
+            // Octal-I/O and octal-output 4-byte fast reads with 20 dummy cycles.
+            Self::MicronMt35xu01g => Some(&[
+                ApertureRead { opcode: 0xfd, address_bytes: 4, dummy_cycles: 20 },
+                ApertureRead { opcode: 0xcc, address_bytes: 4, dummy_cycles: 20 },
+            ]),
+        }
     }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Command {
+    WriteEnable,
+    WriteDisable,
+    Status,
+    Identity,
+    Read,
+    /// A read whose dummy cycles come from the volatile configuration register.
+    FastRead,
+    Program,
+    Erase(usize),
+    WriteVolatile,
 }
 pub struct Controller {
     state: State,
     flash_storage: Shared,
-    descriptor: Descriptor,
+    part: Part,
 }
 impl Controller {
-    pub fn new(flash_storage: Shared, descriptor: Descriptor) -> Self {
+    pub fn new(flash_storage: Shared, part: Part) -> Self {
         let mut regs = vec![0; 64];
         regs[0x10 / 4] = 0x10001; // Explicit inherited enabled/idle controller assumption.
         Self {
@@ -102,10 +131,36 @@ impl Controller {
                 tx: Vec::new(),
                 rx_fifo: Default::default(),
                 configuration_complete: false,
-                volatile_registers: BTreeMap::new(),
+                volatile_dummy_cycles: None,
             },
             flash_storage,
-            descriptor,
+            part,
+        }
+    }
+    /// The aperture's configured read opcode and dummy cycles must be a read
+    /// the installed part answers.
+    fn check_aperture_read(&self) -> Result<(), String> {
+        let Some(reads) = self.part.aperture_reads() else {
+            return Ok(());
+        };
+        let opcode = self.state.regs[0x44 / 4] as u8;
+        let dummy = self.state.regs[0x74 / 4];
+        if self.state.volatile_dummy_cycles.map(u32::from) != Some(dummy) {
+            return Err(format!(
+                "serial NOR part {:#08x} aperture read {opcode:#x} with {dummy} dummy cycles before its volatile dummy-cycle register selects them",
+                self.part.jedec()
+            ));
+        }
+        if reads
+            .iter()
+            .any(|r| r.opcode == opcode && u32::from(r.dummy_cycles) == dummy)
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "serial NOR part {:#08x} has no aperture read {opcode:#x} with {dummy} dummy cycles",
+                self.part.jedec()
+            ))
         }
     }
     fn known(o: u64) -> bool {
@@ -113,7 +168,7 @@ impl Controller {
             o,
             0 | 4
                 | 8
-                | 0x0c
+                | 0xc
                 | 0x10
                 | 0x14
                 | 0x18
@@ -160,62 +215,73 @@ impl Controller {
         self.state.tx.clear();
         self.state.active = true;
         self.state.complete = false;
+        let command = self.part.pio(cmd).ok_or_else(|| {
+            format!(
+                "unsupported serial-flash storage command {cmd:#x} for part {:#08x}",
+                self.part.jedec()
+            )
+        })?;
+        let jedec = self.part.jedec();
         let mut flash_storage = self.flash_storage.lock().unwrap();
         flash_storage.session.controller_complete = false;
-        match cmd {
-            0x06 => {
+        match command {
+            Command::WriteEnable => {
                 flash_storage.session.write_enable = true;
                 self.state.complete = true;
             }
-            0x04 => {
+            Command::WriteDisable => {
                 flash_storage.session.write_enable = false;
                 self.state.complete = true;
             }
-            cmd if cmd == 0x05 || cmd == 0x9f || self.descriptor.reads(cmd) => {
+            Command::Status | Command::Identity | Command::Read | Command::FastRead => {
                 let count = (self.state.regs[0xa0 / 4] & 0x7ff) as usize + 1;
-                self.state.rx_fifo = match cmd {
-                    0x05 => vec![(flash_storage.session.write_enable as u8) << 1; count].into(),
-                    0x9f => (0..count)
-                        .map(|i| {
-                            if i < 3 {
-                                (self.descriptor.jedec >> (16 - i * 8)) as u8
-                            } else {
-                                0xff
-                            }
-                        })
+                self.state.rx_fifo = match command {
+                    Command::Status => {
+                        vec![(flash_storage.session.write_enable as u8) << 1; count].into()
+                    }
+                    Command::Identity => (0..count)
+                        .map(|i| if i < 3 { (jedec >> (16 - i * 8)) as u8 } else { 0xff })
                         .collect(),
-                    _ => flash_storage
-                        .read_device(self.state.regs[0x50 / 4] as u64, count)?
-                        .into(),
+                    _ => {
+                        if command == Command::FastRead && self.state.volatile_dummy_cycles.is_none() {
+                            return Err(format!(
+                                "serial NOR fast read {cmd:#x} before the volatile dummy-cycle register is written"
+                            ));
+                        }
+                        flash_storage
+                            .read_device(self.state.regs[0x50 / 4] as u64, count)?
+                            .into()
+                    }
                 };
                 self.state.complete = true;
             }
-            cmd if self.descriptor.programs(cmd) => {}
-            cmd if self.descriptor.volatile_register_write(cmd).is_some() => {}
-            cmd if self.descriptor.erase_size(cmd).is_some() => {
-                let size = self.descriptor.erase_size(cmd).unwrap();
+            Command::Program => {}
+            Command::WriteVolatile => {
+                if !flash_storage.session.write_enable {
+                    return Err("serial NOR volatile register write without WREN".into());
+                }
+                let count = (self.state.regs[0xa0 / 4] & 0x7ff) as usize + 1;
+                if count != 1 {
+                    return Err(format!(
+                        "serial NOR volatile register write of {count} bytes is not modeled"
+                    ));
+                }
+            }
+            Command::Erase(size) => {
                 flash_storage.erase(self.state.regs[0x50 / 4] as u64, size)?;
                 self.state.complete = true;
             }
-            _ => return Err(format!("unsupported serial-flash storage command {cmd:#x}")),
         }
         Ok(())
     }
     fn stop(&mut self) -> Result<(), String> {
-        if let Some(write) = self.descriptor.volatile_register_write(self.cmd()) {
-            if self.state.regs[0x50 / 4] != write.address
-                || self.state.tx.as_slice() != [write.value]
-            {
-                return Err("unsupported serial-flash volatile register write".into());
-            }
-            let mut flash_storage = self.flash_storage.lock().unwrap();
-            if !flash_storage.session.write_enable {
-                return Err("serial-flash volatile register write without WREN".into());
-            }
-            flash_storage.session.write_enable = false;
-            self.state.volatile_registers.insert(write.address, write.value);
+        if self.part.pio(self.cmd()) == Some(Command::WriteVolatile) && !self.state.tx.is_empty() {
+            let address = self.state.regs[0x50 / 4];
+            self.state.volatile_dummy_cycles =
+                Some(self.part.volatile_dummy_cycles(address, self.state.tx[0])?);
+            self.flash_storage.lock().unwrap().session.write_enable = false;
         }
-        if self.descriptor.programs(self.cmd()) && !self.state.tx.is_empty() {
+        if self.part.pio(self.cmd()) == Some(Command::Program) && !self.state.tx.is_empty() {
             self.flash_storage
                 .lock()
                 .unwrap()
@@ -236,26 +302,36 @@ impl Controller {
             return Err("flash storage FIFO read outside transaction".into());
         }
         let mut s = self.flash_storage.lock().unwrap();
-        let b = match self.cmd() {
-            0x05 => (s.session.write_enable as u8) << 1,
-            0x9f => {
+        let cmd = self.cmd();
+        let b = match self.part.pio(cmd) {
+            Some(Command::Status) => (s.session.write_enable as u8) << 1,
+            Some(Command::Identity) => {
                 if self.state.cursor < 3 {
-                    (self.descriptor.jedec >> (16 - self.state.cursor * 8)) as u8
+                    (self.part.jedec() >> (16 - self.state.cursor * 8)) as u8
                 } else {
                     0xff
                 }
             }
-            cmd if self.descriptor.reads(cmd) => s.read_device(
+            Some(Command::Read | Command::FastRead) => s.read_device(
                 self.state.regs[0x50 / 4] as u64 + self.state.cursor as u64,
                 1,
             )?[0],
-            cmd => return Err(format!("flash storage FIFO read for command {cmd:#x}")),
+            _ => return Err(format!("flash storage FIFO read for command {cmd:#x}")),
         };
         self.state.cursor += 1;
         self.state.complete = true;
         Ok(b)
     }
 }
+impl Controller {
+    fn validate_state(&self, state: &State) -> Result<(), String> {
+        if state.regs.len() != self.state.regs.len() {
+            return Err("serial flash checkpoint has the wrong register count".into());
+        }
+        Ok(())
+    }
+}
+
 impl Device for Controller {
     fn pollable(&self, offset: u64, size: u8) -> bool {
         offset == 0xff90a0f0 && size == 4
@@ -266,10 +342,6 @@ impl Device for Controller {
     fn read(&mut self, cx: &mut Cx<'_>, address: u64, n: u8) -> u64 {
         let o = address.wrapping_sub(0xff90a000);
         if n != 4 || !Self::known(o) {
-            cx.unmodeled();
-            return 0;
-        }
-        if matches!(o, 0x0c | 0x28 | 0x2c | 0x30 | 0x64 | 0x68 | 0x78) {
             cx.unmodeled();
             return 0;
         }
@@ -298,8 +370,15 @@ impl Device for Controller {
             0xf0 => {
                 let receive = !self.state.rx_fifo.is_empty()
                     || (self.state.active
-                        && (matches!(self.cmd(), 0x05 | 0x9f)
-                            || self.descriptor.reads(self.cmd())));
+                        && matches!(
+                            self.part.pio(self.cmd()),
+                            Some(
+                                Command::Status
+                                    | Command::Identity
+                                    | Command::Read
+                                    | Command::FastRead
+                            )
+                        ));
                 let complete = self.state.complete
                     || self
                         .flash_storage
@@ -319,44 +398,14 @@ impl Device for Controller {
             cx.unmodeled();
             return;
         }
-        if o == 0x0c && v != 2 {
-            cx.fail("unsupported flash storage initialization value");
-            return;
-        }
-        if matches!(o, 0x28 | 0x2c | 0x30) && v != u64::from(u32::MAX) {
-            cx.fail("unsupported flash storage setup value");
-            return;
-        }
-        if matches!(o, 0x68 | 0x78) && v != 0 {
-            cx.fail("unsupported flash storage setup value");
-            return;
-        }
-        if o == 0x64 && v != 0 {
-            cx.fail("unsupported flash storage setup value");
-            return;
-        }
         let v = v as u32;
         let result = match o {
-            0x0c => {
-                self.state.regs[o as usize / 4] = v;
-                Ok(())
-            }
-            0x28 | 0x2c | 0x30 => {
-                self.state.regs[o as usize / 4] = v;
-                Ok(())
-            }
-            0x68 | 0x78 => {
-                self.state.regs[o as usize / 4] = v;
-                Ok(())
-            }
-            0x64 => {
-                self.state.regs[o as usize / 4] = v;
-                Ok(())
-            }
             0x80 => {
                 if !self.state.active
-                    || !(self.descriptor.programs(self.cmd())
-                        || self.descriptor.volatile_register_write(self.cmd()).is_some())
+                    || !matches!(
+                        self.part.pio(self.cmd()),
+                        Some(Command::Program | Command::WriteVolatile)
+                    )
                 {
                     Err("unsupported flash storage FIFO write".into())
                 } else {
@@ -402,7 +451,13 @@ impl Device for Controller {
                 }
                 if o == 0x48 {
                     self.flash_storage.lock().unwrap().session.program_mode =
-                        self.descriptor.programs(v as u8);
+                        self.part.pio(v as u8) == Some(Command::Program);
+                }
+                if o == 0x44 || o == 0x74 {
+                    // Configuring is always accepted; a setup the part cannot answer
+                    // only fails when the aperture is actually read through it.
+                    self.flash_storage.lock().unwrap().session.aperture_fault =
+                        self.check_aperture_read().err();
                 }
                 Ok(())
             }
@@ -411,6 +466,7 @@ impl Device for Controller {
             cx.fail(e);
         }
     }
+    fujimod_emulator_devices::checkpoint_state!(state: State, Self::validate_state);
     fn save(&self) -> Value {
         serde_json::to_value(&self.state).unwrap()
     }
@@ -428,12 +484,171 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[test]
-    fn selected_descriptors_enforce_commands_and_erase_geometry() {
-        assert!(Descriptor::for_jedec(0xabcdef).is_err());
+    fn configuration_latches_written_by_serial_flash_setup_read_back() {
+        use fujimod_emulator_devices::test_host::recording::RecordingHost;
+        let storage = Arc::new(Mutex::new(Storage::new(vec![0; 16]).unwrap()));
+        let mut controller = Controller::new(storage, Part::Quad20bb20);
+        let mut host = RecordingHost::default();
+        let mut cx = Cx::new(&mut host, 0, 0, 0);
+        // Aperture window words and the per-opcode format fields a setup program writes.
+        for (offset, value) in [
+            // An SD card stage's own serial flash setup stores 2 here (X-T5, 0xff81ada4).
+            (0xc, 2),
+            (0x24, 0xf000_0000),
+            (0x28, u32::MAX),
+            (0x2c, u32::MAX),
+            (0x30, u32::MAX),
+            (0x34, 0xf800_0000),
+            (0x64, 0),
+            (0x68, 0x12),
+            (0x78, 0x34),
+        ] {
+            controller.write(&mut cx, 0xff90a000 + offset, 4, value.into());
+            assert_eq!(
+                controller.read(&mut cx, 0xff90a000 + offset, 4),
+                u64::from(value),
+                "{offset:#x}"
+            );
+        }
+        assert_eq!(cx.refusal(), None);
+    }
+
+    #[test]
+    fn pio_reads_count_transferred_bytes_once_and_exclude_identity_commands() {
+        let storage = Arc::new(Mutex::new(Storage::new((0..32).collect()).unwrap()));
+        let mut controller = Controller::new(storage.clone(), Part::Quad20bb20);
+        controller.state.regs[0] = 1;
+        controller.state.regs[0x40 / 4] = 0x03;
+        controller.state.regs[0x50 / 4] = 8;
+        controller.state.regs[0xa0 / 4] = 3;
+        controller.begin().unwrap();
+        assert_eq!(storage.lock().unwrap().session.reads.bytes, 4);
+        for value in 8..12 {
+            assert_eq!(controller.rx().unwrap(), value);
+        }
+        assert_eq!(storage.lock().unwrap().session.reads.bytes, 4);
+        assert_eq!(controller.rx().unwrap(), 12);
+        assert_eq!(storage.lock().unwrap().session.reads.ranges, [(8, 13)]);
+        controller.state.regs[0x40 / 4] = 0x9f;
+        controller.begin().unwrap();
+        assert_eq!(controller.rx().unwrap(), 0x20);
+        assert_eq!(storage.lock().unwrap().session.reads.bytes, 5);
+    }
+
+    fn mt35xu() -> (Shared, Controller) {
+        let storage = Arc::new(Mutex::new(Storage::new((0..64).collect()).unwrap()));
+        let controller = Controller::new(storage.clone(), Part::from_jedec(0x2c5b1b).unwrap());
+        (storage, controller)
+    }
+
+    #[test]
+    fn octal_part_answers_its_identity_and_four_byte_reads() {
+        let (_, mut controller) = mt35xu();
+        controller.state.regs[0] = 1;
+        controller.state.regs[0xa0 / 4] = 2;
+        controller.state.regs[0x40 / 4] = 0x9f;
+        controller.begin().unwrap();
+        let id: Vec<u8> = (0..3).map(|_| controller.rx().unwrap()).collect();
+        assert_eq!(id, [0x2c, 0x5b, 0x1b]);
+        controller.state.regs[0x40 / 4] = 0x13;
+        controller.state.regs[0x50 / 4] = 16;
+        controller.begin().unwrap();
+        assert_eq!(controller.rx().unwrap(), 16);
+        write_dummy_cycles(&mut controller, 1, 0x14).unwrap();
+        for opcode in [0xcc, 0xfd] {
+            controller.state.regs[0x40 / 4] = opcode;
+            controller.state.regs[0x50 / 4] = 16;
+            controller.begin().unwrap();
+            assert_eq!(controller.rx().unwrap(), 16);
+        }
+    }
+
+    /// WREN, then a one-byte volatile register write, as a device initializer
+    /// issues it: opcode in `+40`, register address in `+50`, count in `+a0`.
+    fn write_dummy_cycles(controller: &mut Controller, address: u32, value: u8) -> Result<(), String> {
+        controller.state.regs[0] = 1;
+        controller.state.regs[0x40 / 4] = 0x06;
+        controller.begin()?;
+        controller.state.regs[0x40 / 4] = 0x81;
+        controller.state.regs[0x50 / 4] = address;
+        controller.state.regs[0xa0 / 4] = 0;
+        controller.begin()?;
+        controller.state.tx.push(value);
+        controller.stop()
+    }
+
+    #[test]
+    fn octal_part_fast_reads_wait_for_its_dummy_cycle_register() {
+        let (_, mut controller) = mt35xu();
+        controller.state.regs[0] = 1;
+        controller.state.regs[0x40 / 4] = 0xfd;
+        assert!(controller.begin().unwrap_err().contains("volatile dummy-cycle register"));
+        write_dummy_cycles(&mut controller, 1, 0x14).unwrap();
+        assert_eq!(controller.state.volatile_dummy_cycles, Some(20));
+        controller.state.regs[0x40 / 4] = 0xfd;
+        controller.begin().unwrap();
+    }
+
+    #[test]
+    fn volatile_register_write_is_limited_to_the_modeled_setting() {
+        let (storage, mut controller) = mt35xu();
+        controller.state.regs[0] = 1;
+        controller.state.regs[0x40 / 4] = 0x81;
+        controller.state.regs[0xa0 / 4] = 0;
+        assert!(controller.begin().unwrap_err().contains("without WREN"));
+        // The initializer's write: byte 0x14 at register address 1, consuming WREN.
+        write_dummy_cycles(&mut controller, 1, 0x14).unwrap();
+        assert!(!storage.lock().unwrap().session.write_enable);
+        // Other registers and values, and multi-byte writes, are not modeled.
+        let err = write_dummy_cycles(&mut controller, 0, 0xe7).unwrap_err();
+        assert!(err.contains("register 0x0 write 0xe7 is not modeled"), "{err}");
+        let err = write_dummy_cycles(&mut controller, 1, 0x08).unwrap_err();
+        assert!(err.contains("register 0x1 write 0x8 is not modeled"), "{err}");
+        controller.state.regs[0x40 / 4] = 0x06;
+        controller.begin().unwrap();
+        controller.state.regs[0x40 / 4] = 0x81;
+        controller.state.regs[0xa0 / 4] = 1;
+        assert!(controller.begin().unwrap_err().contains("2 bytes"));
+    }
+
+    #[test]
+    fn quad_part_refuses_volatile_register_writes() {
+        let storage = Arc::new(Mutex::new(Storage::new(vec![0; 16]).unwrap()));
+        let mut controller = Controller::new(storage, Part::Quad20bb20);
+        controller.state.regs[0] = 1;
+        controller.state.regs[0x40 / 4] = 0x81;
+        assert!(controller.begin().unwrap_err().contains("for part 0x20bb20"));
+    }
+
+    #[test]
+    fn octal_part_refuses_commands_outside_its_set() {
+        let (_, mut controller) = mt35xu();
+        controller.state.regs[0] = 1;
+        // Three-byte read and quad-I/O read belong to the quad part only.
+        for opcode in [0x03, 0xec] {
+            controller.state.regs[0x40 / 4] = opcode;
+            assert!(controller.begin().unwrap_err().contains("for part 0x2c5b1b"));
+        }
+    }
+
+    #[test]
+    fn octal_part_erases_its_sector_size() {
+        let (storage, mut controller) = mt35xu();
+        controller.state.regs[0] = 1;
+        controller.state.regs[0x40 / 4] = 0x06;
+        controller.begin().unwrap();
+        controller.state.regs[0x40 / 4] = 0xdc;
+        controller.state.regs[0x50 / 4] = 0;
+        controller.begin().unwrap();
+        assert_eq!(storage.lock().unwrap().read_device(0, 1).unwrap(), [0xff]);
+    }
+
+    #[test]
+    fn selected_parts_enforce_commands_and_erase_geometry() {
+        assert!(Part::from_jedec(0xabcdef).is_err());
         for (id, large) in [(0x20bb20, 0x10000), (0x2c5b1b, 0x20000)] {
             let storage = Arc::new(Mutex::new(Storage::new(vec![0; 0x50000]).unwrap()));
-            let descriptor = Descriptor::for_jedec(id).unwrap();
-            let mut c = Controller::new(storage.clone(), descriptor);
+            let mut c = Controller::new(storage.clone(), Part::from_jedec(id).unwrap());
             c.state.regs[0] = 1;
             let issue = |c: &mut Controller, op| {
                 c.state.regs[0x40 / 4] = op;
@@ -475,6 +690,8 @@ mod tests {
             if id == 0x2c5b1b {
                 assert!(issue(&mut c, 0xd8).is_err());
                 assert!(issue(&mut c, 0x03).is_err());
+                write_dummy_cycles(&mut c, 1, 0x14).unwrap();
+                c.state.regs[0x50 / 4] = 0x1000;
                 issue(&mut c, 0xfd).unwrap();
                 assert_eq!(c.rx().unwrap(), 0x5a);
                 issue(&mut c, 0xcc).unwrap();
@@ -484,213 +701,63 @@ mod tests {
     }
 
     #[test]
-    fn selected_volatile_register_write_retains_one_byte_without_programming_array() {
+    fn volatile_register_write_leaves_the_array_and_survives_a_checkpoint() {
         let storage = Arc::new(Mutex::new(Storage::new(vec![0x5a; 0x100]).unwrap()));
-        let mut controller =
-            Controller::new(storage.clone(), Descriptor::for_jedec(0x2c5b1b).unwrap());
-        controller.state.regs[0] = 1;
-        controller.state.regs[0x40 / 4] = 0x06;
-        controller.begin().unwrap();
-        assert!(storage.lock().unwrap().session.write_enable);
-
-        controller.state.regs[0x40 / 4] = 0x81;
-        controller.state.regs[0x50 / 4] = 1;
-        controller.state.regs[0xa0 / 4] = 0;
-        controller.begin().unwrap();
-        controller.state.tx.push(0x14);
-        controller.stop().unwrap();
-        assert_eq!(controller.state.volatile_registers.get(&1), Some(&0x14));
-        assert_eq!(storage.lock().unwrap().read(0, 0x100).unwrap(), vec![0x5a; 0x100]);
-        assert!(!storage.lock().unwrap().session.write_enable);
+        let mut controller = Controller::new(storage.clone(), Part::MicronMt35xu01g);
+        write_dummy_cycles(&mut controller, 1, 0x14).unwrap();
+        assert_eq!(controller.state.volatile_dummy_cycles, Some(20));
+        assert_eq!(
+            storage.lock().unwrap().read(0, 0x100).unwrap(),
+            vec![0x5a; 0x100]
+        );
         let saved = controller.save();
-        controller.state.volatile_registers.clear();
+        controller.state.volatile_dummy_cycles = None;
         controller.restore(&saved).unwrap();
-        assert_eq!(controller.state.volatile_registers.get(&1), Some(&0x14));
-
-        controller.state.regs[0x40 / 4] = 0x06;
-        controller.begin().unwrap();
-        controller.state.regs[0x40 / 4] = 0x81;
-        controller.state.regs[0x50 / 4] = 2;
-        controller.begin().unwrap();
-        controller.state.tx.push(0x14);
-        assert!(controller.stop().is_err());
-        assert_eq!(controller.state.volatile_registers.get(&1), Some(&0x14));
-        controller.state.regs[0x50 / 4] = 1;
-        controller.begin().unwrap();
-        controller.state.tx.push(0x15);
-        assert!(controller.stop().is_err());
+        assert_eq!(controller.state.volatile_dummy_cycles, Some(20));
+        assert!(write_dummy_cycles(&mut controller, 2, 0x14).is_err());
+        assert!(write_dummy_cycles(&mut controller, 1, 0x15).is_err());
+        assert_eq!(controller.state.volatile_dummy_cycles, Some(20));
     }
 
     #[test]
-    fn pio_reads_count_transferred_bytes_once_and_exclude_identity_commands() {
-        let storage = Arc::new(Mutex::new(Storage::new((0..32).collect()).unwrap()));
-        let mut controller =
-            Controller::new(storage.clone(), Descriptor::for_jedec(0x20bb20).unwrap());
-        controller.state.regs[0] = 1;
-        controller.state.regs[0x40 / 4] = 0x03;
-        controller.state.regs[0x50 / 4] = 8;
-        controller.state.regs[0xa0 / 4] = 3;
-        controller.begin().unwrap();
-        assert_eq!(storage.lock().unwrap().session.reads.bytes, 4);
-        for value in 8..12 {
-            assert_eq!(controller.rx().unwrap(), value);
-        }
-        assert_eq!(storage.lock().unwrap().session.reads.bytes, 4);
-        assert_eq!(controller.rx().unwrap(), 12);
-        assert_eq!(storage.lock().unwrap().session.reads.ranges, [(8, 13)]);
-        controller.state.regs[0x40 / 4] = 0x9f;
-        controller.begin().unwrap();
-        assert_eq!(controller.rx().unwrap(), 0x20);
-        assert_eq!(storage.lock().unwrap().session.reads.bytes, 5);
+    fn aperture_read_setup_must_match_the_part() {
+        let (_, mut controller) = mt35xu();
+        controller.state.regs[0x44 / 4] = 0xfd;
+        controller.state.regs[0x74 / 4] = 20;
+        assert!(controller.check_aperture_read().unwrap_err().contains("before its volatile"));
+        write_dummy_cycles(&mut controller, 1, 0x14).unwrap();
+        assert!(controller.check_aperture_read().is_ok());
+        controller.state.regs[0x74 / 4] = 10;
+        assert!(controller.check_aperture_read().unwrap_err().contains("0xfd with 10"));
+        controller.state.regs[0x44 / 4] = 0xec;
+        controller.state.regs[0x74 / 4] = 10;
+        assert!(controller.check_aperture_read().is_err());
+        assert_eq!(Part::from_jedec(0xef4018).unwrap_err(), "unsupported serial NOR part 0xef4018");
     }
 
     #[test]
-    fn initialization_register_accepts_only_two_and_is_saved() {
+    fn unsupported_setup_is_latched_and_refused_only_when_the_aperture_is_read() {
         use fujimod_emulator_devices::test_host::recording::RecordingHost;
-
-        let storage = Arc::new(Mutex::new(Storage::new(vec![0; 0x100]).unwrap()));
-        let mut controller = Controller::new(storage, Descriptor::for_jedec(0x20bb20).unwrap());
+        let (storage, mut controller) = mt35xu();
+        // The part answers its 20-dummy fast read only after the volatile register selects it.
+        write_dummy_cycles(&mut controller, 1, 0x14).unwrap();
+        let medium = crate::flash_storage::Medium::Nor(storage.clone());
         let mut host = RecordingHost::default();
         let mut cx = Cx::new(&mut host, 0, 0, 0);
-
-        controller.write(&mut cx, 0xff90a00c, 4, 2);
+        // Default quad setup (0xec, 10 dummies): configuring is accepted and latched.
+        controller.write(&mut cx, 0xff90a044, 4, 0xec);
+        controller.write(&mut cx, 0xff90a074, 4, 10);
         assert_eq!(cx.refusal(), None);
-        assert_eq!(controller.state.regs[0x0c / 4], 2);
-        let saved = controller.save();
-
-        controller.write(&mut cx, 0xff90a00c, 4, 0);
-        assert!(cx.refusal().is_some());
-        controller.restore(&saved).unwrap();
-        assert_eq!(controller.state.regs[0x0c / 4], 2);
-
-        let mut read_host = RecordingHost::default();
-        let mut read_cx = Cx::new(&mut read_host, 0, 0, 0);
-        assert_eq!(controller.read(&mut read_cx, 0xff90a00c, 4), 0);
-        assert!(read_cx.refusal().is_some());
-
-        let mut invalid_host = RecordingHost::default();
-        let mut invalid_cx = Cx::new(&mut invalid_host, 0, 0, 0);
-        controller.write(&mut invalid_cx, 0xff90a00c, 4, 3);
-        assert!(invalid_cx.refusal().is_some());
-        assert_eq!(controller.state.regs[0x0c / 4], 2);
-
-        let mut width_host = RecordingHost::default();
-        let mut width_cx = Cx::new(&mut width_host, 0, 0, 0);
-        controller.write(&mut width_cx, 0xff90a00c, 2, 2);
-        assert!(width_cx.refusal().is_some());
-        assert_eq!(controller.state.regs[0x0c / 4], 2);
-    }
-
-    #[test]
-    fn setup_registers_accept_ordered_all_ones_and_are_saved() {
-        use fujimod_emulator_devices::test_host::recording::RecordingHost;
-
-        let storage = Arc::new(Mutex::new(Storage::new(vec![0; 0x100]).unwrap()));
-        let mut controller = Controller::new(storage, Descriptor::for_jedec(0x20bb20).unwrap());
-        let mut host = RecordingHost::default();
-        let mut cx = Cx::new(&mut host, 0, 0, 0);
-        for offset in [0x28, 0x2c, 0x30] {
-            controller.write(&mut cx, 0xff90a000 + offset as u64, 4, u32::MAX.into());
-            assert_eq!(controller.state.regs[offset / 4], u32::MAX);
-        }
+        assert_eq!(controller.read(&mut cx, 0xff90a074, 4), 10);
+        // Reading through that setup is refused.
+        assert!(medium.read_device(0, 4).unwrap_err().contains("0xec with 10"));
+        // Reprogramming to a setup the part answers clears the fault.
+        controller.write(&mut cx, 0xff90a044, 4, 0xfd);
+        controller.write(&mut cx, 0xff90a074, 4, 20);
         assert_eq!(cx.refusal(), None);
-        let saved = controller.save();
-
-        let mut read_host = RecordingHost::default();
-        let mut read_cx = Cx::new(&mut read_host, 0, 0, 0);
-        for offset in [0x28, 0x2c, 0x30] {
-            assert_eq!(
-                controller.read(&mut read_cx, 0xff90a000 + offset as u64, 4),
-                0
-            );
-        }
-        assert!(read_cx.refusal().is_some());
-
-        let mut invalid_host = RecordingHost::default();
-        let mut invalid_cx = Cx::new(&mut invalid_host, 0, 0, 0);
-        controller.write(&mut invalid_cx, 0xff90a028, 4, 0xffff_fffe);
-        assert!(invalid_cx.refusal().is_some());
-
-        let mut width_host = RecordingHost::default();
-        let mut width_cx = Cx::new(&mut width_host, 0, 0, 0);
-        controller.write(&mut width_cx, 0xff90a028, 2, u32::MAX.into());
-        assert!(width_cx.refusal().is_some());
-
-        controller.restore(&saved).unwrap();
-        for offset in [0x28, 0x2c, 0x30] {
-            assert_eq!(controller.state.regs[offset / 4], u32::MAX);
-        }
-    }
-
-    #[test]
-    fn setup_zero_registers_are_write_only_and_saved() {
-        use fujimod_emulator_devices::test_host::recording::RecordingHost;
-
-        let storage = Arc::new(Mutex::new(Storage::new(vec![0; 0x100]).unwrap()));
-        let mut controller = Controller::new(storage, Descriptor::for_jedec(0x20bb20).unwrap());
-        let mut host = RecordingHost::default();
-        let mut cx = Cx::new(&mut host, 0, 0, 0);
-        for offset in [0x68_usize, 0x78, 0x98] {
-            controller.write(&mut cx, 0xff90a000 + offset as u64, 4, 0);
-            assert_eq!(controller.state.regs[offset / 4], 0);
-        }
-        assert_eq!(cx.refusal(), None);
-        let saved = controller.save();
-
-        let mut read_host = RecordingHost::default();
-        let mut read_cx = Cx::new(&mut read_host, 0, 0, 0);
-        for offset in [0x68_u64, 0x78] {
-            controller.read(&mut read_cx, 0xff90a000 + offset, 4);
-        }
-        assert!(read_cx.refusal().is_some());
-        assert_eq!(controller.read(&mut cx, 0xff90a098, 4), 0);
-        assert_eq!(cx.refusal(), None);
-
-        let mut invalid_host = RecordingHost::default();
-        let mut invalid_cx = Cx::new(&mut invalid_host, 0, 0, 0);
-        controller.write(&mut invalid_cx, 0xff90a068, 4, 1);
-        assert!(invalid_cx.refusal().is_some());
-
-        let mut width_host = RecordingHost::default();
-        let mut width_cx = Cx::new(&mut width_host, 0, 0, 0);
-        controller.write(&mut width_cx, 0xff90a078, 2, 0);
-        assert!(width_cx.refusal().is_some());
-        controller.restore(&saved).unwrap();
-        for offset in [0x68, 0x78, 0x98] {
-            assert_eq!(controller.state.regs[offset / 4], 0);
-        }
-    }
-
-    #[test]
-    fn zero_setup_register_is_write_only_exact_and_saved() {
-        use fujimod_emulator_devices::test_host::recording::RecordingHost;
-
-        let storage = Arc::new(Mutex::new(Storage::new(vec![0; 0x100]).unwrap()));
-        let mut controller = Controller::new(storage, Descriptor::for_jedec(0x20bb20).unwrap());
-        controller.state.regs[0x64 / 4] = 0x55;
-        let mut host = RecordingHost::default();
-
-        let mut write_cx = Cx::new(&mut host, 0, 0, 0);
-        controller.write(&mut write_cx, 0xff90a064, 4, 0);
-        assert_eq!(write_cx.refusal(), None);
-        assert_eq!(controller.state.regs[0x64 / 4], 0);
-        let saved = controller.save();
-
-        let mut read_cx = Cx::new(&mut host, 0, 0, 0);
-        controller.read(&mut read_cx, 0xff90a064, 4);
-        assert!(read_cx.is_unmodeled());
-
-        let mut value_cx = Cx::new(&mut host, 0, 0, 0);
-        controller.write(&mut value_cx, 0xff90a064, 4, 1);
-        assert!(value_cx.refusal().is_some());
-        assert_eq!(controller.state.regs[0x64 / 4], 0);
-
-        let mut width_cx = Cx::new(&mut host, 0, 0, 0);
-        controller.write(&mut width_cx, 0xff90a064, 2, 0);
-        assert!(width_cx.is_unmodeled());
-
-        controller.state.regs[0x64 / 4] = 0x99;
-        controller.restore(&saved).unwrap();
-        assert_eq!(controller.state.regs[0x64 / 4], 0);
+        assert_eq!(medium.read_device(0, 4).unwrap(), [0, 1, 2, 3]);
+        // A bad dummy count alone is also refused at read time.
+        controller.write(&mut cx, 0xff90a074, 4, 10);
+        assert!(medium.read_device(0, 4).unwrap_err().contains("0xfd with 10"));
     }
 }

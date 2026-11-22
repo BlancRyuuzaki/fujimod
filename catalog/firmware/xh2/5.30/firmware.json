@@ -9,162 +9,217 @@
     "sha256": "be47168cb075ef726e67cb4bb08175a896047a3b0de2bcb6e65333b22cfcb203"
   },
   "boot_rom": null,
-  "installation": {
-    "flash_offset": 628,
-    "entry_labels": {
-      "0x58420": "experimental EL3 entry candidate"
-    },
-    "loader_validation": null,
-    "image_sections": [
-      {
-        "name": "segment-0",
-        "address": 262144,
-        "size": 123712,
-        "sha256": "a73aee09924485ab65ba9b2747488403aced37b576378b1a2d1cc951fa5d80db"
-      },
-      {
-        "name": "segment-4",
-        "address": 17829888,
-        "size": 12042160,
-        "sha256": "3aacc331157312a03531266cd9aca0daea28597b9f3535bb6141105ad7354b4d"
-      }
-    ]
-  },
+  "installation": null,
   "generated_facts": null,
   "layouts": {
     "profiles": {
-      "xh2-530-experimental": {
+      "xh2-530": {
         "flash_image": {
           "dat_origin": 628,
           "xor": 255
         },
-        "preload": [],
-        "gic_initial": {
-          "0x0": 1
-        },
-        "gic_redistributor_initial": [
-          {"core": 0, "offset": 20, "size": 4, "value": 0},
-          {"core": 1, "offset": 20, "size": 4, "value": 0},
-          {"core": 2, "offset": 20, "size": 4, "value": 0},
-          {"core": 3, "offset": 20, "size": 4, "value": 0}
+        "preload": [
+          {
+            "address": 17563648,
+            "dat_offset": 1704564,
+            "length": 2048,
+            "sha256": "6807f5eb47d1edacdf3de6c7ad071b4227f6429448aedb6dacb87eb16bf42c48"
+          },
+          {
+            "address": 98896,
+            "words": [
+              65534,
+              65535,
+              65535,
+              65535,
+              65535,
+              65535,
+              65535,
+              65535,
+              65535,
+              65535,
+              65535,
+              65535,
+              65535,
+              65535,
+              65535,
+              65535,
+              65535,
+              65535,
+              65535,
+              65535
+            ],
+            "word_size": 4
+          },
+          {
+            "address": 98976,
+            "value": 1398030660,
+            "size": 4
+          },
+          {
+            "address": 99104,
+            "value": 1398030660,
+            "size": 4
+          },
+          {
+            "address": 99232,
+            "value": 4,
+            "size": 4
+          },
+          {
+            "address": 99236,
+            "value": 0,
+            "size": 4
+          },
+          {
+            "address": 99240,
+            "value": 0,
+            "size": 8
+          },
+          {
+            "address": 99348,
+            "value": 0,
+            "size": 4
+          },
+          {
+            "address": 99352,
+            "words": [
+              0,
+              0,
+              0,
+              98304,
+              0
+            ],
+            "word_size": 4
+          },
+          {
+            "address": 100380,
+            "words": [
+              1,
+              26,
+              0,
+              257,
+              2906907
+            ],
+            "word_size": 4
+          }
         ],
         "cpu": [
           {
             "id": 0,
-            "pc": 361504,
+            "pc": 361596,
+            "cpsr": 964,
             "running": true,
-            "entry": {
-              "level": "el3t",
-              "pstate": 972,
-              "regs": {
-                "x0": 21896268,
-                "x1": 98896
-              }
+            "regs": {
+              "x19": 0,
+              "x20": 21896268,
+              "x21": 98896
             },
             "sysregs": {
-              "CPACR_EL1": 3145728,
-              "ICC_IGRPEN0_EL1": 1,
-              "ICC_IGRPEN1_EL1": 0,
               "ICC_PMR_EL1": 255,
-              "SCTLR_EL1": 0,
-              "SP_EL0": 129088,
-              "SP_EL1": 0,
-              "VBAR_EL1": 0,
-              "ELR_EL3": 0,
-              "SCR_EL3": 3072,
-              "SPSR_EL3": 4,
-              "SP_EL3": 0
+              "ICC_IGRPEN0_EL1": 1,
+              "ICC_IGRPEN1_EL1": 1,
+              "VBAR_EL1": 366592,
+              "SCTLR_EL1": 818939904,
+              "CPACR_EL1": 3145728,
+              "SP_EL0": 696320,
+              "SP_EL1": 696320
             }
           },
           {
             "id": 1,
-            "pc": 361504,
+            "pc": 361596,
+            "cpsr": 964,
             "running": true,
-            "entry": {
-              "level": "el3t",
-              "pstate": 972,
-              "regs": {
-                "x0": 21896268,
-                "x1": 98896
-              }
+            "regs": {
+              "x19": 1,
+              "x20": 21896268,
+              "x21": 98896
             },
             "sysregs": {
-              "CPACR_EL1": 3145728,
-              "ICC_IGRPEN0_EL1": 1,
-              "ICC_IGRPEN1_EL1": 0,
               "ICC_PMR_EL1": 255,
-              "SCTLR_EL1": 0,
-              "SP_EL0": 157760,
-              "SP_EL1": 0,
-              "VBAR_EL1": 0,
-              "ELR_EL3": 0,
-              "SCR_EL3": 3072,
-              "SPSR_EL3": 4,
-              "SP_EL3": 0
+              "ICC_IGRPEN0_EL1": 1,
+              "ICC_IGRPEN1_EL1": 1,
+              "VBAR_EL1": 366592,
+              "SCTLR_EL1": 818939904,
+              "CPACR_EL1": 3145728,
+              "SP_EL0": 712704,
+              "SP_EL1": 712704
             }
           },
           {
             "id": 2,
-            "pc": 361504,
+            "pc": 361596,
+            "cpsr": 964,
             "running": true,
-            "entry": {
-              "level": "el3t",
-              "pstate": 972,
-              "regs": {
-                "x0": 21896268,
-                "x1": 98896
-              }
+            "regs": {
+              "x19": 2,
+              "x20": 21896268,
+              "x21": 98896
             },
             "sysregs": {
-              "CPACR_EL1": 3145728,
-              "ICC_IGRPEN0_EL1": 1,
-              "ICC_IGRPEN1_EL1": 0,
               "ICC_PMR_EL1": 255,
-              "SCTLR_EL1": 0,
-              "SP_EL0": 186432,
-              "SP_EL1": 0,
-              "VBAR_EL1": 0,
-              "ELR_EL3": 0,
-              "SCR_EL3": 3072,
-              "SPSR_EL3": 4,
-              "SP_EL3": 0
+              "ICC_IGRPEN0_EL1": 1,
+              "ICC_IGRPEN1_EL1": 1,
+              "VBAR_EL1": 366592,
+              "SCTLR_EL1": 818939904,
+              "CPACR_EL1": 3145728,
+              "SP_EL0": 729088,
+              "SP_EL1": 729088
             }
           },
           {
             "id": 3,
-            "pc": 361504,
+            "pc": 361596,
+            "cpsr": 964,
             "running": true,
-            "entry": {
-              "level": "el3t",
-              "pstate": 972,
-              "regs": {
-                "x0": 21896268,
-                "x1": 98896
-              }
+            "regs": {
+              "x19": 3,
+              "x20": 21896268,
+              "x21": 98896
             },
             "sysregs": {
-              "CPACR_EL1": 3145728,
-              "ICC_IGRPEN0_EL1": 1,
-              "ICC_IGRPEN1_EL1": 0,
               "ICC_PMR_EL1": 255,
-              "SCTLR_EL1": 0,
-              "SP_EL0": 215104,
-              "SP_EL1": 0,
-              "VBAR_EL1": 0,
-              "ELR_EL3": 0,
-              "SCR_EL3": 3072,
-              "SPSR_EL3": 4,
-              "SP_EL3": 0
+              "ICC_IGRPEN0_EL1": 1,
+              "ICC_IGRPEN1_EL1": 1,
+              "VBAR_EL1": 366592,
+              "SCTLR_EL1": 818939904,
+              "CPACR_EL1": 3145728,
+              "SP_EL0": 745472,
+              "SP_EL1": 745472
             }
           }
         ],
-        "limits": [
-          "Experimental four-core startup candidate; no physical four-core execution is established.",
-          "EL3t entry, x0/x1, boot-core SP_EL0, CPACR_EL1 FPEN, SCR_EL3 RW/ST, and SPSR_EL3 EL1t mode are source-backed; other inherited register values are candidates.",
-          "Per-core stacks for cores 1-3 are candidate offsets from the boot-core stack, not measured physical stacks.",
-          "Initial group-0 distributor enable, redistributor awake state, CPU priority mask 255 and group-0 interface enables are candidate inherited GIC state, not measured reset values.",
-          "Initial image regions identify registered initialized segment bytes; they do not establish physical RAM placement, BSS contents, or hardware validation."
-        ]
+        "gic_initial": {
+          "0x0": 7
+        },
+        "gic_redistributor_initial": [
+          {
+            "core": 0,
+            "offset": 20,
+            "size": 4,
+            "value": 0
+          },
+          {
+            "core": 1,
+            "offset": 20,
+            "size": 4,
+            "value": 0
+          },
+          {
+            "core": 2,
+            "offset": 20,
+            "size": 4,
+            "value": 0
+          },
+          {
+            "core": 3,
+            "offset": 20,
+            "size": 4,
+            "value": 0
+          }
+        ],
+        "limits": []
       }
     },
     "views": {}

@@ -7,15 +7,16 @@ import {
   expectedAssets,
   loadingStep,
 } from '@fujimod/emulator-ui/engine/download-progress';
-import { CameraStore, type CameraRecord, type LibraryFirmware } from '../cameras/store';
+import { CameraStore, type CameraRecord } from '../cameras/store';
 import type { FirmwareLibrary } from '../cameras/firmware-library';
 import { latestCamera } from '../cameras/selection';
-import type { FirmwareDownloadFormat } from '../firmware-download';
 import '../home/site.css';
-import { modifiedDownload } from '../patch/download';
 import type { PatchResult } from '../patch/patcher';
 import { validateCatalog, type Catalog, type Firmware } from '../catalog';
-import { verifyPatch } from '../patch/catalog';
+import { verifyPatch, type PatchFirmware } from '../patch/catalog';
+import { loadOtaRelease, sdBootV2Firmware } from '../ota/release';
+import { releaseCameras, sdBootV2Plan, type CardCamera } from './sd-boot-v2/plan';
+import { cardFiles } from './sd-boot-v2/build';
 import { loadRelease, type LoadedRelease } from '../patch/release';
 import { sha256 } from '../patch/patcher';
 import { EngineError, faultFrom } from '@fujimod/emulator-ui/engine/fault';
@@ -25,7 +26,6 @@ import type { ReplayScenario } from '../scenarios';
 import { DEVICE_PANEL_SCHEMA, type DevicePanel } from '@fujimod/emulator-ui/ui/layout';
 import { shownError } from '@fujimod/emulator-ui/ui/shown-error';
 
-import { downloadBlob } from '@fujimod/emulator-ui/ui/download';
 import type { HomeState, PreviewCredit } from './state';
 import type { HomeSetter } from './state';
 
@@ -38,7 +38,7 @@ const adapters = import.meta.glob<{
   panel: DevicePanel;
   preview?: string;
   previewCredit?: PreviewCredit;
-  sdBoot?: boolean;
+  sdCardBoot?: boolean;
 }>('../../devices/*/index.ts');
 export function startHome(
   state: HomeState,
@@ -159,8 +159,63 @@ export function startHome(
     const firmware = index?.firmwares.find((entry) => entry.sha256 === selected.sha256);
     if (!index || !firmware || !index.patches[selected.sha256])
       return { identities: Promise.resolve([]), load: async () => [] };
+    const camera = sdBootV2Camera(firmware);
+    return camera ? sdBootV2Media(index, camera) : patchMedia(index, firmware, file);
+  }
+  /** The release's SD boot v2 camera for a firmware, when its processor has SD boot v2. */
+  function sdBootV2Camera(firmware: { id: string }) {
+    return release
+      ? releaseCameras(release.firmwares, catalog.firmwares, release.sd_card_files ?? []).find(
+          (entry) => entry.id === sdBootV2Firmware(firmware.id),
+        )
+      : undefined;
+  }
+  /** The release's SD boot v2 SD card for one camera, as the downloaded SD card holds it. */
+  function sdBootV2Media(index: LoadedRelease, camera: CardCamera): BootMedia {
+    const plan = loadOtaRelease(index.assetBase, camera.id).then((ota) => {
+      const { files, problems } = sdBootV2Plan({
+        cameras: [camera],
+        card: index.sd_card_files ?? [],
+        releases: new Map([[camera.id, ota]]),
+        excluded: new Set(),
+      });
+      if (problems.length) throw Error(problems[0]);
+      return files;
+    });
+    const step = (loaded: number, total: number) => ({
+      ...loadingStep('card', 'loading'),
+      loaded,
+      total,
+    });
+    // Start at once: the SD card downloads alongside the camera runtime.
+    const files = plan.then((planned) =>
+      cardFiles(planned, {
+        assetBase: index.assetBase,
+        progress: (received, total) => progress(state.message, undefined, [step(received, total)]),
+      }),
+    );
+    files.catch(() => {});
+    return {
+      identities: plan.then((files) =>
+        Promise.all(
+          files.map(async (file) => ({
+            path: `/${file.path}`,
+            sha256: file.from === 'data' ? await sha256(file.data) : file.sha256,
+          })),
+        ),
+      ),
+      load: async () => {
+        const loaded = await files;
+        const bytes = loaded.reduce((sum, file) => sum + file.bytes.length, 0);
+        progress(state.message, undefined, [loadingStep('card', 'complete', bytes)]);
+        return loaded.map(({ path, bytes }) => ({ path: `/${path}`, bytes }));
+      },
+    };
+  }
+  /** A release patch's SD boot v1 files, built from the selected firmware. */
+  function patchMedia(index: LoadedRelease, firmware: PatchFirmware, file: File): BootMedia {
     const metadata = (async () => {
-      const response = await fetch(new URL(index.patches[selected.sha256], index.assetBase));
+      const response = await fetch(new URL(index.patches[firmware.sha256], index.assetBase));
       if (!response.ok) throw Error('The release patch could not be downloaded.');
       return verifyPatch(index, firmware, new Uint8Array(await response.arrayBuffer()));
     })();
@@ -303,16 +358,18 @@ export function startHome(
       runningLayout();
       if (camera && !restart) modEnabled = camera.modEnabled;
       const modSupported =
-        'sdBoot' in device && !!device.sdBoot && !!release?.patches[entry.sha256];
-      // A FujiMod boot patches the firmware before the camera is built.
-      if (modSupported && modEnabled)
+        'sdCardBoot' in device && !!device.sdCardBoot && !!release?.patches[entry.sha256];
+      // A Fujimod boot downloads its SD card, or patches the firmware, before the camera is built.
+      if (modSupported && modEnabled) {
+        const media = loadingStep(sdBootV2Camera(entry) ? 'card' : 'patch', 'waiting');
         setState((s) => {
-          if (s.loadingAssets.some((asset) => asset.url === 'step:patch')) return;
+          if (s.loadingAssets.some((asset) => asset.url === media.url)) return;
           const rows = s.loadingAssets.map((asset) => ({ ...asset }));
           const build = rows.findIndex((asset) => asset.url === 'step:build');
-          rows.splice(build < 0 ? rows.length : build, 0, loadingStep('patch', 'waiting'));
+          rows.splice(build < 0 ? rows.length : build, 0, media);
           reconcile(rows, 'url')(s.loadingAssets);
         });
+      }
       progress('Loading emulator…');
       if (!replayScenario && !activeCamera) {
         activeCamera = await cameras.create(file, entry, modEnabled);
@@ -368,6 +425,7 @@ export function startHome(
                 ? {
                     mode: replayScenario.interactive ? 'live' : 'replay',
                     clockSeconds2000: replayScenario.clockSeconds2000,
+                    initialSteps: replayScenario.interactive ? replayScenario.steps : undefined,
                   }
                 : undefined,
             },
@@ -402,52 +460,48 @@ export function startHome(
         reconcile(records, 'id')(s.savedCameras);
       });
   }
-  /** Resume the latest matching camera, or create an independent camera from the selected DAT. */
-  async function runCamera(source: LibraryFirmware, enabled: boolean, fresh: boolean) {
+  /** Download the camera's official firmware, then resume or create its Fujimod camera. */
+  async function launch(firmware: Firmware) {
     manualSelection = true;
     if (state.cameraBusy) return;
     setState((s) => {
       s.cameraBusy = true;
     });
+    const current = ++generation;
+    const download = (loaded: number) => ({
+      ...loadingStep('download', loaded < firmware.bytes ? 'loading' : 'complete'),
+      loaded,
+      total: firmware.bytes,
+    });
     try {
-      const camera = fresh ? undefined : latestCamera(await cameras.list(), source.sha256, enabled);
-      const read = async () => new File([await cameras.firmware(source.sha256)], source.fileName);
-      await processFile(await read(), false, undefined, camera ? undefined : read, camera, enabled);
+      reset();
+      storageStatus('');
+      runningLayout();
+      setState((s) => {
+        s.loadingAssets = [download(0)];
+      });
+      progress('Downloading firmware…', undefined, [download(0)]);
+      const entry = await library.get(firmware, (received) =>
+        progress('Downloading firmware…', undefined, [download(received)]),
+      );
+      progress('Downloading firmware…', undefined, [download(firmware.bytes)]);
+      if (current !== generation) return;
+      const camera = latestCamera(await cameras.list(), entry.sha256, true);
+      // One read from storage: the camera takes these bytes, the File keeps a copy for restarts.
+      const bytes = await cameras.firmwareBytes(entry.sha256);
+      const read = async () => new File([await cameras.firmware(entry.sha256)], entry.fileName);
+      await processFile(new File([bytes], entry.fileName), false, bytes, read, camera, true);
     } catch (error) {
+      if (current === generation) {
+        ++generation;
+        reset();
+      }
       storageStatus(shownError(error), true);
     } finally {
       setState((s) => {
         s.cameraBusy = false;
       });
     }
-  }
-  async function downloadFirmware(source: LibraryFirmware, format: FirmwareDownloadFormat) {
-    const index = release;
-    const entry = index?.firmwares.find((entry) => entry.sha256 === source.sha256);
-    if (
-      !index ||
-      !entry ||
-      !(format === 'installable' ? entry.downloads.installable : entry.downloads.sd_card)
-    )
-      throw Error('This download is unavailable for the selected firmware.');
-    const file = new File([await cameras.firmware(source.sha256)], source.fileName);
-    const result = await new Promise<PatchResult>((resolve, reject) => {
-      const worker = new Worker(new URL('../patch/worker.ts', import.meta.url), { type: 'module' });
-      worker.onmessage = ({ data }) => {
-        if (data.stage) return;
-        worker.terminate();
-        if (data.error || data.unsupported)
-          reject(Error(data.error ?? 'No release patch is available for this firmware.'));
-        else resolve(data.result);
-      };
-      worker.onerror = (error) => {
-        worker.terminate();
-        reject(Error(error.message));
-      };
-      worker.postMessage({ file, index, artifactBase: index.assetBase });
-    });
-    const download = await modifiedDownload(format, result, entry, __FUJIMOD_BUILD_SHA__);
-    downloadBlob(download.blob, download.name);
   }
   async function closeCamera() {
     if (state.cameraBusy) return;
@@ -504,7 +558,7 @@ export function startHome(
       }
       if (disposed) return;
       setState((s) => {
-        s.catalog = catalog;
+        Object.assign(s.catalog, catalog);
         s.release = release;
       });
       if (disposed) return;
@@ -589,8 +643,7 @@ export function startHome(
     ...session,
     selectMod,
     saveLayout,
-    runCamera,
-    downloadFirmware,
+    launch,
     closeCamera,
     selectFile: (file?: File) => {
       manualSelection = true;

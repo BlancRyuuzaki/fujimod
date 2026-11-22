@@ -175,14 +175,14 @@ fn deadline_samples_policy_boundary_and_checkpoint_restores_the_observed_state()
 
         assert_eq!(board.state()["timeline"]["now"], 2);
         assert_eq!(samples(&board, device), [(2, expected)]);
-        let before = board.fingerprint().unwrap();
+        let before = board.complete_state().unwrap();
         let saved = board.checkpoint(None).unwrap();
 
         board
             .write_physical(0x3000, &0xdead_beefu32.to_le_bytes())
             .unwrap();
         board.restore_keyframe(&saved).unwrap();
-        assert_eq!(board.fingerprint().unwrap(), before);
+        assert_eq!(board.complete_state().unwrap(), before);
         assert_eq!(samples(&board, device), [(2, expected)]);
 
         board.run_until(4, 16).unwrap();
@@ -300,11 +300,11 @@ fn check_mmio_progress(policy: ExecutionPolicy, tick_limit: bool) {
             [100_000]
         );
     }
-    let before = board.fingerprint().unwrap();
+    let before = board.complete_state().unwrap();
     let saved = board.checkpoint(None).unwrap();
     board.run_for_instructions(1000, 1000).unwrap();
     board.restore_keyframe(&saved).unwrap();
-    assert_eq!(board.fingerprint().unwrap(), before);
+    assert_eq!(board.complete_state().unwrap(), before);
 }
 
 #[test]
@@ -354,10 +354,10 @@ fn mmio_created_deadline_survives_callback_restarts_and_checkpoint_restore() {
     board.run_until(armed + 32, 1000).unwrap();
     assert_eq!(samples(&board, device), [(armed + 32, 0)]);
     let saved = board.checkpoint(None).unwrap();
-    let before = board.fingerprint().unwrap();
+    let before = board.complete_state().unwrap();
     board.run_until(20_000, 1000).unwrap();
     board.restore_keyframe(&saved).unwrap();
-    assert_eq!(board.fingerprint().unwrap(), before);
+    assert_eq!(board.complete_state().unwrap(), before);
     assert_eq!(samples(&board, device), [(armed + 32, 0)]);
 }
 
@@ -420,8 +420,10 @@ fn serviced_deadline_precedes_interactive_mmio_catch_up() {
         let mut bytes = [0; 12];
         board.read_physical(0x3000, &mut bytes).unwrap();
         let words: Vec<_> = bytes
-            .chunks_exact(4)
-            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_le_bytes(*b))
             .collect();
         if words[0] == 1 {
             break words;
@@ -589,4 +591,36 @@ fn flag_rendezvous_continues_with_short_turns_and_livelocks_when_one_core_runs_a
     assert_eq!(stalled[0], 0, "{stalled:?}");
     assert!((0x1034..=0x1054).contains(&pcs[0]), "{:#x}", pcs[0]);
     assert!(pcs[1..].iter().all(|pc| (0x202c..=0x204c).contains(pc)), "{pcs:x?}");
+}
+
+#[test]
+fn cohort_ends_when_its_first_core_reaches_the_limit() {
+    let clock = fujimod_emulator_cpu::Clock {
+        now: 1000,
+        phase: 0,
+        ratio: Ratio::new(1, 1).unwrap(),
+    };
+    let mut epoch = super::Epoch::new(
+        3,
+        clock,
+        100,
+        fujimod_perf::EngineEndReason::OtherExit,
+    );
+    let cohort = [0, 1, 2];
+    assert!(epoch.open(&cohort));
+    // Owner callbacks split the epoch into segments; each core keeps its
+    // remaining share while every core has some left.
+    assert_eq!(epoch.advance(1, 30).unwrap(), 30);
+    assert_eq!(epoch.advance(2, 60).unwrap(), 30);
+    assert!(epoch.open(&cohort));
+    assert_eq!((epoch.room(0), epoch.room(1), epoch.room(2)), (100, 70, 40));
+    // Core 2 reaches the limit. Cores 0 and 1 still have room, but they
+    // would run alone against core 2's stores, so the cohort ends and time
+    // advances to the furthest core only.
+    assert_eq!(epoch.advance(2, 40).unwrap(), 40);
+    assert_eq!(epoch.advance(0, 10).unwrap(), 0);
+    assert!(!epoch.open(&cohort));
+    assert_eq!(epoch.clock(2).unwrap().now, 1100);
+    // A core outside the cohort (waiting or not released) does not end it.
+    assert!(epoch.open(&[0, 1]));
 }

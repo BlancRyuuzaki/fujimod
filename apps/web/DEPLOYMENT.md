@@ -7,17 +7,22 @@ serves `share.fujimod.com`; its signaling endpoint is
 
 ## Deploy
 
-Website deployment is independent of mod publication. GitHub Releases contain
-`patches.json`, mod patches, and optional `notes.md`. Generated emulator runtimes, the camera
-catalog, and feature media are uploaded directly to Cloudflare with the website.
+Website deployment is independent of mod publication. Merging to `main` does not
+deploy: `fujimod.com` shows the site code and the camera progress in
+`catalog/progress/` as of its last deploy, which is a maintainer's manual deploy
+or the [nightly deploy](#nightly-deploy). GitHub Releases contain
+`patches.json`, mod patches, optional `notes.md`, and camera update assets.
+Generated emulator runtimes, the camera catalog, feature media, and FocalUI SDK docs are uploaded
+directly to Cloudflare with the website.
 Generated assets stay outside Git.
 
 From `apps/web`, use the locally generated asset directories:
 
 ```sh
-FUJIMOD_SIGNAL_URL=wss://share.fujimod.com/usb-proxy/signal npm run deploy -- \
+FUJIMOD_SIGNAL_URL=wss://share.fujimod.com/usb-proxy/signal pnpm run deploy -- \
   --runtime /path/to/runtime \
-  --media /path/to/feature-media
+  --media /path/to/feature-media \
+  --sdk-docs /path/to/sdk-docs
 ```
 
 Deploys authenticate with the Cloudflare CLI's sign-in (`cf auth login`) through
@@ -33,29 +38,193 @@ staging leaves out recordings of cards the homepage no longer has. Locally, set
 back to its current promotion. Media and recording outputs are served directly
 at workspace-relative URLs. `FUJIMOD_MEDIA` selects a standalone media directory
 at `/artifacts/docs/`; production builds read this explicit directory.
+`FUJIMOD_SDK_DOCS` selects the SDK docs directory for dev and build. Its
+`manifest.json` supplies the component reference and preview metadata, and its
+preview HTML, scripts, and Wasm are served under `/docs/sdk/focal/`.
+
+The production build reads the published release history from GitHub. Set
+`GH_TOKEN` to authenticate those requests. Set `FUJIMOD_CONTRIBUTORS` to the
+directory of contributor JSON files, each with an `attributionName`, to supply
+the contributor roster. Development and `local-preview` builds use versioned
+Markdown in `FUJIMOD_RELEASE_NOTES` without contacting GitHub. Local dates come
+from when the notes were added to Git, or their modification times if Git
+history is unavailable. To see the personal note in development, open
+`/__dev/release-personal-note`.
 
 The command validates and stages these assets, runs application checks and tests,
 builds the website, and deploys `dist/client` using `wrangler.jsonc`. Staging fails
 before replacing installed assets if a required file or qualification is missing.
 Use `--prepare-only` to stage assets without building or deploying. The generated
 `site-assets.json` records file sizes and SHA-256 hashes for deployment verification.
+Every deploy also publishes `deployment.json` with the deployed commit and whether
+the checkout had uncommitted changes to tracked files.
+
+### Nightly deploy
+
+The [Web deploy](../../.github/workflows/web-deploy.yml) workflow runs nightly and
+when started by hand. It deploys `main` unless `fujimod.com/deployment.json`
+already names `main`'s commit from a clean checkout; the manual run's `force`
+input deploys anyway. It runs the Web checks workflow first, then:
+
+```sh
+pnpm run deploy -- --carry-from https://fujimod.com/
+```
+
+CI cannot rebuild emulator runtimes, feature media, or SDK docs because their inputs stay
+outside Git. `--carry-from` downloads the assets the site already serves instead:
+it reads the site's `site-assets.json`, downloads every file it lists, and checks
+each file's size and SHA-256 and each runtime loader against this checkout's
+Camera API before running the same checks, tests, build and upload as a manual
+deploy. A size or hash mismatch, or a runtime missing a Camera method, stops the
+deploy. A runtime SBOM without linker provenance also requires a fresh runtime
+build. A maintainer deploys fresh inputs with `--runtime`, `--media`, and
+`--sdk-docs`. The nightly deploy carries the SDK bundle forward after the first
+deploy that publishes it.
+
+The workflow needs the repository secret `CLOUDFLARE_API_TOKEN`: a Cloudflare API
+token from the "Edit Cloudflare Workers" template, limited to the account in
+`wrangler.jsonc` and the `fujimod.com` zone. Its `deploy` job runs in the
+`production` environment, where required reviewers or a branch rule can gate it.
 A mod release never triggers or supplies a website deployment. The Worker
 selects the newest published GitHub release with `patches.json`, including
-prereleases, through unauthenticated API requests. `/releases/current` returns
+prereleases, through GitHub API requests. `/releases/current` returns
 `{tag, name, published_at, prerelease}` with a five-minute edge cache. The
-`RELEASES` KV namespace (`fujimod-releases`) holds the current release and
-every release file served. `/releases/current` answers from KV and refreshes it
+`RELEASES` KV namespace (`fujimod-releases`) holds the current release, every
+release file served, and the OTA manifest and store copies used when GitHub
+fails. `/releases/current` answers from KV and refreshes it
 from GitHub in the background; release files fall back to KV when GitHub fails.
 GitHub's unauthenticated limit is shared by every Worker on an egress address,
 so only the first lookup after creating the namespace waits on GitHub.
+Set the `GITHUB_TOKEN` Worker secret to authenticate these API lookups with a
+token; it increases the shared limit and is never sent to asset downloads.
+Set it once from `apps/web` with
+`node ../../scripts/cloudflare/wrangler.ts secret put GITHUB_TOKEN`.
 `/releases/<tag>/<file>` proxies GitHub asset bytes with a one-year edge cache.
 Only successful responses are cached; browser consumers still verify file sizes
 and SHA-256. Development and preview servers expose the same routes from
 `FUJIMOD_PATCHES` without caching.
 
+## OTA updates
+
+Camera updates use the same release. `GET /ota/<firmware-id>/latest.json`
+answers with the release manifest and `GET /ota/store/<XXXXXXXX.YYY>` with the
+store file of that content-addressed name. Both come from the newest published
+release that carries `patches.json`. `/ota/timezone` answers with
+`{"timezone": <request.cf.timezone>}` for clock setup.
+
+`fujimod-release-manifest` writes a release directory containing `latest.json`
+and one file per distinct SHA-256. Upload it with the manifest renamed to
+`<firmware-id>-latest.json`, because GitHub release assets have flat names:
+
+```sh
+gh release upload <tag> \
+  release/latest.json#x70-110-latest.json \
+  release/[0-9A-F]*.???
+```
+
+The store file name is the full asset name, so every release must include each
+store file its manifest names. The Worker rejects a manifest whose `firmware`
+field differs from the requested firmware id. Requests never forward the
+client's authorization or cookie headers to GitHub.
+
+The current-release lookup and each firmware manifest are cached at the edge
+for five minutes and mirrored in KV. Camera requests inside that window answer
+without contacting GitHub; an origin error serves the last copy. Manifests go
+to cameras with `Cache-Control: no-store`. Their edge copies carry an internal
+fetch time and stay for a year, so they remain available during an outage. The
+`GITHUB_TOKEN` secret authenticates GitHub API lookups; store assets are
+downloaded without it.
+
+Store files are immutable. On a cold cache the Worker fetches the whole asset
+once, never forwarding a client's `Range` header, then caches the bytes at the
+edge and in the `RELEASES` KV namespace and answers ranges from that copy.
+
+A single `bytes=` range is answered with `206` and `Content-Range`, or `416`
+with `Content-Range: bytes */<size>` when unsatisfiable. Other range syntax
+receives the whole file with `200`. `HEAD` answers with the same status and
+headers as `GET` and no body. The Worker follows GitHub's redirect to asset
+storage itself, so these routes answer directly over HTTPS without redirecting
+the camera.
+
+A published release becomes visible within five minutes. To publish
+immediately, purge the cached release lookup and each changed manifest by URL:
+
+```sh
+curl -sS -X POST "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/purge_cache" \
+  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data '{"files":[
+    "https://fujimod.com/ota/release.json",
+    "https://fujimod.com/ota/x70-110/latest.json"
+  ]}'
+```
+
+`/ota/release.json` is the internal cache key for the current-release lookup
+and is not a public route. The Worker reads and writes these entries through
+the Cache API under those exact URLs, so a URL purge clears them in every data
+center.
+
 Verify both HTTPS hostnames, `/dev-tools/`, camera launch controls, an actual
-emulator boot, and feature media after deployment. Firmware DATs are selected
-locally in the browser and are not website assets.
+emulator boot, `/ota/timezone`, a release manifest, and feature media after
+deployment. Firmware DATs are selected locally in the browser and are not
+website assets.
+
+## Accounts
+
+The Worker mounts Better Auth at `/api/auth/*` ahead of static assets and stores
+users, sessions, linked Google accounts, devices and device codes in the
+`fujimod-auth` D1 database (`AUTH_DB`). `www.fujimod.com` signs in through the
+apex origin, so one Google redirect covers both hostnames.
+
+A camera asks `/api/auth/device/code` for a code and shows it to its owner, who
+approves it at `/device/` after signing in. The approved camera polls
+`/api/auth/device/token` for its session token. The Worker stores that token as a
+hashed device credential, and the camera sends it to
+`POST /api/devices/google-token` to receive a Google access token for upload.
+Permissions come from [`src/devices/policy.ts`](src/devices/policy.ts), not from
+the scopes a client asks for, so an unknown client cannot obtain a code and a
+device without `google.photos.append` is refused.
+
+The Google OAuth client `FujiMod Web` needs these authorized redirect URIs, and
+the JavaScript origins without the path:
+
+```text
+https://fujimod.com/api/auth/callback/google
+https://cozycat.tail2b5ca.ts.net:8794/api/auth/callback/google
+```
+
+The Google Auth Platform data access page must list `openid`,
+`userinfo.email`, `userinfo.profile`, `photoslibrary.appendonly`,
+`photoslibrary.readonly.appcreateddata` and `photospicker.mediaitems.readonly`.
+The scope list lives in [`src/auth/options.ts`](src/auth/options.ts).
+
+The Worker needs `GOOGLE_CLIENT_SECRET` and `BETTER_AUTH_SECRET` secrets;
+`GOOGLE_CLIENT_ID` is a plain variable in `wrangler.jsonc`. Local development
+reads them from `.dev.vars` (see `.dev.vars.example`).
+
+Schema changes come from Drizzle: edit `src/db/`, then `pnpm run db:generate`
+and apply the new migration.
+
+```sh
+pnpm run db:migrate:list
+pnpm run db:migrate:remote
+```
+
+Applying migrations uses the Cloudflare CLI (`cf`), which shares this
+repository's sign-in with Wrangler. `pnpm run db:migrate:local` targets the local
+D1 copy instead.
+
+## Download counts
+
+The homepage reports each completed FujiMod archive to `POST /api/downloads`.
+The Worker records it in `download_event` in `fujimod-auth`; the tab-scoped
+random session ID separates downloads from distinct sessions. Failed builds and
+recovery images are not counted. Query the table with the Cloudflare CLI:
+
+```sh
+cf d1 query 29375cc8-35ff-4559-ad3a-05d977dfde89 --sql \
+  "select count(*) as downloads, count(distinct session) as sessions from download_event"
+```
 
 ## DNS and sharing
 

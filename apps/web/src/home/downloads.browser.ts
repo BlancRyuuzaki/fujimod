@@ -2,6 +2,7 @@
 import { chromium } from 'playwright';
 import assert from 'node:assert/strict';
 import { mkdir, writeFile } from 'node:fs/promises';
+import { launchFujimod } from '../cameras/launch.playwright.ts';
 
 const url = process.env.FUJIMOD_WEB_URL;
 const dat = process.env.FUJIMOD_TEST_DAT;
@@ -14,6 +15,13 @@ try {
   if (!process.env.FUJIMOD_PREVIEW_ONLY) {
     const context = await browser.newContext({ viewport: { width: 390, height: 844 } });
     await context.routeWebSocket('**/*', () => {});
+    // Hold the camera emulator download until its bandwidth limit is in place.
+    let throttle = () => {};
+    const throttled = new Promise<void>((resolve) => (throttle = resolve));
+    await context.route('**/camera.wasm', async (route) => {
+      await throttled;
+      await route.continue();
+    });
     const page = await context.newPage();
     page.on('pageerror', (error) => errors.push(error.stack ?? error.message));
     page.on('console', (message) => {
@@ -27,14 +35,16 @@ try {
     const cdp = await context.newCDPSession(page);
     await cdp.send('Network.enable');
     await cdp.send('Network.setBlockedURLs', { urls: ['wss://*', 'ws://*'] });
+    // Throttle only the camera's assets: the firmware download finishes first.
+    await launchFujimod(page, dat);
+    await page.locator('[data-asset="step:download"][data-state="complete"]').waitFor();
     await cdp.send('Network.emulateNetworkConditions', {
       offline: false,
       latency: 20,
       downloadThroughput: 400000,
       uploadThroughput: 1000000,
     });
-    await page.locator('#firmware-file').setInputFiles(dat);
-    await page.getByRole('button', { name: 'Run unmodified in your browser', exact: true }).click();
+    throttle();
     await page.waitForFunction(
       () => {
         const bar = document.querySelector<HTMLProgressElement>(

@@ -8,8 +8,9 @@ immutable `Frame` and `Recorder`.
 
 PNG encoding is lazy and shared by clones of a frame. Video consumes RGB
 directly, fits a changed image once to its initial canvas, and reuses clean and
-annotated buffers until pixels or badge appearance change. The two ffmpeg
-processes consume that same rendering. Screenshots retain native resolution and
+annotated buffers until pixels or badge appearance change. Each FFmpeg process
+receives a timestamped, lossless RGB stream through a pipe and expands holds to
+the requested frame rate. Screenshots retain native resolution and
 never include input badges. Badges and touch circles are anti-aliased vector
 paths drawn with tiny-skia; badge text is Inter SemiBold (`assets/fonts`, SIL
 Open Font License) outlined through ab_glyph with the font's advances and
@@ -48,12 +49,12 @@ register/configuration key and a read function. Reuse requires the same key and
 identical bytes at **every** previously addressed span. A changed register,
 buffer or palette causes a new rendering. Refused captures never enter the
 cache. Emulator sessions keep this host cache outside checkpoints and complete
-state fingerprints; it neither drives execution nor acknowledges hardware.
+state; it neither drives execution nor acknowledges hardware.
 
 Python exposes `fujimod.recording.Frame`, `Recorder` and `capture_scanout` through
 the native binding. Guide code receives native frames; only an explicit image
 consumer calls `Frame.png()`. `Frame.save()` and `Recorder.screenshot()` write
-screenshots and return their SHA-256. Importing PNG is supported for image files
+screenshots. Importing PNG is supported for image files
 and test inputs; the native scanout/video path never uses PNG intermediates.
 
 Run `cargo test -p fujimod-recording` and

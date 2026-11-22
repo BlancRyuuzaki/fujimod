@@ -12,6 +12,7 @@
 //! records every access it observes, so the tests assert the exact physical
 //! address, width, value and order the device scheduler saw.
 
+use fujimod_catalog_configuration::RunEngine;
 use super::{
     bus::{Bus, Mode},
     factory, Board,
@@ -134,7 +135,7 @@ fn translated_device_execution(program: &[u32], map_device: bool) -> (Board, Arc
         .unwrap();
     let board = graph
         .build(
-            factory::Options::new(factory::Engine::Unicorn)
+            factory::Options::new(RunEngine::Unicorn)
                 .with_translation_cache_size_bytes(1 << 20),
             bus,
             None,

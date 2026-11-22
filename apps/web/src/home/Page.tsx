@@ -5,51 +5,24 @@ import { Show, createSignal, onSettled } from 'solid-js';
 import { createHomeState } from './state';
 import { startHome, type HomeController } from './controller';
 import { FaultPanel } from '@fujimod/emulator-ui/ui/fault';
+import { ReleasePersonalNote } from '../ui/ReleasePersonalNote';
 import { CameraTable } from '../ui/cameras';
-import {
-  byModel,
-  withOverrides,
-  type FirmwareProgress,
-  type ProgressOverride,
-} from '../ui/camera-progress';
-import { PersonalNote } from '../ui/personal-note';
-import { SiteHeader } from '../ui/site-header';
-import { FeatureCatalog } from './Features';
+import { cameraProgress } from '../ui/catalog-progress';
+import generations from '../../devices/generations.generated.json';
+import owners from '../../devices/owners.json';
+import { ReleaseNotes } from '../cameras/ReleaseNotes';
+import { releaseData, releaseDate } from '../release-data';
+import { SiteFrame } from '../ui/SiteFrame';
+import { FeatureReels } from './FeatureReels';
+import { SdBootV2Download } from './sd-boot-v2/SdBootV2Download';
+import { recipeCatalog } from './sd-boot-v2/plan';
 import { createFirmwareLibrary } from '../cameras/firmware-library';
 import { sha256 } from '../patch/patcher';
 import { initialize } from 'fujimod';
 import { identify } from '../recovery/identify';
 import { EmulatorFeedback } from '@fujimod/emulator-ui/Feedback';
 import { ViewportControls } from '@fujimod/emulator-ui/ViewportControls';
-import { Icon } from '@fujimod/emulator-ui/ui/icons';
-import generations from '../../devices/generations.json';
-import owners from '../../devices/owners.json';
 import '../home/site.css';
-import '../navigation.css';
-
-/** Latest recorded bring-up progress with publishing overrides, from the catalog at build time. */
-const cameraProgress = byModel(
-  withOverrides(
-    Object.values(
-      import.meta.glob<FirmwareProgress>(
-        '../../../../catalog/progress/*/*/progress.generated.json',
-        {
-          eager: true,
-          import: 'default',
-        },
-      ),
-    ),
-    Object.values(
-      import.meta.glob<ProgressOverride>(
-        '../../../../catalog/progress/*/*/progress.override.json',
-        {
-          eager: true,
-          import: 'default',
-        },
-      ),
-    ),
-  ),
-);
 
 export default function Home() {
   const [state, setState] = createHomeState();
@@ -93,14 +66,36 @@ export default function Home() {
   });
   return (
     <>
-      <div class="shell">
-        <SiteHeader root="" />
+      <SiteFrame>
         <main>
-          <PersonalNote />
-          <FeatureCatalog />
+          <ReleasePersonalNote />
+          <FeatureReels recipeCount={recipeCatalog(state.release?.sd_card_files).length} />
+          <section class="home-release">
+            <Show when={releaseData.current}>
+              {(release) => (
+                <h2 class="home-release-title">
+                  Fujimod {release().version}
+                  <time datetime={release().publishedAt}>
+                    {releaseDate.format(new Date(release().publishedAt))}
+                  </time>
+                </h2>
+              )}
+            </Show>
+            <SdBootV2Download release={state.release} catalog={state.catalog.firmwares} />
+            <Show when={releaseData.current}>
+              {(release) => (
+                <article class="home-release-notes">
+                  <ReleaseNotes title={`Fujimod ${release().version}`} text={release().notes} />
+                  <p class="home-release-history">
+                    <a href="/releases">All releases →</a>
+                  </p>
+                </article>
+              )}
+            </Show>
+          </section>
           <div class="emulator-heading">
             <h2 class="section-heading" id="software">
-              Software
+              Emulator
             </h2>
             <Show when={state.activeCamera}>
               <span
@@ -120,8 +115,7 @@ export default function Home() {
                 disabled={state.cameraBusy}
                 onClick={() => void runtime()?.closeCamera()}
               >
-                <Icon name="power" size={14} />
-                Save & Exit
+                Close
               </button>
             </Show>
           </div>
@@ -145,7 +139,7 @@ export default function Home() {
                 entry.name,
                 state.release?.firmwares.find(
                   (firmware) => firmware.sha256 === state.firmware?.sha256,
-                )?.downloads,
+                ),
               )
             }
             onLayoutChange={(panel) => runtime()?.saveLayout(panel)}
@@ -175,23 +169,20 @@ export default function Home() {
             <Show when={state.promptVisible}>
               <CameraLauncher
                 ready={state.savedCamerasRead && library.ready()}
-                cameras={state.savedCameras}
-                library={library}
-                release={state.release}
                 supported={state.cameras}
                 busy={state.cameraBusy}
                 message={state.storageMessage}
                 error={state.storageError}
-                run={(firmware, mod, fresh) => void runtime()?.runCamera(firmware, mod, fresh)}
-                download={(firmware, format) => {
-                  const app = runtime();
-                  if (!app) return Promise.reject(Error('The launcher is not ready.'));
-                  return app.downloadFirmware(firmware, format);
-                }}
+                launch={(firmware) => void runtime()?.launch(firmware)}
               />
             </Show>
           </EmulatorWorkspace>
-          <CameraTable columns={generations} progress={cameraProgress} owners={owners} />
+          <CameraTable
+            columns={generations}
+            progress={cameraProgress}
+            owners={owners}
+            released={new Set(state.release?.firmwares.map((firmware) => firmware.id))}
+          />
         </main>
         <footer id="preview-credit" hidden={!state.idle}>
           <Show when={state.previewCredit}>
@@ -204,7 +195,7 @@ export default function Home() {
             )}
           </Show>
         </footer>
-      </div>
+      </SiteFrame>
       <FaultPanel
         fault={state.fault}
         context={state.faultContext}

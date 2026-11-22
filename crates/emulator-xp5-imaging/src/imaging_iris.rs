@@ -1,4 +1,5 @@
 //! Functional SPI5 aperture pulse completion at the stock IRQ boundary.
+use fujimod_emulator_devices::checkpoint::Checkpoint;
 use fujimod_emulator_devices::{Cx, Device};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,50 +13,6 @@ struct Motion {
     completions: u64,
     #[serde(default)]
     batches: VecDeque<u16>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use fujimod_emulator_devices::test_host::recording::RecordingHost;
-    #[test]
-    fn stock_three_batch_command_survives_restore_and_stop_cancels() {
-        let mut iris = Iris::new(crate::serial_sink::Sink::new(0));
-        let mut host = RecordingHost::default();
-        for word in [0x2c00, 0x2c04, 0x2cc4, 0x2c04] {
-            iris.write(&mut Cx::new(&mut host, 0, 0, 0), 8, 4, word);
-        }
-        let mut restored = Iris::new(crate::serial_sink::Sink::new(0));
-        restored.restore(&iris.save()).unwrap();
-        while !host.events.is_empty() {
-            let (_, at, token) = host.events.remove(0);
-            host.now = at;
-            restored.event(&mut Cx::new(&mut host, 0, 0, 0), token);
-        }
-        assert_eq!(
-            host.irqs
-                .iter()
-                .filter(|(_, high)| *high)
-                .map(|(irq, _)| *irq)
-                .collect::<Vec<_>>(),
-            [125, 125, 125]
-        );
-        assert_eq!(host.now, 7_080_000);
-        restored.write(&mut Cx::new(&mut host, 0, 0, 0), 8, 4, 0x2cc4);
-        restored.write(&mut Cx::new(&mut host, 0, 0, 0), 8, 4, 0x2c04);
-        let (_, _, token) = host.events.remove(0);
-        restored.write(&mut Cx::new(&mut host, 0, 0, 0), 8, 4, 0x2400);
-        restored.event(&mut Cx::new(&mut host, 0, 0, 0), token);
-        assert_eq!(
-            host.irqs
-                .iter()
-                .filter(|(_, high)| *high)
-                .map(|(irq, _)| *irq)
-                .collect::<Vec<_>>(),
-            [125, 125, 125]
-        );
-        assert!(host.events.is_empty());
-    }
 }
 
 pub struct Iris {
@@ -137,6 +94,21 @@ impl Device for Iris {
             self.schedule(cx);
         }
     }
+    fn checkpoint(&self) -> Result<Checkpoint, String> {
+        Ok(Checkpoint::encode(self.name(), &self.motion)?
+            .with_children(vec![self.serial.checkpoint()?]))
+    }
+    fn validate_checkpoint(&self, saved: &Checkpoint) -> Result<(), String> {
+        let _: Motion = saved.decode(self.name())?;
+        let [serial] = saved.children() else { return Err("missing serial motion state".into()); };
+        self.serial.validate_checkpoint(serial)
+    }
+    fn restore_checkpoint(&mut self, saved: &Checkpoint) -> Result<(), String> {
+        self.validate_checkpoint(saved)?;
+        self.serial.restore_checkpoint(&saved.children()[0])?;
+        self.motion = saved.decode(self.name())?;
+        Ok(())
+    }
     fn save(&self) -> Value {
         serde_json::json!({"serial": self.serial.save(), "iris": self.motion})
     }
@@ -146,5 +118,49 @@ impl Device for Iris {
         self.serial.restore(&value["serial"])?;
         self.motion = motion;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fujimod_emulator_devices::test_host::recording::RecordingHost;
+    #[test]
+    fn stock_three_batch_command_survives_restore_and_stop_cancels() {
+        let mut iris = Iris::new(crate::serial_sink::Sink::new(0));
+        let mut host = RecordingHost::default();
+        for word in [0x2c00, 0x2c04, 0x2cc4, 0x2c04] {
+            iris.write(&mut Cx::new(&mut host, 0, 0, 0), 8, 4, word);
+        }
+        let mut restored = Iris::new(crate::serial_sink::Sink::new(0));
+        restored.restore(&iris.save()).unwrap();
+        while !host.events.is_empty() {
+            let (_, at, token) = host.events.remove(0);
+            host.now = at;
+            restored.event(&mut Cx::new(&mut host, 0, 0, 0), token);
+        }
+        assert_eq!(
+            host.irqs
+                .iter()
+                .filter(|(_, high)| *high)
+                .map(|(irq, _)| *irq)
+                .collect::<Vec<_>>(),
+            [125, 125, 125]
+        );
+        assert_eq!(host.now, 7_080_000);
+        restored.write(&mut Cx::new(&mut host, 0, 0, 0), 8, 4, 0x2cc4);
+        restored.write(&mut Cx::new(&mut host, 0, 0, 0), 8, 4, 0x2c04);
+        let (_, _, token) = host.events.remove(0);
+        restored.write(&mut Cx::new(&mut host, 0, 0, 0), 8, 4, 0x2400);
+        restored.event(&mut Cx::new(&mut host, 0, 0, 0), token);
+        assert_eq!(
+            host.irqs
+                .iter()
+                .filter(|(_, high)| *high)
+                .map(|(irq, _)| *irq)
+                .collect::<Vec<_>>(),
+            [125, 125, 125]
+        );
+        assert!(host.events.is_empty());
     }
 }

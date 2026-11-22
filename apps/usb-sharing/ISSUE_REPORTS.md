@@ -1,4 +1,4 @@
-# Camera issue reports
+# Issue reports
 
 `POST /issue-reports` accepts an explicitly selected TAR, its QR descriptor and a
 reporter's description. The browser never sends the URL fragment during page load.
@@ -7,7 +7,7 @@ The description becomes public in `justjake/fujimod`. Issues carry the labels `b
 Processor 2)"). The Worker creates a camera's label with that description the first
 time the camera reports. `camera-labels.generated.json` lists every known
 firmware's label, generated from the catalog and `processor-names.json` by
-`npm run generate`. The archive is stored in
+`pnpm run generate`. The archive is stored in
 R2 and a separate read-only share URL is returned to the uploader. Anyone with
 that URL can download the report. No GitHub account or credential is needed in the browser.
 
@@ -25,6 +25,23 @@ retains the archive and never automatically repeats the GitHub request. Retrieve
 that ID from the private bucket to reconcile it manually. Receipts also include
 `shareUrl`; see [Shared files](SHARED_FILES.md). Records and archives persist until maintainers delete
 them; there is no automatic retention policy yet.
+
+## Reports without a camera QR link
+
+The same endpoint accepts multipart submissions with `kind=general`, a
+`description`, and optional `archive=zip`. The browser creates a single ZIP
+of the selected files and sends it through the resumable contributions
+protocol with `reportArchive: true`. This mode accepts a single ZIP of up to
+1 GiB and returns a private receipt without a publication. At least a
+description or a stored ZIP is required.
+
+The reporter can include `name`, `contact-type` (Instagram, Twitter, GitHub,
+or Email), and `contact-value`. The GitHub issue contains the description and
+report ID. The `share-contact=on` option adds the supplied contact to the issue.
+The `share-files=on` option adds a public download link for the ZIP alone.
+Retrieve `<id>/report.zip` and `<id>/metadata.json` from the private R2 bucket.
+General report receipts contain the report ID and the GitHub issue URL when
+creation is confirmed.
 
 ## Index
 
@@ -52,9 +69,9 @@ access). Configure `GITHUB_ISSUES_TOKEN` with Issues: write access to
 `justjake/fujimod` under the account that should author the issues, then deploy:
 
 ```sh
-npx wrangler r2 bucket create fujimod-issue-reports
-npx wrangler secret put GITHUB_ISSUES_TOKEN
-npm run deploy
+pnpm exec wrangler r2 bucket create fujimod-issue-reports
+pnpm exec wrangler secret put GITHUB_ISSUES_TOKEN
+pnpm run deploy
 ```
 
 Never reuse a developer's local GitHub credential implicitly. The token stays in
@@ -64,7 +81,7 @@ existing USB sharing objects and TURN secrets remain intact.
 Maintainers can retrieve a report with their Cloudflare credentials:
 
 ```sh
-npx wrangler r2 object get fujimod-issue-reports/REPORT_ID/report.tar --remote --file report.tar
+pnpm exec wrangler r2 object get fujimod-issue-reports/REPORT_ID/report.tar --remote --file report.tar
 ```
 
 Run `node --test worker.test.ts issue-reports.test.ts`. Tests use a real local

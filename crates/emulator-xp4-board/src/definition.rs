@@ -6,9 +6,33 @@ fn instruction_rate() -> (u64, u64) {
     (1, 1)
 }
 
+/// Explicit discovery-only receiver input; no physical register model.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryTxReceiver {
+    pub address: u32,
+    pub request: u8,
+    pub capacity: usize,
+    pub offer_at: u64,
+    pub offer_bytes: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StandaloneDma {
+    pub irq_routes: Vec<u32>,
+    pub reset_profile: String,
+    pub timing_profile: String,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Definition {
+    #[serde(default)]
+    pub discovery_tx_receiver: Option<DiscoveryTxReceiver>,
+    /// Explicit byte I2C controllers and their declared external peers.
+    #[serde(default)]
+    pub byte_i2c: Vec<ByteI2c>,
     pub ram_size: usize,
     pub cores: usize,
     pub discovery: bool,
@@ -16,10 +40,17 @@ pub struct Definition {
     pub memory_regions: Vec<super::memory::Region>,
     #[serde(default)]
     pub initial_registers: Vec<Vec<(Register, u64)>>,
+    /// Explicit Cortex-A7 SCR/NSACR inputs, one per core. Empty preserves
+    /// backend defaults; this declaration is not a physical reset measurement.
+    #[serde(default)]
+    pub initial_security: Vec<InitialSecurity>,
     #[serde(default)]
     pub labels: Vec<u32>,
     #[serde(default)]
     pub cbar: Option<u32>,
+    /// Explicit initial GIC registers; omitted preserves reset state.
+    #[serde(default)]
+    pub gic_initial: Option<GicInitial>,
     #[serde(default)]
     pub timer_base: Option<u32>,
     #[serde(default)]
@@ -28,16 +59,57 @@ pub struct Definition {
     pub timer_routes: Vec<(usize, usize)>,
     #[serde(default)]
     pub storage_jedec: Option<u32>,
+    /// Immutable executable prefix of the connected XP4 NOR array.
+    #[serde(default)]
+    pub storage_immutable_prefix: Option<NorImmutablePrefix>,
+    /// Mutable NOR execution window, declared independently of normal mapped reads.
+    #[serde(default)]
+    pub storage_executable_range: Option<fujimod_emulator_xp4_storage::storage::ExecutableRange>,
+    /// Declared controller and pad states under which CPU reads of the mapped
+    /// NOR return array data; absent serves every mapped read.
+    #[serde(default)]
+    pub storage_mapped_read: Option<fujimod_emulator_xp4_storage::storage::MappedReadGate>,
+    /// Refuse every write-enable, erase and program request to the NOR.
+    #[serde(default)]
+    pub storage_write_protect: bool,
+    /// Declared array-relative extents that a synthetic experiment admits
+    /// mutation into. Requires strict read backing; contradicts whole-array
+    /// write protection. Empty preserves the existing behavior.
+    #[serde(default)]
+    pub storage_write_ranges: Vec<fujimod_emulator_xp4_storage::storage::WriteRange>,
+    /// Bound external NOR reads to the supplied asset. Omitted preserves
+    /// erased bytes beyond the asset; this does not declare chip capacity.
+    #[serde(default)]
+    pub storage_strict_backing: bool,
+    /// Explicit erased initial ranges outside the byte asset. Requires strict
+    /// backing; undeclared gaps remain inaccessible.
+    #[serde(default)]
+    pub storage_erased_ranges: Vec<fujimod_emulator_xp4_storage::storage::ErasedRange>,
+    /// DMA-only connection with explicitly declared reset and timing hypotheses.
+    #[serde(default)]
+    pub standalone_dma: Option<StandaloneDma>,
     #[serde(default)]
     pub storage_dma_routes: Vec<u32>,
     #[serde(default)]
     pub spi_inputs: Vec<(u64, bool)>,
     #[serde(default)]
     pub control_requests: Vec<(u64, u64)>,
+    /// Optional unmeasured delay for the single-word XP4 request acknowledgment.
+    #[serde(default)]
+    pub request_acknowledgment_ticks: Option<u64>,
+    /// Explicit, unmeasured functional hypotheses; absent keeps strict refusal.
+    #[serde(default)]
+    pub xp4_functional_system_control: Option<fujimod_emulator_xp4_system::system_control::Config>,
     #[serde(default)]
     pub storage_geometry: Option<(usize, usize, u64, u64)>,
     #[serde(default)]
     pub storage_irq: Option<u32>,
+    /// Declared audio channels of the XP4 storage DMA: paced silent audio
+    /// FIFOs and linked descriptor lists (see
+    /// [`fujimod_emulator_xp4_storage::storage::AudioPacing`]). Absent, every
+    /// channel is unchanged.
+    #[serde(default)]
+    pub storage_dma_audio: Option<fujimod_emulator_xp4_storage::storage::AudioPacing>,
     #[serde(default)]
     pub xpp_storage: Option<XppStorage>,
     #[serde(default)]
@@ -139,10 +211,16 @@ pub struct Definition {
     /// GPIO bank base; the XP4 0xfff41000 when absent.
     #[serde(default)]
     pub gpio_base: Option<u64>,
+    /// GPIO pads wired to level-sensitive interrupt inputs.
+    #[serde(default)]
+    pub gpio_interrupts: Vec<fujimod_emulator_devices::parts::gpio::InputIrq>,
     #[serde(default)]
     pub temperature: Option<(i32, u64)>,
     #[serde(default)]
     pub power_spi: Option<(u64, bool, usize, usize, bool, BTreeMap<u8, u16>, u64)>,
+    /// Optional exact uninterpreted output; requires the power SPI peer.
+    #[serde(default)]
+    pub power_spi_command_output: Option<fujimod_emulator_xp4_io::power_serial::ExactCommandOutput>,
     #[serde(default)]
     pub checksum_power_spi: Option<(
         u64,
@@ -157,7 +235,7 @@ pub struct Definition {
     )>,
     #[serde(default)]
     pub imaging: Option<(
-        (u64, u64, Vec<u32>, Vec<u32>, Vec<u32>),
+        (u64, u64, Vec<u32>, Vec<u32>, Vec<u32>, Option<Vec<u32>>),
         (u64, u64, u64, u64),
         (u16, u8),
         Option<(u64, u32, u64, u64, u64, String)>,
@@ -166,6 +244,45 @@ pub struct Definition {
     pub movdc: Vec<(u64, u32, u64, u64, u8)>,
     #[serde(default)]
     pub sd_clocks: Vec<(u64, u64)>,
+    /// SD hosts with the card in their slot; each owns its page, clock halfword included.
+    #[serde(default)]
+    pub sd_hosts: Vec<SdHost>,
+    /// Card-controller register windows, each excluding its clock halfword.
+    #[serde(default)]
+    pub register_banks: Vec<(u64, u64)>,
+    /// The USB condition register `(base, cable present)`, when declared.
+    #[serde(default)]
+    pub usb_condition: Option<(u64, bool)>,
+    /// The countdown timer bank `(base, [(channel, interrupt line)])`, when declared.
+    #[serde(default)]
+    pub countdown_timers: Option<(u64, Vec<(usize, u32)>)>,
+    /// Command dials wired to countdown timer channels' count inputs.
+    #[serde(default)]
+    pub countdown_dials: Vec<CountdownDial>,
+    /// The JPEG encoder with the XP4 driver's register contract, when declared.
+    #[serde(default)]
+    pub jpeg_encoder: Option<JpegEncoder>,
+    /// The JPEG decoder with the X-Processor Pro register contract, when declared.
+    #[serde(default)]
+    pub jpeg_decoder: Option<JpegDecoder>,
+    /// Declared still-processing engines (see `crate::still`).
+    #[serde(default)]
+    pub still_engines: Vec<StillEngine>,
+    /// The still DSP's host interface (see `crate::dsp`), when declared.
+    #[serde(default)]
+    pub dsp: Option<Dsp>,
+    /// The face detection engine with the XP4 driver's register contract, when declared.
+    #[serde(default)]
+    pub face_detector: Option<FaceDetector>,
+    /// The filter engine with the XP4 driver's register contract, when declared.
+    #[serde(default)]
+    pub filter_engine: Option<FilterEngine>,
+    /// Arm PL011 UARTs with nothing attached, when declared.
+    #[serde(default)]
+    pub pl011_uarts: Vec<Pl011Uart>,
+    /// The Mali-V61 style video unit with the XP4 driver's host interface, when declared.
+    #[serde(default)]
+    pub mali_v61: Option<fujimod_emulator_xp4_video::mali_v61::Options>,
     #[serde(default = "instruction_rate")]
     pub instructions_per_tick: (u64, u64),
     #[serde(default)]
@@ -179,6 +296,112 @@ pub struct Definition {
     /// Declared (port base, send word, receive word) replies.
     #[serde(default)]
     pub xpp_serial_replies: Vec<(u64, u32, u32)>,
+}
+
+/// A command dial whose quadrature phases drive a countdown timer channel's
+/// count inputs, the host's name for it, and the time between its edges.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CountdownDial {
+    pub name: String,
+    pub channel: usize,
+    pub phase_ticks: u64,
+    pub rest_phase: u8,
+}
+
+/// One Arm PL011 UART: register page base and, when routed, its interrupt
+/// line (see `fujimod_emulator_ip_arm::pl011`).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pl011Uart {
+    pub base: u64,
+    #[serde(default)]
+    pub irq: Option<u32>,
+    /// Optional virtual programming peer, with a declared code-flash geometry.
+    #[serde(default)]
+    pub rl78: Option<fujimod_emulator_ip_arm::pl011::Rl78Config>,
+}
+
+/// The XP4 JPEG encoder: register page base, completion interrupt line,
+/// run time in ticks and the address of its memory type word.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JpegEncoder {
+    pub base: u64,
+    pub irq: u32,
+    pub run_ticks: u64,
+    pub memory_type: u64,
+}
+
+/// The XP4 JPEG decoder: register page base, completion interrupt line and
+/// the ticks a run takes. Its registers follow the X-Processor Pro decoder
+/// contract of `fujimod_emulator_ip::jpeg::Decoder`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JpegDecoder {
+    pub base: u64,
+    pub irq: u32,
+    pub run_ticks: u64,
+}
+
+/// One declared XP4 still-processing engine: which contract, its register
+/// page base, completion interrupt line and the ticks a job takes.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StillEngine {
+    pub engine: crate::still::Kind,
+    pub base: u64,
+    pub irq: u32,
+    pub run_ticks: u64,
+    /// A finished job also computes the engine's declared output (opt-in;
+    /// RESZ only, see `crate::still`). Absent, a job writes nothing.
+    #[serde(default)]
+    pub compute: bool,
+    /// RECC only: the sensor RAW its passes develop from (opt-in, see
+    /// `crate::still`). Absent, a pass writes nothing.
+    #[serde(default)]
+    pub raw: Option<crate::still::Raw>,
+    /// RECC with `raw` only: its still bands develop with the color the
+    /// firmware programs into its two color pages (opt-in, see
+    /// `crate::still`). Absent, they develop with the declared sRGB law.
+    #[serde(default)]
+    pub firmware_color: bool,
+    /// RECC with `firmware_color` only: its still bands also apply the white
+    /// balance of the tone page's channel gains, relative to these declared
+    /// reference (R, G, B) gains at which the declared scene renders neutral
+    /// (opt-in, see `crate::still`). Absent, no white balance.
+    #[serde(default)]
+    pub firmware_white_balance: Option<[u32; 3]>,
+}
+
+/// The XP4 still DSP host interface: completion interrupt line and the
+/// ticks a command takes.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Dsp {
+    pub irq: u32,
+    pub run_ticks: u64,
+}
+
+/// The XP4 face detection engine: register page base, finished-run
+/// interrupt line and run time in ticks.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FaceDetector {
+    pub base: u64,
+    pub irq: u32,
+    pub run_ticks: u64,
+}
+
+/// The XP4 filter engine: register page base, address of its two memory
+/// type words, finished-run interrupt line and run time in ticks.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilterEngine {
+    pub base: u64,
+    pub memory_types: u64,
+    pub irq: u32,
+    pub run_ticks: u64,
 }
 
 /// Register layout of the interval timer at `timer_base`.
@@ -294,6 +517,16 @@ pub struct XppSd {
     pub reset_channel: Option<usize>,
 }
 
+/// An XP4 SD host with a freshly formatted card in its slot.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SdHost {
+    pub options: fujimod_emulator_xp4_io::sd::Options,
+    pub card: fujimod_emulator_storage::fat::Options,
+    #[serde(default)]
+    pub irq: Option<u32>,
+}
+
 /// X-Processor Pro imaging frame sync: register base, the address of the
 /// frame interrupt words, the (source, line) pairs frames latch and the frame
 /// period in ticks.
@@ -324,6 +557,12 @@ pub struct XppRegisterBlock {
     /// Commands that set a field of a status word.
     #[serde(default)]
     pub commands: Vec<XppBlockCommand>,
+    /// The block's job converts audio samples, as the X-T3 5.11 audio format
+    /// converter 0xfffa8000 does (opt-in, needs the job; see
+    /// [`fujimod_emulator_xpp::blocks::AUDIO_CONTROL`]). Off, the job only
+    /// raises its interrupt.
+    #[serde(default)]
+    pub audio_converter: bool,
 }
 
 /// Command law of a register block: writing exactly `value` to `word` sets
@@ -419,4 +658,52 @@ pub struct XppBoot {
     /// Memory window shown at physical 0 until the guest selects the remap.
     #[serde(default)]
     pub low_alias: Option<u64>,
+}
+
+/// Explicit immutable NOR aperture policy.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NorImmutablePrefix { pub bytes: usize }
+
+/// Initial values supported by the modeled GIC register interface.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GicInitial {
+    pub distributor_control: u32,
+    pub cpu_interfaces: Vec<GicCpuInitial>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GicCpuInitial {
+    pub control: u32,
+    pub priority_mask: u32,
+    pub binary_point: u32,
+}
+
+impl GicInitial {
+    pub(super) fn apply(self, gic: &mut Gic, cores: usize) -> Result<(), String> {
+        if self.distributor_control > 1 || self.cpu_interfaces.len() != cores
+            || self.cpu_interfaces.iter().any(|cpu| cpu.control > 1
+                || cpu.priority_mask > 255 || cpu.binary_point > 7) {
+            return Err("Invalid initial GIC registers or CPU interface count".into());
+        }
+        gic.access(0, true, 0, 4, true, self.distributor_control)?;
+        for (core, cpu) in self.cpu_interfaces.into_iter().enumerate() {
+            for (offset, value) in [(0, cpu.control), (4, cpu.priority_mask), (8, cpu.binary_point)] {
+                gic.access(core, false, offset, 4, true, value)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One byte I2C controller with an explicit reset/timing fixture and peer.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ByteI2c {
+    pub base: u64,
+    pub irq: u32,
+    pub profile: fujimod_emulator_xp4_io::i2c::Profile,
+    pub peer: fujimod_emulator_xp4_io::i2c::Peer,
 }

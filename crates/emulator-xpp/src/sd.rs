@@ -64,6 +64,9 @@ impl Controller {
             initialization_fault: host::InitializationFault::None,
             high_speed: options.high_speed,
             ram_banks: options.ram_banks.clone(),
+            dram_alias: true,
+            address_high: None,
+            speed_dividers: None,
             capabilities_1: None,
             initialized_by_boot_rom: false,
             supply: None,
@@ -292,7 +295,7 @@ impl Device for Controller {
                 self.reset.as_ref().map(|r| r.1),
             ),
         )?;
-        Ok(json!({"wrapper":wrapper.fingerprint(),"host":self.host.fingerprint()?}))
+        Ok(json!({"wrapper":wrapper.state(),"host":self.host.fingerprint()?}))
     }
 }
 

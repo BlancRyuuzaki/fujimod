@@ -20,7 +20,9 @@ fn has_zero_chroma(source: &[u8], raster: &Raster) -> bool {
         .take(raster.height)
         .any(|row| {
             row[..raster.width * 2]
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|pair| pair[2] == 0 || pair[3] == 0)
         })
 }
@@ -35,6 +37,7 @@ fn centered_packed422(
     input_center: u32,
     output_center: u32,
     origin: [u32; 2],
+    reject_tags: bool,
     out: &mut [u8],
 ) -> Result<(), String> {
     // The vertical affine pass feeds the horizontal shear. Both retain Q16
@@ -100,6 +103,22 @@ fn centered_packed422(
                 let (x0, y0) = ((fx >> 16) as usize, (fy >> 16) as usize);
                 let (x1, y1) = ((x0 + 1).min(width - 1), (y0 + 1).min(src.height - 1));
                 let (dx, dy) = (fx & 65535, fy & 65535);
+                if reject_tags {
+                    // Unused source pixels do not require a transformed-tag
+                    // law. Refuse if a sampling tap or its following row has
+                    // a tag; that support includes the identity validity law.
+                    for row in [y0, y1, (y1 + 1).min(src.height - 1)] {
+                        for column in [x0, x1] {
+                            let pair = if channel == 0 { column / 2 } else { column };
+                            let at = row * src.pitch + pair * 4;
+                            if source[at + 2] == 0 || source[at + 3] == 0 {
+                                return Err(
+                                    "scaler zero-chroma validity tags are unsupported".into()
+                                );
+                            }
+                        }
+                    }
+                }
                 let sample = |x: usize, y: usize| {
                     let pixel = if channel == 0 { x } else { x * 2 };
                     let i = y * src.pitch
@@ -151,6 +170,16 @@ impl Scaler {
         let centered = [0x44, 0x4c, 0x50, 0x5c, 0x60, 0x64]
             .iter()
             .any(|&o| r[o / 4] != 0);
+        // The driver programs +0x40..+0x64 only when a request carries a
+        // transform; otherwise the block keeps its prior contents. A block
+        // never written (zero) with equal source and destination geometry is
+        // a 1:1 copy. Zero steps with any other geometry stay refused below.
+        let steps = match [r[0x40 / 4], r[0x54 / 4]] {
+            [0, 0] if !centered && src.width == dst.width && src.height == dst.height => {
+                [0x10000; 2]
+            }
+            steps => steps,
+        };
         if centered
             && [0x2c, 0x60, 0x64]
                 .iter()
@@ -170,17 +199,30 @@ impl Scaler {
                 .any(|v| v % 8 != 0)
             || src.pitch > 16384
             || dst.pitch > 16384
-            || ![r[0x40 / 4], r[0x54 / 4]]
-                .iter()
-                .all(|&v| v > 0 && v <= 0x1ffff)
+            || !steps.iter().all(|&v| v > 0 && v <= 0x1ffff)
         {
             return Err("scaler geometry/transform is unsupported".into());
         }
         self.source.resize(src.pitch * src.height, 0);
         cx.ram_read(src.address, &mut self.source)?;
-        // Retouch treats zero chroma as validity tags, including a neighboring
-        // row. The bilinear-only implementation cannot render those inputs.
-        if mode == 1 && has_zero_chroma(&self.source, &src) {
+        // Measured identity transfers invalidate a pair when its own or the
+        // following source row has zero Cb/Cr. Transformed samples touching
+        // tags and identity last-row tags still lack a measured contract.
+        let tagged = mode == 1 && has_zero_chroma(&self.source, &src);
+        let identity = src.width == dst.width
+            && src.height == dst.height
+            && steps == [65536; 2]
+            && [0x2c, 0x44, 0x4c, 0x50, 0x5c]
+                .iter()
+                .all(|&o| r[o / 4] == 0)
+            && r[0x60 / 4] == r[0x64 / 4];
+        let last_row_tagged = tagged
+            && self.source[(src.height - 1) * src.pitch..][..src.width * 2]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pair| pair[2] == 0 || pair[3] == 0);
+        if tagged && ((!identity && !centered) || (identity && last_row_tagged)) {
             return Err("scaler zero-chroma validity tags are unsupported".into());
         }
         if centered {
@@ -199,6 +241,7 @@ impl Scaler {
                 r[0x60 / 4],
                 r[0x64 / 4],
                 origin,
+                tagged && !identity,
                 &mut self.dma.pixels,
             ) {
                 self.dma.cancel();
@@ -213,11 +256,25 @@ impl Scaler {
                 src.pitch,
                 dst.width,
                 dst.height,
-                [r[0x40 / 4], r[0x54 / 4]],
+                steps,
                 &mut self.dma.pixels,
             ) {
                 self.dma.cancel();
                 return Err(e);
+            }
+        }
+        if tagged && identity {
+            for y in 0..src.height - 1 {
+                for x in (0..src.width * 2).step_by(4) {
+                    let current = y * src.pitch + x;
+                    let next = current + src.pitch;
+                    if [current + 2, current + 3, next + 2, next + 3]
+                        .iter()
+                        .any(|&at| self.source[at] == 0)
+                    {
+                        self.dma.pixels[y * dst.width * 2 + x..][..4].fill(0);
+                    }
+                }
             }
         }
         Ok(())
@@ -227,7 +284,7 @@ impl Device for Scaler {
     fujimod_emulator_devices::checkpoint_fields!(r: Vec<u32>, dma: Transfer, #[serde(with = "fujimod_emulator_devices::checkpoint::bytes")] source: Vec<u8>);
     fn fingerprint(&self) -> std::result::Result<serde_json::Value, String> {
         Ok(
-            serde_json::json!({"r":self.r,"dma":self.dma.fingerprint(),"source":fujimod_emulator_devices::fingerprint::bytes(&self.source)}),
+            serde_json::json!({"r":self.r,"dma":self.dma.fingerprint(),"source":fujimod_emulator_devices::state::bytes(&self.source)}),
         )
     }
 

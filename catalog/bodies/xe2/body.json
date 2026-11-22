@@ -39,6 +39,15 @@
               "refs": {}
             },
             {
+              "name": "windowanalysis",
+              "kind": "WindowAnalysisControl",
+              "boot_entries": [
+                "rom",
+                "loader"
+              ],
+              "refs": {}
+            },
+            {
               "name": "usbcontrol",
               "kind": "USBControl",
               "refs": {
@@ -201,6 +210,11 @@
               "name": "jpegdecoder",
               "kind": "JPEGDecodeControl",
               "refs": {}
+            },
+            {
+              "name": "imagecombination",
+              "kind": "ImageCombination",
+              "refs": {}
             }
           ],
           "construction_order": [
@@ -209,6 +223,7 @@
             "nandcontroller",
             "fujidecompressor",
             "loadermemorydma",
+            "windowanalysis",
             "powerdevices",
             "usbcontrol",
             "audio",
@@ -238,7 +253,8 @@
             "imagewarp",
             "jpegencoder",
             "rawreadback",
-            "jpegdecoder"
+            "jpegdecoder",
+            "imagecombination"
           ],
           "attachment_order": [
             "bootcontrols",
@@ -246,6 +262,7 @@
             "nandcontroller",
             "fujidecompressor",
             "loadermemorydma",
+            "windowanalysis",
             "usbcontrol",
             "powerdevices",
             "audio",
@@ -275,7 +292,8 @@
             "imagewarp",
             "jpegencoder",
             "rawreadback",
-            "jpegdecoder"
+            "jpegdecoder",
+            "imagecombination"
           ]
         },
         "controllers": {
@@ -330,6 +348,11 @@
             "frame_period_ticks": 400000,
             "stop_delay_ticks": 2,
             "basis": "Declared catalog input."
+          },
+          "window_analysis": {
+            "profile": "declared-y16-window-gradients-and-local-tracking-unmeasured",
+            "ticks_per_window": 1000,
+            "basis": "Existing EXR II window-analysis numerical law and clock; silicon behavior and latency remain unmeasured."
           }
         },
         "pin_interrupts": [
@@ -673,6 +696,11 @@
               "name": "displayformatter",
               "kind": "DisplayFormatter",
               "refs": {}
+            },
+            {
+              "name": "imagecombination",
+              "kind": "ImageCombination",
+              "refs": {}
             }
           ],
           "construction_order": [
@@ -702,7 +730,8 @@
             "graphicsaccelerator",
             "displayscanout",
             "displaytiming",
-            "displayformatter"
+            "displayformatter",
+            "imagecombination"
           ],
           "attachment_order": [
             "bootcontrols",
@@ -731,7 +760,8 @@
             "graphicsaccelerator",
             "displayscanout",
             "displaytiming",
-            "displayformatter"
+            "displayformatter",
+            "imagecombination"
           ]
         },
         "controllers": {

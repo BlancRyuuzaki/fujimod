@@ -16,6 +16,7 @@ pub fn register(constructors: &mut Constructors) {
     constructors.add("encoder", encoder);
     constructors.add("gpio-contact-response", gpio_contact_response);
     constructors.add("contact-actuator", contact_actuator);
+    constructors.add("contact-cam", contact_cam);
 }
 
 fn usb(builder: Builder<'_>, model: Model) -> Result<Built, String> {
@@ -61,13 +62,16 @@ fn usb(builder: Builder<'_>, model: Model) -> Result<Built, String> {
     }))
 }
 
-fn adc(_builder: Builder<'_>, model: Model) -> Result<Built, String> {
+fn adc(builder: Builder<'_>, model: Model) -> Result<Built, String> {
+    let Builder { name, resources, .. } = builder;
     let Model::Adc { options } = model else {
         return Err("constructor called for another model kind".into());
     };
     Ok(Built::Device({
         let options: crate::adc::controller::Options = decode(options)?;
-        Box::new(adc::controller::Converter::new(options)?)
+        let adc = adc::controller::Converter::new(options)?;
+        resources.analog.insert(name.to_owned(), adc.external_inputs());
+        Box::new(adc)
     }))
 }
 
@@ -123,6 +127,7 @@ fn encoder(builder: Builder<'_>, model: Model) -> Result<Built, String> {
     let Model::Encoder {
         options,
         gpio,
+        adc,
         counter,
     } = model
     else {
@@ -130,10 +135,32 @@ fn encoder(builder: Builder<'_>, model: Model) -> Result<Built, String> {
     };
     Ok(Built::Device({
         let options: fujimod_emulator_parts_controls::encoder::Options = decode(options)?;
+        use fujimod_emulator_parts_controls::encoder::{OutputWiring, Outputs};
+        let outputs = match &options.outputs {
+            Outputs::Gpio => {
+                if adc.is_some() {
+                    return Err("GPIO encoder must not declare an ADC connection".into());
+                }
+                OutputWiring::Gpio(Box::new(resources.pads(
+                    gpio.as_deref().ok_or("GPIO encoder requires a GPIO connection")?,
+                )?))
+            }
+            Outputs::Adc { .. } => {
+                if gpio.is_some() {
+                    return Err("ADC encoder must not declare a GPIO connection".into());
+                }
+                let node = adc.as_deref().ok_or("ADC encoder requires an ADC connection")?;
+                OutputWiring::Adc(
+                    resources.analog.get(node)
+                        .ok_or_else(|| format!("ADC input {node} is not connected"))?
+                        .clone(),
+                )
+            }
+        };
         let encoder = Encoder::new(
             options,
             fujimod_emulator_parts_controls::encoder::Wiring {
-                gpio: Box::new(resources.pads(&gpio)?),
+                outputs,
                 counter: counter.map(|n| resources.pulses(&n)).transpose()?,
             },
         )?;
@@ -154,6 +181,38 @@ fn gpio_contact_response(builder: Builder<'_>, model: Model) -> Result<Built, St
             options,
             fujimod_emulator_parts_controls::gpio_contact_response::Wiring {
                 pins: Box::new(resources.pads(&gpio)?),
+            },
+        )?)
+    }))
+}
+
+fn contact_cam(builder: Builder<'_>, model: Model) -> Result<Built, String> {
+    let Builder {
+        id,
+        windows,
+        resources,
+        ..
+    } = builder;
+    let Model::ContactCam {
+        options,
+        gpio,
+        release,
+    } = model
+    else {
+        return Err("constructor called for another model kind".into());
+    };
+    Ok(Built::Device({
+        let options: fujimod_emulator_parts_controls::contact_cam::Options = decode(options)?;
+        if !windows.is_empty() || options.contacts.iter().any(|pin| pin.port >= 16) {
+            return Err("contact cam requires GPIO input pads and no register aperture".into());
+        }
+        Box::new(fujimod_emulator_parts_controls::contact_cam::ContactCam::new(
+            options,
+            fujimod_emulator_parts_controls::contact_cam::Wiring {
+                pins: Box::new(resources.pads(&gpio)?),
+                release: release
+                    .map(|name| Ok::<_, String>(wire!(resources, id, name, LogicLevel)))
+                    .transpose()?,
             },
         )?)
     }))

@@ -18,6 +18,11 @@ pub trait KeyInput: Controls {
     /// Queue one physical edge. Edges the model has no declared wiring or
     /// band for are refused, never approximated.
     fn enqueue(&self, at: Duration, key: Key, pressed: bool) -> Result<(), String>;
+    /// Queue a latched dial or switch position change. Models without
+    /// declared positions refuse it.
+    fn set_position(&self, _at: Duration, dial: &str, _position: &str) -> Result<(), String> {
+        Err(format!("this body's key model declares no dial {dial:?}"))
+    }
 }
 
 impl KeyInput for resistor_keys::ResistorKeys {
@@ -35,6 +40,9 @@ impl KeyInput for ladder_keys::LadderKeys {
     }
     fn enqueue(&self, at: Duration, key: Key, pressed: bool) -> Result<(), String> {
         ladder_keys::LadderKeys::enqueue(self, at, key, pressed)
+    }
+    fn set_position(&self, at: Duration, dial: &str, position: &str) -> Result<(), String> {
+        ladder_keys::LadderKeys::set_position(self, at, dial, position)
     }
 }
 
@@ -66,7 +74,7 @@ impl ControlsOptions {
         Ok(match self {
             Self::Absent => Arc::new(AbsentControls),
             Self::ResistorKeys(options) => Arc::new(resistor_keys::ResistorKeys::new(pins, options)?),
-            Self::LadderKeys(options) => Arc::new(ladder_keys::LadderKeys::new(options)?),
+            Self::LadderKeys(options) => Arc::new(ladder_keys::LadderKeys::with_pins(options, pins)?),
         })
     }
 }

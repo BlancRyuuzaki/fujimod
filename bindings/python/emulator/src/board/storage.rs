@@ -45,7 +45,7 @@ impl CardMedium {
         Ok(PyBytes::new(py, self.0.sector(lba).map_err(error)?))
     }
     fn write_sectors(&mut self, first: u32, bytes: &[u8]) -> PyResult<()> {
-        if bytes.len() % 512 != 0 {
+        if !bytes.len().is_multiple_of(512) {
             return Err(error("Whole sectors are required".into()));
         }
         self.0.write_bytes(first as u64 * 512, bytes).map_err(error)
@@ -78,7 +78,7 @@ impl CardMedium {
         max_bytes: usize,
     ) -> PyResult<Bound<'py, PyBytes>> {
         if !(1..=fat::MAX_BYTES).contains(&max_bytes) {
-            return Err(error("Card read bound must be 1..64 MiB".into()));
+            return Err(error("Card read bound must be 1..96 MiB".into()));
         }
         let bytes = fat::Reader::new(&self.0)
             .map_err(error)?

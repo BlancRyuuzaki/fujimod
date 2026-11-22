@@ -2,6 +2,7 @@
 use super::{Board, State};
 use fujimod_emulator_cpu::{Architecture, Cpu, Hook, HookRange, Register, arm};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
@@ -11,6 +12,60 @@ use std::{
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct Entries(BTreeMap<(usize, u64), Value>);
+
+const PAGE: u64 = 0x1000;
+/// Bus-backed memory `[address, address + length)` summarized without side effects: the SHA-256 of
+/// the bytes, how many 4 KiB pages hold a nonzero byte and the runs of such pages (at most 64
+/// are listed). A range with no complete backing reports the error instead.
+pub(super) fn range_digest(memory: &super::memory::Memory, address: u64, length: u64) -> Value {
+    const LISTED: usize = 64;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    let (mut pages, mut runs, mut open): (u64, Vec<(u64, u64)>, Option<u64>) = (0, vec![], None);
+    let mut runs_dropped = 0u64;
+    let mut at = address;
+    let end = address.saturating_add(length);
+    while at < end {
+        let n = ((end - at) as usize).min(buffer.len());
+        if let Err(error) = memory.read_host(at, &mut buffer[..n]) {
+            return json!({"address":address,"length":length,"error":error,"failed_at":at});
+        }
+        hasher.update(&buffer[..n]);
+        for (index, page) in buffer[..n].chunks(PAGE as usize).enumerate() {
+            let start = at + index as u64 * PAGE;
+            if page.iter().any(|&byte| byte != 0) {
+                pages += 1;
+                open.get_or_insert(start);
+            } else if let Some(first) = open.take() {
+                if runs.len() < LISTED { runs.push((first, start)); } else { runs_dropped += 1; }
+            }
+        }
+        at += n as u64;
+    }
+    if let Some(first) = open {
+        if runs.len() < LISTED { runs.push((first, end)); } else { runs_dropped += 1; }
+    }
+    let digest: String = hasher.finalize().iter().map(|byte| format!("{byte:02x}")).collect();
+    json!({"address":address,"length":length,"sha256":digest,"nonzero_pages_4k":pages,
+        "nonzero_runs":runs,"nonzero_runs_not_listed":runs_dropped})
+}
+
+/// `FUJIMOD_WATCH_HASH=ADDR:LEN[;ADDR:LEN...]` (decimal or `0x`): the digests of these ranges are
+/// added to a watched PC's first-entry record on core 0, taken at the moment it first reaches it.
+fn watch_hash_ranges() -> Vec<(u64, u64)> {
+    let Ok(spec) = std::env::var("FUJIMOD_WATCH_HASH") else { return vec![] };
+    let number = |text: &str| match text.trim().strip_prefix("0x") {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => text.trim().parse().ok(),
+    };
+    spec.split(';')
+        .filter(|item| !item.trim().is_empty())
+        .filter_map(|item| {
+            let (address, length) = item.split_once(':')?;
+            Some((number(address)?, number(length)?))
+        })
+        .collect()
+}
 pub(super) struct Watch {
     state: Weak<RefCell<State>>,
     cpus: Weak<Vec<Rc<dyn Cpu>>>,
@@ -18,10 +73,29 @@ pub(super) struct Watch {
     core: usize,
     addresses: Vec<u64>,
 }
+/// `entered` for a hook that spans every watched address of its processor.
+unsafe fn entered_among(pc: u64, size: u32, data: *mut c_void) {
+    let watch = unsafe { &*data.cast::<Watch>() };
+    // Watched addresses are sorted and unique (`watch_pcs`).
+    if watch.addresses.binary_search(&pc).is_ok() {
+        unsafe { entered(pc, size, data) }
+    }
+}
 unsafe fn entered(pc: u64, _: u32, data: *mut c_void) {
     let watch = unsafe { &*data.cast::<Watch>() };
     let mut entries = watch.entries.borrow_mut();
-    if entries.0.contains_key(&(watch.core, pc)) {
+    // XT5_WATCH_ALL: record every entry (bounded), keyed by a sequence number.
+    let all = std::env::var_os("XT5_WATCH_ALL").is_some();
+    let key = if all {
+        let n = entries.0.len();
+        if n >= 200_000 {
+            return;
+        }
+        (watch.core + 16 * (n + 1), pc)
+    } else {
+        (watch.core, pc)
+    };
+    if entries.0.contains_key(&key) {
         return;
     }
     let (Some(state), Some(cpus)) = (watch.state.upgrade(), watch.cpus.upgrade()) else {
@@ -71,14 +145,49 @@ unsafe fn entered(pc: u64, _: u32, data: *mut c_void) {
             })
         })
         .collect();
-    entries.0.insert(
-        (watch.core, pc),
-        json!({"core":watch.core,"pc":pc,
+    // AArch64 frame-pointer backtrace (x30, then saved {fp, lr} pairs).
+    let mut backtrace = vec![];
+    if cpu.model().architecture() == Architecture::Arm64 {
+        if let Ok(lr) = super::scalar(cpu, Register::X(30)) {
+            backtrace.push(lr);
+        }
+        let mut fp = super::scalar(cpu, Register::X(29)).unwrap_or(0);
+        for _ in 0..16 {
+            let mut frame = [0u8; 16];
+            if fp == 0 || fp & 7 != 0 || state.memory.read_host(fp, &mut frame).is_err() {
+                break;
+            }
+            let next = u64::from_le_bytes(frame[..8].try_into().unwrap());
+            backtrace.push(u64::from_le_bytes(frame[8..].try_into().unwrap()));
+            if next <= fp {
+                break;
+            }
+            fp = next;
+        }
+    }
+    let sp = super::scalar(cpu, Register::Sp).unwrap_or(0);
+    // Digests are taken on core 0's first entry only: they read all of the requested ranges.
+    let ranges = if watch.core == 0 { watch_hash_ranges() } else { vec![] };
+    let mut record = json!({"core":watch.core,"pc":pc,
         "instructions":counts,"tick":state.timeline.now().saturating_add(elapsed),
-        "arguments":arguments,"argument_bus_memory":argument_memory}),
-    );
+        "arguments":arguments,"argument_bus_memory":argument_memory,"backtrace":backtrace,"sp":sp});
+    // The `digests` key exists only when FUJIMOD_WATCH_HASH names ranges, so records of runs that
+    // do not ask for it are unchanged.
+    if !ranges.is_empty() {
+        let digests: Vec<Value> = ranges
+            .into_iter()
+            .map(|(address, length)| range_digest(&state.memory, address, length))
+            .collect();
+        record["digests"] = Value::from(digests);
+    }
+    entries.0.insert(key, record);
 }
 impl Board {
+    /// Digest of bus-backed physical memory, as in a watched PC's `digests` (host-side, no guest
+    /// access or device effect).
+    pub fn range_digest(&self, address: u64, length: u64) -> Value {
+        range_digest(&self.physical_memory, address, length)
+    }
     pub fn observation_topology(&self) -> Vec<(usize, Vec<u64>)> {
         self.watches
             .iter()
@@ -117,6 +226,25 @@ impl Board {
             let data = (&**self.watches.last().unwrap() as *const Watch)
                 .cast_mut()
                 .cast();
+            if super::observes_every_instruction(&*self.cpus[core]) {
+                // Every entry of this processor already reaches an observer,
+                // and each further hook is one more list entry to pass on
+                // every instruction. One hook over the watched span, which
+                // looks the entry up, observes the same entries as one hook
+                // per address.
+                let hook = unsafe {
+                    self.cpus[core].install_hook(Hook::Instruction {
+                        callback: entered_among,
+                        data,
+                        range: HookRange::Inclusive {
+                            begin: addresses[0],
+                            end: addresses[addresses.len() - 1],
+                        },
+                    })?
+                };
+                self.hooks.push((core, hook));
+                continue;
+            }
             for &pc in addresses {
                 // The boxed context stays at this address until Board drops
                 // its CPU hooks; its CPU/state links are weak and serialized.

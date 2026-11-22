@@ -1,6 +1,5 @@
 """Create external card inputs through the Rust storage library."""
 
-import hashlib
 import json
 from collections.abc import Iterable
 from pathlib import Path
@@ -45,12 +44,10 @@ def load_card_image(
     card = _native.CardMedium.blank(
         json.dumps(dict(sectors=sectors, max_dirty_sectors=max_dirty_sectors))
     )
-    digest = hashlib.sha256()
     count = 0
     offset = 0
     with path.open("rb") as source:
         while block := source.read(1 << 20):
-            digest.update(block)
             if any(block):
                 card.write_sectors(offset // 512, block)
                 count += sum(any(block[i : i + 512]) for i in range(0, len(block), 512))
@@ -62,5 +59,25 @@ def load_card_image(
         bytes=size,
         sectors=size // 512,
         nonzero_sectors=count,
-        sha256=digest.hexdigest(),
+    )
+
+
+def write_card_image(medium: _native.CardMedium, path: str | Path) -> dict[str, int | str]:
+    """Write a medium as a raw image of its full capacity, leaving unwritten sectors as holes.
+
+    The file is created exclusively, so an existing image is never replaced.
+    """
+    path = Path(path)
+    sectors = medium.sectors
+    written = medium.sparse_sectors()
+    with path.open("xb") as target:
+        target.truncate(sectors * 512)
+        for lba in sorted(written):
+            target.seek(lba * 512)
+            target.write(written[lba])
+    return dict(
+        path=str(path),
+        bytes=sectors * 512,
+        sectors=sectors,
+        nonzero_sectors=sum(any(sector) for sector in written.values()),
     )

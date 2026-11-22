@@ -44,6 +44,11 @@ pub struct CardTree {
     pub entries: Vec<fat::CardEntry>,
 }
 
+/// Prepare a replacement medium before changing the host controller.
+pub fn merge_files(medium: Card, files: &[(String, Vec<u8>)]) -> Result<Card, String> {
+    if files.is_empty() { Ok(medium) } else { fat::merge(&medium, files) }
+}
+
 impl Session {
     pub fn card_state(&self, name: &str) -> Result<CardState, String> {
         let contacts = self.contacts.get(name).ok_or("no SD host with that name")?;
@@ -87,12 +92,15 @@ impl Session {
         max_bytes: usize,
     ) -> Result<Vec<u8>, String> {
         if !(1..=fat::MAX_BYTES).contains(&max_bytes) {
-            return Err("card reads require a bound of 1..64 MiB".into());
+            return Err("card reads require a bound of 1..96 MiB".into());
         }
-        self.board
+        let bytes = self
+            .board
             .inspect_capability::<dyn CardSlot, _>(self.node(name)?, |host| {
                 fat::Reader::new(host.readable_card(revision)?)?.read(path, max_bytes)
-            })
+            })?;
+        fujimod_perf::add_bytes(fujimod_perf::ByteCounter::CardFileRead, bytes.len() as u64);
+        Ok(bytes)
     }
     fn admit_card_contacts(
         &self,
@@ -149,12 +157,27 @@ impl Session {
         self.board
             .edit_capability::<dyn CardSlot, _>(id, |host| host.replace_card(card).map(|_| ()))
     }
+    /// Replace the medium with an explicit image, optionally adding files in one revision.
+    pub fn install_card_files(
+        &mut self,
+        name: &str,
+        medium: Option<Card>,
+        files: &[(String, Vec<u8>)],
+    ) -> Result<(), String> {
+        let medium = match medium {
+            Some(medium) => medium,
+            None => self.card_medium(name)?,
+        };
+        let medium = merge_files(medium, files)?;
+        self.insert_card(name, medium, true, false)?;
+        Ok(())
+    }
     pub fn card_medium(&self, name: &str) -> Result<Card, String> {
         self.board
             .inspect_capability::<dyn CardSlot, _>(self.node(name)?, |host| Ok(host.card().clone()))
     }
     pub fn initialize_card_revision(&mut self, name: &str, revision: u64) -> Result<(), String> {
-        if self.board.instruction_counts().iter().any(|n| *n != 0) {
+        if !self.board.epoch_is_unexecuted() {
             return Err("initial card revision requires an unexecuted board".into());
         }
         self.board
@@ -167,7 +190,7 @@ impl Session {
         present: bool,
         protected: bool,
     ) -> Result<(), String> {
-        if self.board.instruction_counts().iter().any(|n| *n != 0) {
+        if !self.board.epoch_is_unexecuted() {
             return Err("retaining external media requires an unexecuted board".into());
         }
         self.admit_card_contacts(name, present, protected)?;

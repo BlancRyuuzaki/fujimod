@@ -9,6 +9,7 @@ import type {
   WasmWorkerEvent,
 } from '@fujimod/emulator-ui/engine/wasm-worker-protocol';
 import { testConfig } from './test-fixtures';
+import { scenarioFromUrl } from '../scenarios';
 import type { CameraRecord, CameraSave } from '../cameras/store';
 
 function setup(
@@ -287,6 +288,34 @@ test('a portable camera save restores media before boot', async () => {
   assert.equal(boot.type, 'reply');
   assert.deepEqual(f.calls.find((c) => c.action === 'restore_durable')!.bytes, [7, 8, 9]);
   assert.equal(f.saves.length, 0);
+});
+
+test('a camera save the emulator cannot read boots a fresh camera instead of stopping', async () => {
+  const f = setup({
+    saved: {
+      durable: new Uint8Array([7, 8, 9]).buffer,
+      runtimeKey: 'prior-runtime',
+      positions: {},
+      poweredOn: true,
+      modEnabled: false,
+    },
+  });
+  f.restoreError('durable storage decode: missing field `overlays`');
+  const boot = await f.send({
+    action: 'boot',
+    config: f.config,
+    dat: new ArrayBuffer(1),
+    files: [],
+    seedIdentity: [],
+  });
+  assert.equal(boot.type, 'reply');
+  const actions = f.calls.map((c) => c.action);
+  assert.deepEqual(actions.slice(0, actions.indexOf('restore_durable') + 2), [
+    'create',
+    'restore_durable',
+    'create',
+  ]);
+  assert.equal(actions.filter((a) => a === 'restore_durable').length, 1);
 });
 
 test('replay advance returns while power is OFF and does not run or spin', async () => {
@@ -619,4 +648,61 @@ test('boot holds release through native contacts when the ordinary scanner is un
   } finally {
     release.mockRestore();
   }
+});
+
+test('idle supply-off advances time without checkpoints and resumes capture after wake', async () => {
+  const f = setup();
+  await f.send({
+    action: 'boot',
+    config: f.config,
+    dat: new ArrayBuffer(1),
+    files: [],
+    seedIdentity: [],
+  });
+  const before = f.calls.filter((c) => c.action === 'checkpoint').length;
+  f.supply(false);
+  const advance = () =>
+    f.send({ action: 'replay', steps: [{ action: 'advance', ticks: 36000000 }] });
+  assert.equal((await advance()).type, 'reply');
+  assert.equal((await advance()).type, 'reply');
+  assert.equal(f.calls.filter((c) => c.action === 'checkpoint').length, before);
+  assert.equal(
+    f.events.some((e) => e.type === 'error'),
+    false,
+  );
+  const checkpoint = await f.send({ action: 'checkpoint' });
+  assert.equal(checkpoint.type, 'error');
+  if (checkpoint.type === 'error') {
+    assert.equal(checkpoint.error, 'The camera power supply is off.');
+    assert.equal(checkpoint.fault, undefined);
+  }
+  f.supply(true);
+  assert.equal((await advance()).type, 'reply');
+  assert.ok(f.calls.filter((c) => c.action === 'checkpoint').length > before);
+});
+
+test('the idle review runs its native-time prelude once and power cycling restores supply', async () => {
+  const f = setup(),
+    scenario = scenarioFromUrl('?scenario=x70-idle');
+  f.supply(false);
+  const config = {
+    ...f.config,
+    execution: { ...f.config.execution, initialSteps: scenario.steps },
+  };
+  assert.equal(
+    (await f.send({ action: 'boot', config, dat: new ArrayBuffer(1), files: [], seedIdentity: [] }))
+      .type,
+    'reply',
+  );
+  assert.equal(f.ticks(), 1_800_000_000n);
+  const off = f.events.filter((e) => e.type === 'state').at(-1);
+  assert.ok(off?.type === 'state');
+  assert.equal(off.supplyOn, false);
+  assert.equal(off.state.poweredOn, true);
+  assert.equal((await f.send({ action: 'power_cycle', inputs: [] })).type, 'reply');
+  assert.equal(f.ticks(), 0n);
+  const on = f.events.filter((e) => e.type === 'state').at(-1);
+  assert.ok(on?.type === 'state');
+  assert.equal(on.supplyOn, true);
+  assert.equal(on.state.poweredOn, true);
 });

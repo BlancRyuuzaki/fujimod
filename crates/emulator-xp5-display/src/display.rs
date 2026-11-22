@@ -7,7 +7,6 @@ use fujimod_emulator_devices::{Cx, Device};
 use fujimod_framebuffer::raster::{self, PixelOrder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::Digest;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct State {
@@ -17,7 +16,7 @@ struct State {
     phase: usize,
     deadline: Option<u64>,
     frames: u64,
-    last_hash: String,
+    last_rgba: Vec<u8>,
 }
 #[derive(Debug)]
 struct Timing {
@@ -69,7 +68,7 @@ impl Display {
                 phase: 0,
                 deadline: None,
                 frames: 0,
-                last_hash: String::new(),
+                last_rgba: Vec::new(),
             },
             period_ns: config.period_ns,
             formats: config.raw_formats,
@@ -191,23 +190,21 @@ impl Display {
             return Ok(());
         }
         let mut rgba = vec![0; width as usize * height as usize * 4];
-        for p in rgba.chunks_exact_mut(4) {
+        for p in rgba.as_chunks_mut::<4>().0 {
             p[3] = 255;
         }
         for p in &captured {
             raster::composite_snapshot(p, width, height, &mut rgba)?;
         }
         self.input = Some((width, height, captured));
-        let hash = format!("{:x}", sha2::Sha256::digest(&rgba));
-        let hash = format!("{width}x{height}:{hash}");
-        let changed = hash != self.state.last_hash;
+        let changed = rgba != self.state.last_rgba;
         if changed {
             self.state.frames = self
                 .state
                 .frames
                 .checked_add(1)
                 .ok_or("scanout sequence overflow")?;
-            self.state.last_hash = hash;
+            self.state.last_rgba = rgba.clone();
         } else if !self.needs_publication {
             if blank {
                 self.blank = Some((width, height));
@@ -234,6 +231,18 @@ impl Display {
         Ok(())
     }
 }
+impl Display {
+    fn validate_state(&self, state: &State) -> Result<(), String> {
+        if state.regs.len() != 0x7d4 / 4
+            || state.phase >= 3
+            || state.enabled != state.deadline.is_some()
+        {
+            return Err("invalid display checkpoint register/phase state".into());
+        }
+        Ok(())
+    }
+}
+
 impl Device for Display {
     fn name(&self) -> &'static str {
         "lcdc"
@@ -349,18 +358,14 @@ impl Device for Display {
     fn next_deadline(&self, _: u64) -> Option<u64> {
         self.state.deadline
     }
+    fujimod_emulator_devices::checkpoint_state!(state: State, Self::validate_state);
     fn save(&self) -> Value {
         serde_json::to_value(&self.state).unwrap()
     }
     fn restore(&mut self, value: &Value) -> Result<(), String> {
         let state: State = serde_json::from_value(value.clone())
             .map_err(|e| format!("display checkpoint: {e}"))?;
-        if state.regs.len() != 0x7d4 / 4
-            || state.phase >= 3
-            || state.enabled != state.deadline.is_some()
-        {
-            return Err("invalid display checkpoint register/phase state".into());
-        }
+        self.validate_state(&state)?;
         self.state = state;
         // Republish the same deterministic sequence into a new host run;
         // publication is not a new modeled image change.
@@ -552,7 +557,7 @@ mod tests {
             ram: vec![0; 256],
             ..Default::default()
         };
-        for p in h.ram.chunks_exact_mut(4) {
+        for p in h.ram.as_chunks_mut::<4>().0 {
             p.copy_from_slice(&[255, 0, 255, 255]);
         }
         h.ram[36..44].copy_from_slice(&[0, 0, 255, 255, 0, 255, 0, 255]);
@@ -741,7 +746,51 @@ mod tests {
         }
     }
     #[test]
-    fn packed_picture_uses_dma_crop_and_rejects_unknown_phase() {
+    fn bank1_blank_then_enabled_plane_and_disabled_scanout() {
+        let (mut d, mut h) = setup(1);
+        let base = d.base();
+        // Give the empty bank a canvas and a programmed pixel clock.
+        let mut pll = crate::panel_clock::PanelPll::new(0xffa11000, d.clocks.clone(), Default::default()).unwrap();
+        write(&mut pll, &mut h, 0xffa11000, 1);
+        write(&mut d, &mut h, base + 0x14, 2);
+        write(&mut d, &mut h, base + 0x24, 2);
+        write(&mut d, &mut h, base + 8, 0);
+        due(&mut d, &mut h);
+        due(&mut d, &mut h);
+        assert_eq!(h.frames.len(), 1);
+        assert_eq!((h.frames[0].output, h.frames[0].width, h.frames[0].height), (1, 2, 2));
+        assert_eq!(h.frames[0].rgba, [0, 0, 0, 255].repeat(4));
+        let blank_sequence = h.frames[0].sequence;
+
+        // The preconfigured 2x2 OSD uses synthetic pixels from the host's RAM.
+        write(&mut d, &mut h, base + 0x5c, 0);
+        write(&mut d, &mut h, base + 8, 1 << 20);
+        for _ in 0..3 {
+            due(&mut d, &mut h);
+        }
+        assert_eq!(h.frames.len(), 2);
+        assert_eq!(h.frames[1].sequence, blank_sequence + 1);
+        assert_eq!(h.frames[1].output, 1);
+        assert_eq!(h.frames[1].rgba, [
+            255, 0, 0, 255, 0, 255, 0, 255,
+            0, 0, 255, 255, 255, 255, 255, 255,
+        ]);
+
+        let token = d.state.generation;
+        write(&mut d, &mut h, base + 4, 0);
+        let frame_count = h.frames.len();
+        let irq_count = h.irqs.len();
+        h.now += 1_000_000_000;
+        let mut cx = Cx::new(&mut h, 0, 0, 0);
+        d.event(&mut cx, token);
+        assert_eq!(cx.refusal(), None);
+        assert_eq!(d.next_deadline(h.now), None);
+        assert_eq!(h.frames.len(), frame_count);
+        assert_eq!(h.irqs.len(), irq_count);
+    }
+
+    #[test]
+    fn packed_picture_uses_dma_crop_and_rejects_split_packing() {
         let (mut d, mut h) = setup(1);
         let base = d.base();
         let a = 0x370;
@@ -767,14 +816,18 @@ mod tests {
                 255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255
             ]
         );
-        write(&mut d, &mut h, base + a + 0x2c, 1);
+        // 10-bit three-per-word packing (control bit 8) is not decoded.
+        write(&mut d, &mut h, base + a + 0x10, 0x100);
         due(&mut d, &mut h);
         due(&mut d, &mut h);
         h.now = d.next_deadline(h.now).unwrap();
         let irqs = h.irqs.len();
         let mut cx = Cx::new(&mut h, 0, 0, 0);
         d.advance(&mut cx);
-        assert!(cx.refusal().unwrap().contains("fractional phase"));
+        let refusal = cx.refusal().unwrap();
+        assert!(refusal.contains("fractional phase"), "{refusal}");
+        assert!(refusal.contains("group0"), "{refusal}");
+        assert!(refusal.contains("+10(control)=0x100"), "{refusal}");
         assert_eq!(h.irqs.len(), irqs);
         assert_eq!(h.frames.len(), 1);
     }

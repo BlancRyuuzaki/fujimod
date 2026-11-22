@@ -32,6 +32,10 @@ declare class Camera {
      */
     close(): void;
     completeHostRequest(device: number, id: bigint, result: Uint8Array): void;
+    /**
+     * Complete stopped-session state as a canonical typed archive.
+     */
+    completeState(): Uint8Array;
     deviceStates(kind: string): DeviceStates;
     /**
      * Set the stopped host worker preference (0 or 2) and report it.
@@ -39,7 +43,6 @@ declare class Camera {
     deviceWorkers(count?: number | null): DeviceWorkers;
     errorReport(): ErrorReport;
     exportSnapshot(): SessionSnapshot;
-    fingerprint(): Fingerprint;
     /**
      * The latest presented frame of `output`, or `undefined` before the first.
      */
@@ -158,6 +161,10 @@ declare class Status {
     [Symbol.dispose](): void;
     readonly failed: boolean;
     readonly instructions: bigint;
+    /**
+     * Whether the modeled power controller is supplying the board.
+     */
+    readonly supplyOn: boolean;
     readonly ticks: bigint;
 }
 
@@ -217,6 +224,7 @@ export interface RecReport {
      */
     scanout_instance: number | null;
     failure: string | null;
+    discovery_callee_stubs: unknown;
 }
 
 /**
@@ -466,10 +474,6 @@ export interface EndpointOptions {
     dma_limit: number;
     out_endpoints: [number, number][];
     in_endpoints: [number, number][];
-}
-
-export interface Fingerprint {
-    sha256: string;
 }
 
 export interface JitOptions {

@@ -53,7 +53,9 @@ fn scalar(p: &Projection, frame: &ExposedFrame, shift: f64) -> Arc<[u8]> {
         libm::rint(v * 65535.) as u16
     });
     let source: Vec<[u16; 3]> = rgb
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|v| std::array::from_fn(|c| lut[v[c] as usize]))
         .collect();
     let diameter = (shift - p.subject_shift).abs() * p.spec.focal_length_mm
@@ -151,10 +153,10 @@ fn sparse_readouts_and_unsampled_queries_match_scalar_psf() {
                     for y in 0..h {
                         for x in 0..w {
                             let v = f.sample_source(x, y);
-                            for c in 0..3 {
+                            for (c, value) in v.iter().enumerate().take(3) {
                                 let at = (y * w + x) * 6 + c * 2;
                                 assert_eq!(
-                                    v[c],
+                                    *value,
                                     u16::from_le_bytes([expected[at], expected[at + 1]])
                                 );
                             }
@@ -218,7 +220,7 @@ fn scene_prefix_and_readout_memos_use_complete_physical_keys() {
 }
 #[test]
 fn large_scene_sparse_cache_matches_fresh_projection_and_invalidates() {
-    let [width, height] = [2050, 2048];
+    let [width, height] = [4098, 4096];
     assert!(width * height > CACHE_PIXELS);
     let rgb: Arc<[u8]> = (0..width * height * 3)
         .map(|i| ((i * 37 + i / (width * 3) * 19) % 256) as u8)

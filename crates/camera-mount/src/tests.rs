@@ -1,4 +1,5 @@
 use super::*;
+use sha2::Digest;
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
@@ -387,5 +388,187 @@ fn display_files_are_read_only_and_chunk_reads_share_one_open_snapshot() {
             .calls
             .iter()
             .all(|(name, _, _)| !name.starts_with("write"))
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn adapter_splits_reads_larger_than_one_device_exchange() {
+    let length = (64 << 20) + 4096;
+    let fs = CameraFs::new(
+        TestDevice::default(),
+        vec![Region {
+            name: "ram".into(),
+            address: 0,
+            size: length as u64,
+        }],
+    )
+    .unwrap();
+    let mut adapter = crate::fskit::Adapter::new(fs, 0, 0);
+    let data = fskit_rs::Filesystem::read(&mut adapter, MEMORY, 0, length as i64)
+        .await
+        .unwrap();
+    assert_eq!(data.len(), length);
+}
+
+#[test]
+fn read_only_device_reads_the_card_and_refuses_every_change() {
+    let device = TestDevice::default();
+    device
+        .0
+        .lock()
+        .unwrap()
+        .files
+        .insert("A:\\DCIM\\IMAGE.JPG".into(), (0..128).collect());
+    let mut fs = CameraFs::new(read_only::ReadOnly(device.clone()), vec![]).unwrap();
+    let folder = fs.lookup(SD, "DCIM").unwrap();
+    let image = fs.lookup(folder.id, "IMAGE.JPG").unwrap();
+    assert_eq!(fs.read(image.id, 4, 4).unwrap(), vec![4, 5, 6, 7]);
+    assert_eq!(fs.write(image.id, 0, b"x").err(), Some(libc::EROFS));
+    assert_eq!(fs.create(SD, "new.bin", false).err(), Some(libc::EROFS));
+    assert_eq!(fs.truncate(image.id, 0).err(), Some(libc::EROFS));
+    assert_eq!(fs.remove(folder.id, "IMAGE.JPG").err(), Some(libc::EROFS));
+    let state = device.0.lock().unwrap();
+    assert_eq!(state.files.len(), 1);
+    assert_eq!(
+        state.files["A:\\DCIM\\IMAGE.JPG"],
+        (0..128).collect::<Vec<u8>>()
+    );
+}
+
+#[test]
+fn file_commands_list_patterns_read_prefixes_and_rewrite_any_size() {
+    let (mut fs, device) = filesystem();
+    {
+        let mut s = device.0.lock().unwrap();
+        s.files.insert("A:\\DCIM\\DSCF0001.JPG".into(), vec![1; 10]);
+        s.files.insert("A:\\DCIM\\DSCF0002.RAF".into(), vec![2; 10]);
+        s.files
+            .insert("A:\\FUJIMOD\\SETTINGS.JSN".into(), b"{\"a\":1}".to_vec());
+    }
+    let names = |nodes: Vec<Node>| nodes.into_iter().map(|n| n.name).collect::<Vec<_>>();
+    assert_eq!(
+        names(files::list(&mut fs, "DCIM/*.JPG").unwrap()),
+        ["DSCF0001.JPG", "IMAGE.JPG"]
+    );
+    assert_eq!(
+        names(files::list(&mut fs, "A:\\DCIM\\dscf000?.*").unwrap()),
+        ["DSCF0001.JPG", "DSCF0002.RAF"]
+    );
+    let image = files::list(&mut fs, "DCIM/IMAGE.JPG").unwrap().remove(0);
+    assert_eq!(
+        files::get(&mut fs, &image, Some(5)).unwrap(),
+        [0, 1, 2, 3, 4]
+    );
+    assert_eq!(files::get(&mut fs, &image, None).unwrap().len(), 128);
+    assert_eq!(
+        names(files::list(&mut fs, "*").unwrap()),
+        ["DCIM", "FUJIMOD"]
+    );
+    assert!(files::list(&mut fs, "*").unwrap()[0].directory);
+    assert_eq!(
+        files::list(&mut fs, "DCIM/NONE.JPG").err(),
+        Some(libc::ENOENT)
+    );
+
+    // Longer, shorter and new files all end at exactly the written bytes.
+    for data in [b"{\"a\":1,\"b\":22}".to_vec(), b"{}".to_vec()] {
+        let hash = files::put(&mut fs, "FUJIMOD/SETTINGS.JSN", &data).unwrap();
+        assert_eq!(hash, format!("{:x}", sha2::Sha256::digest(&data)));
+        assert_eq!(
+            device.0.lock().unwrap().files["A:\\FUJIMOD\\SETTINGS.JSN"],
+            data
+        );
+    }
+    files::put(&mut fs, "FUJIMOD/NEW.JSN", b"new").unwrap();
+    assert_eq!(
+        device.0.lock().unwrap().files["A:\\FUJIMOD\\NEW.JSN"],
+        b"new"
+    );
+    files::remove(&mut fs, "FUJIMOD/NEW.JSN").unwrap();
+    assert!(
+        !device
+            .0
+            .lock()
+            .unwrap()
+            .files
+            .contains_key("A:\\FUJIMOD\\NEW.JSN")
+    );
+    assert_eq!(
+        files::remove(&mut fs, "FUJIMOD/NEW.JSN").err(),
+        Some(libc::ENOENT)
+    );
+    files::put(&mut fs, "FUJIMOD/NEW.JSN", b"new").unwrap();
+    assert_eq!(
+        files::put(&mut fs, "FUJIMOD/*.JSN", b"x").err(),
+        Some(libc::EINVAL)
+    );
+
+    device.0.lock().unwrap().fail_write = true;
+    assert_eq!(
+        files::put(&mut fs, "FUJIMOD/NEW.JSN", b"other").err(),
+        Some(libc::EIO)
+    );
+}
+
+#[test]
+fn read_only_devices_refuse_file_puts() {
+    let device = TestDevice::default();
+    device
+        .0
+        .lock()
+        .unwrap()
+        .files
+        .insert("A:\\FUJIMOD\\SETTINGS.JSN".into(), b"{}".to_vec());
+    let mut fs = CameraFs::new(read_only::ReadOnly(device.clone()), vec![]).unwrap();
+    assert_eq!(
+        files::put(&mut fs, "FUJIMOD/SETTINGS.JSN", b"{\"a\":1}").err(),
+        Some(libc::EROFS)
+    );
+    assert_eq!(
+        device.0.lock().unwrap().files["A:\\FUJIMOD\\SETTINGS.JSN"],
+        b"{}"
+    );
+}
+
+#[test]
+fn kept_listings_list_each_folder_once_per_command() {
+    let (mut fs, device) = filesystem();
+    fs.keep_listings();
+    for n in 0..50 {
+        device
+            .0
+            .lock()
+            .unwrap()
+            .files
+            .insert(format!("A:\\DCIM\\DSCF{n:04}.JPG"), vec![n as u8; 10]);
+    }
+    for n in 0..50 {
+        if n == 1 {
+            // Outlives the mount's short listing lifetime.
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        let node = files::list(&mut fs, &format!("DCIM/DSCF{n:04}.JPG"))
+            .unwrap()
+            .remove(0);
+        assert_eq!(files::get(&mut fs, &node, Some(4)).unwrap(), [n as u8; 4]);
+    }
+    // The root and DCIM, once each.
+    assert_eq!(device.0.lock().unwrap().lists, 2);
+    files::put(&mut fs, "DCIM/NEW.JPG", b"new").unwrap();
+    assert_eq!(files::list(&mut fs, "DCIM/NEW.JPG").unwrap()[0].size, 3);
+}
+
+#[test]
+fn get_many_reads_each_prefix_in_one_device_call() {
+    let (mut fs, _device) = filesystem();
+    let image = files::list(&mut fs, "DCIM/IMAGE.JPG").unwrap().remove(0);
+    let data = files::get_many(&mut fs, &[image.clone(), image.clone()], Some(3)).unwrap();
+    assert_eq!(data, [vec![0, 1, 2], vec![0, 1, 2]]);
+    let mut big = image;
+    big.size = IO_BYTES as u64 + 1;
+    assert_eq!(
+        files::get_many(&mut fs, &[big], None).err(),
+        Some(libc::EINVAL)
     );
 }

@@ -62,19 +62,77 @@ impl Bits {
         }
         Ok(((1u32 << zeros) - 1) + self.bits(zeros)?)
     }
+    fn se(&mut self) -> Result<i32, String> {
+        let value = self.ue()?;
+        Ok(if value & 1 == 0 {
+            -((value / 2) as i32)
+        } else {
+            value.div_ceil(2) as i32
+        })
+    }
 }
 
 /// Bound dimensions before invoking the host codec, including cropped pictures.
 pub fn sequence(nal: &[u8]) -> Result<Sequence, String> {
+    sequence_profile(nal, false)
+}
+
+/// Accept the stock camera's High-profile SPS when it uses 4:2:0, 8-bit
+/// samples and no scaling matrices. The bounded picture and slice checks are
+/// shared with [`sequence`].
+pub fn sequence_high(nal: &[u8]) -> Result<Sequence, String> {
+    sequence_profile(nal, true)
+}
+
+/// The largest SPS level and coded picture a decoder accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Bounds {
+    pub level_idc: u32,
+    pub coded_width: usize,
+    pub coded_height: usize,
+}
+
+impl Bounds {
+    /// Level 4.2 and 1920x1088: the bound of [`sequence`] and [`sequence_high`].
+    pub const FULL_HD: Self = Self { level_idc: 42, coded_width: 1920, coded_height: 1088 };
+    /// Level 5.2 and 4096x2304: 4K movies.
+    pub const UHD: Self = Self { level_idc: 52, coded_width: 4096, coded_height: 2304 };
+}
+
+fn sequence_profile(nal: &[u8], allow_high: bool) -> Result<Sequence, String> {
+    sequence_bounded(nal, allow_high, Bounds::FULL_HD)
+}
+
+/// [`sequence`] or, with `allow_high`, [`sequence_high`], with the given bounds.
+pub fn sequence_bounded(nal: &[u8], allow_high: bool, bounds: Bounds) -> Result<Sequence, String> {
     if nal.first().map(|b| b & 31) != Some(7) || nal.len() > 256 {
         return Err("AVC requires a bounded SPS".into());
     }
     let mut bits = Bits::new(&nal[1..])?;
-    if bits.bits(8)? != 66 {
+    let profile = bits.bits(8)?;
+    if profile != 66 && !(allow_high && profile == 100) {
         return Err("AVC decoder supports Baseline profile".into());
     }
     bits.bits(8)?; // Constraint flags.
-    if bits.bits(8)? > 42 || bits.ue()? > 31 || bits.ue()? > 12 {
+    if bits.bits(8)? > bounds.level_idc || bits.ue()? > 31 {
+        return Err("AVC SPS level or identifiers exceed supported bounds".into());
+    }
+    if profile == 100 {
+        let chroma = bits.ue()?;
+        if chroma != 1 || bits.ue()? != 0 || bits.ue()? != 0 || bits.bit()? != 0 {
+            return Err("AVC High profile requires 4:2:0 eight-bit samples".into());
+        }
+        if bits.bit()? == 1 {
+            for index in 0..8 {
+                if bits.bit()? == 1 {
+                    for _ in 0..(if index < 6 { 16 } else { 64 }) {
+                        bits.se()?;
+                    }
+                }
+            }
+        }
+    }
+    if bits.ue()? > 12 {
         return Err("AVC SPS level or identifiers exceed supported bounds".into());
     }
     match bits.ue()? {
@@ -91,7 +149,7 @@ pub fn sequence(nal: &[u8]) -> Result<Sequence, String> {
     }
     let coded_width = (bits.ue()? as usize + 1) * 16;
     let coded_height = (bits.ue()? as usize + 1) * 16;
-    if coded_width > 1920 || coded_height > 1088 || bits.bit()? != 1 {
+    if coded_width > bounds.coded_width || coded_height > bounds.coded_height || bits.bit()? != 1 {
         return Err("AVC decoder requires bounded progressive pictures".into());
     }
     bits.bit()?; // direct_8x8_inference_flag.
@@ -133,6 +191,10 @@ fn prefix(bytes: &[u8]) -> usize {
 /// Locate one single-slice access unit in an addressed Annex B input span.
 /// Padding zeros before the next start code belong to the consumed span.
 pub fn access_unit(bytes: &[u8]) -> Result<(usize, bool), String> {
+    access_unit_profile(bytes, false)
+}
+
+fn access_unit_profile(bytes: &[u8], allow_high: bool) -> Result<(usize, bool), String> {
     if bytes.len() > 2 * 1024 * 1024 {
         return Err("AVC input exceeds two bounded stream banks".into());
     }
@@ -179,7 +241,7 @@ pub fn access_unit(bytes: &[u8]) -> Result<(usize, bool), String> {
                 idr = kind == 5;
             }
             7 => {
-                sequence(&bytes[start..used])?;
+                sequence_profile(&bytes[start..used], allow_high)?;
             }
             8 => {
                 if used - start > 256 {
@@ -270,7 +332,9 @@ pub fn packet_sequence(bytes: &[u8]) -> Result<Option<Sequence>, String> {
 
 pub struct Decoder {
     sequence: Option<Sequence>,
-    #[cfg(not(target_arch = "wasm32"))]
+    allow_high: bool,
+    bounds: Bounds,
+    #[cfg(any(not(target_arch = "wasm32"), target_os = "emscripten"))]
     codec: openh264::decoder::Decoder,
 }
 
@@ -287,8 +351,37 @@ mod tests {
             bitrate: 1_000_000,
             max_qp: 20,
             gop: 4,
+            level_idc: 42,
         }
     }
+    /// A level 5.1 stream, as the X-T5 4K movie encoder writes: the default movie decoder
+    /// refuses its SPS, the 4K bounds decode it to the encoder's own reconstruction size.
+    #[test]
+    fn the_4k_bounds_accept_a_level_51_sequence() {
+        use crate::h264::{Direct, DirectConfig};
+        let mut encoder = Direct::new(DirectConfig {
+            width: 64,
+            height: 32,
+            frames_per_second: 30,
+            bitrate: 0,
+            gop: 1,
+            level_idc: 51,
+        })
+        .unwrap();
+        let unit = encoder.encode_i420(&input(false)).unwrap();
+        let refusal = Decoder::new_movie(&[]).unwrap().decode_movie_unit(&unit).err().unwrap();
+        assert_eq!(refusal, "AVC SPS level or identifiers exceed supported bounds");
+        let picture =
+            Decoder::new_movie_bounded(&[], Bounds::UHD).unwrap().decode_movie_unit(&unit).unwrap();
+        assert_eq!((picture.sequence.width, picture.sequence.height), (64, 32));
+        assert_eq!(picture.i420.len(), 64 * 32 * 3 / 2);
+        // A picture larger than the bound is refused before the host codec runs.
+        let small = Bounds { level_idc: 52, coded_width: 48, coded_height: 32 };
+        let refusal =
+            Decoder::new_movie_bounded(&[], small).unwrap().decode_movie_unit(&unit).err().unwrap();
+        assert_eq!(refusal, "AVC decoder requires bounded progressive pictures");
+    }
+
     fn input(bright: bool) -> Vec<u8> {
         let mut pixels = vec![128; 64 * 32 * 3 / 2];
         for row in 0..32 {
@@ -427,6 +520,29 @@ mod tests {
     }
 
     #[test]
+    fn stock_high_profile_sps_is_bounded_to_420_eight_bit_with_scaling() {
+        // Captured from flog-clips/stock.MOV: High 4:2:0, 1920x1080 with
+        // eight absent scaling lists and a four-line bottom crop.
+        let sps = [
+            0x67, 0x64, 0x00, 0x2a, 0xad, 0x00, 0x72, 0x20, 0x1e, 0x00, 0x89, 0xf9, 0x66, 0xe0,
+            0x20, 0xc0, 0xc8, 0x00, 0x00, 0x1f, 0x48, 0x00, 0x0e, 0xa6, 0x04, 0x20, 0x00, 0x00,
+        ];
+        assert!(sequence(&sps).unwrap_err().contains("Baseline"));
+        assert_eq!(
+            sequence_high(&sps).unwrap(),
+            Sequence {
+                width: 1920,
+                height: 1080,
+                coded_width: 1920,
+                coded_height: 1088
+            }
+        );
+        let mut unsupported = sps;
+        unsupported[1] = 0x4d;
+        assert!(sequence_high(&unsupported).is_err());
+    }
+
+    #[test]
     fn progressive_macroblock_height_crops_1088_to_1080() {
         fn ue(value: u32) -> String {
             let bits = format!("{:b}", value + 1);
@@ -458,15 +574,35 @@ mod tests {
 }
 impl Decoder {
     pub fn new(history: &[Arc<[u8]>]) -> Result<Self, String> {
-        #[cfg(target_arch = "wasm32")]
+        Self::new_with_high(history, false)
+    }
+
+    /// A decoder for stock camera movies, whose avcC declares High profile.
+    pub fn new_movie(history: &[Arc<[u8]>]) -> Result<Self, String> {
+        Self::new_with_high(history, true)
+    }
+
+    /// A movie decoder ([`Decoder::new_movie`]) with other SPS bounds.
+    pub fn new_movie_bounded(history: &[Arc<[u8]>], bounds: Bounds) -> Result<Self, String> {
+        Self::new_bounded(history, true, bounds)
+    }
+
+    fn new_with_high(history: &[Arc<[u8]>], allow_high: bool) -> Result<Self, String> {
+        Self::new_bounded(history, allow_high, Bounds::FULL_HD)
+    }
+
+    fn new_bounded(history: &[Arc<[u8]>], allow_high: bool, bounds: Bounds) -> Result<Self, String> {
+        #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
         {
-            let _ = history;
+            let _ = (history, allow_high, bounds);
             Err("AVC decoding is unavailable on this target".into())
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), target_os = "emscripten"))]
         {
             let mut decoder = Self {
                 sequence: None,
+                allow_high,
+                bounds,
                 codec: openh264::decoder::Decoder::new()
                     .map_err(|e| format!("AVC decoder initialization: {e}"))?,
             };
@@ -479,8 +615,12 @@ impl Decoder {
             Ok(decoder)
         }
     }
+
+    fn read_sequence(&self, nal: &[u8]) -> Result<Sequence, String> {
+        sequence_bounded(nal, self.allow_high, self.bounds)
+    }
     pub fn decode(&mut self, bytes: &[u8]) -> Result<Picture, String> {
-        let (used, _) = access_unit(bytes)?;
+        let (used, _) = access_unit_profile(bytes, self.allow_high)?;
         if bytes[used..].iter().any(|&b| b != 0) {
             return Err("AVC access unit contains multiple pictures".into());
         }
@@ -501,7 +641,7 @@ impl Decoder {
                 while payload_end > start && bytes[payload_end - 1] == 0 {
                     payload_end -= 1;
                 }
-                let next = sequence(&bytes[start..payload_end])?;
+                let next = self.read_sequence(&bytes[start..payload_end])?;
                 if self.sequence.is_some_and(|old| old != next) {
                     return Err("AVC dimensions changed without reset".into());
                 }
@@ -509,39 +649,98 @@ impl Decoder {
             }
             at = end;
         }
+        self.decode_picture(&bytes[..used])
+    }
+
+    /// Decode one already bounded Annex B access unit from a stock MOV.
+    ///
+    /// The demuxer has removed transport padding, so this path does not
+    /// require [`access_unit`]'s single-slice scan or its multi-picture check.
+    /// It still parses every SPS and bounds the decoded dimensions.
+    pub fn decode_movie_unit(&mut self, bytes: &[u8]) -> Result<Picture, String> {
+        let mut at = 0;
+        while at < bytes.len() {
+            let count = prefix(&bytes[at..]);
+            if count == 0 {
+                at += 1;
+                continue;
+            }
+            let start = at + count;
+            let mut end = start + 1;
+            while end < bytes.len() && prefix(&bytes[end..]) == 0 {
+                end += 1;
+            }
+            if bytes[start] & 31 == 7 {
+                let mut payload_end = end;
+                while payload_end > start && bytes[payload_end - 1] == 0 {
+                    payload_end -= 1;
+                }
+                let next = self.read_sequence(&bytes[start..payload_end])?;
+                if self.sequence.is_some_and(|old| old != next) {
+                    return Err("AVC dimensions changed without reset".into());
+                }
+                self.sequence = Some(next);
+            }
+            at = end;
+        }
+        self.decode_picture(bytes)
+    }
+
+    fn decode_picture(&mut self, bytes: &[u8]) -> Result<Picture, String> {
         let sequence = self.sequence.ok_or("AVC picture has no bounded SPS")?;
-        #[cfg(target_arch = "wasm32")]
+        #[cfg(all(target_arch = "wasm32", not(target_os = "emscripten")))]
         {
-            let _ = sequence;
+            let _ = (bytes, sequence);
             Err("AVC decoding is unavailable on this target".into())
         }
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(any(not(target_arch = "wasm32"), target_os = "emscripten"))]
         {
-            use openh264::formats::YUVSource;
-            let image = self
+            use openh264::decoder::{DecodeOptions, Flush};
+            let mut image = self
                 .codec
-                .decode(&bytes[..used])
-                .map_err(|e| format!("AVC decode failed: {e}"))?
-                .ok_or("AVC access unit produced no picture")?;
-            if image.dimensions() != (sequence.width, sequence.height) {
-                return Err("AVC decoded dimensions differ from bounded SPS".into());
+                .decode_with_options(
+                    bytes,
+                    DecodeOptions::new().flush_after_decode(Flush::NoFlush),
+                )
+                .map_err(|e| format!("AVC decode failed: {e}"))?;
+            if image.is_none() {
+                let mut buffered = self
+                    .codec
+                    .flush_remaining()
+                    .map_err(|e| format!("AVC flush failed: {e}"))?;
+                if buffered.len() != 1 {
+                    return Err("AVC decoder buffered an unexpected picture count".into());
+                }
+                image = buffered.pop();
             }
-            let (ys, us, vs) = image.strides();
-            let luma = sequence.width * sequence.height;
-            let mut i420 = vec![0; luma * 3 / 2];
-            for row in 0..sequence.height {
-                i420[row * sequence.width..(row + 1) * sequence.width]
-                    .copy_from_slice(&image.y()[row * ys..row * ys + sequence.width]);
-            }
-            let chroma_width = sequence.width / 2;
-            for row in 0..sequence.height / 2 {
-                let start = row * chroma_width;
-                i420[luma + start..luma + start + chroma_width]
-                    .copy_from_slice(&image.u()[row * us..row * us + chroma_width]);
-                i420[luma + luma / 4 + start..luma + luma / 4 + start + chroma_width]
-                    .copy_from_slice(&image.v()[row * vs..row * vs + chroma_width]);
-            }
-            Ok(Picture { sequence, i420 })
+            let image = image.ok_or("AVC access unit produced no picture")?;
+            picture(sequence, &image)
         }
     }
+}
+
+#[cfg(any(not(target_arch = "wasm32"), target_os = "emscripten"))]
+fn picture(
+    sequence: Sequence,
+    image: &impl openh264::formats::YUVSource,
+) -> Result<Picture, String> {
+    if image.dimensions() != (sequence.width, sequence.height) {
+        return Err("AVC decoded dimensions differ from bounded SPS".into());
+    }
+    let (ys, us, vs) = image.strides();
+    let luma = sequence.width * sequence.height;
+    let mut i420 = vec![0; luma * 3 / 2];
+    for row in 0..sequence.height {
+        i420[row * sequence.width..(row + 1) * sequence.width]
+            .copy_from_slice(&image.y()[row * ys..row * ys + sequence.width]);
+    }
+    let chroma_width = sequence.width / 2;
+    for row in 0..sequence.height / 2 {
+        let start = row * chroma_width;
+        i420[luma + start..luma + start + chroma_width]
+            .copy_from_slice(&image.u()[row * us..row * us + chroma_width]);
+        i420[luma + luma / 4 + start..luma + luma / 4 + start + chroma_width]
+            .copy_from_slice(&image.v()[row * vs..row * vs + chroma_width]);
+    }
+    Ok(Picture { sequence, i420 })
 }

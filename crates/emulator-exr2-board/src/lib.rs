@@ -182,6 +182,7 @@ fn build(
             node.model,
             Model::Encoder { .. }
                 | Model::ContactActuator { .. }
+                | Model::ContactCam { .. }
                 | Model::GpioContactResponse { .. }
                 | Model::I2cMotorBridge { .. }
                 | Model::CoreRelease { .. }
@@ -206,7 +207,7 @@ fn build(
                 &node.name,
                 spec,
                 &node.windows,
-                &mut resources,
+                &resources,
                 &built.node_ids,
             )?)
         } else {

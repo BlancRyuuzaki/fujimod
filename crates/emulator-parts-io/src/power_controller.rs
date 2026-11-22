@@ -1,6 +1,7 @@
 //! Four-byte, MSB-first power-controller protocol with explicit checksum and
 //! register effects.
 //! This is an emulated register file, not an identified external PMIC.
+use fujimod_emulator_devices::checkpoint::Checkpoint;
 use serde::{Deserialize, Serialize};
 
 impl super::serial::Endpoint for PowerController {
@@ -20,6 +21,29 @@ impl super::serial::Endpoint for PowerController {
     fn transfer(&mut self, frame: super::serial::Frame, now_ns: u64) -> u16 {
         self.advance(now_ns);
         self.exchange(frame.word as u8).into()
+    }
+    fn set_input_bits(&mut self, register: u8, mask: u16, value: u16) -> Result<(), String> {
+        if register > 0x7f || value & !mask != 0 {
+            return Err("power-controller input bits outside the register or mask".into());
+        }
+        let old = self.register(register);
+        self.set_register(register, (old & !mask) | value);
+        Ok(())
+    }
+    fn checkpoint(&self) -> Result<Checkpoint, String> {
+        Checkpoint::encode(self.name(), self)
+    }
+    fn validate_checkpoint(&self, saved: &Checkpoint) -> Result<(), String> {
+        let state: Self = saved.decode(self.name())?;
+        if state.registers.len() != 128 || state.position >= 4 {
+            return Err("invalid power controller checkpoint".into());
+        }
+        Ok(())
+    }
+    fn restore_checkpoint(&mut self, saved: &Checkpoint) -> Result<(), String> {
+        self.validate_checkpoint(saved)?;
+        *self = saved.decode(self.name())?;
+        Ok(())
     }
     fn save(&self) -> serde_json::Value {
         serde_json::to_value(self).unwrap()
@@ -76,6 +100,11 @@ impl PowerController {
     }
     pub fn reset_transfer(&mut self) {
         self.position = 0;
+    }
+    /// Byte position within the current four-byte transfer; 0 means the next
+    /// byte is a command.
+    pub fn transfer_position(&self) -> usize {
+        self.position
     }
     /// Seconds since 2000-01-01, advanced by the VM clock. Invalid/unset
     /// profiles retain bit1 clear until a calendar is committed.
@@ -165,9 +194,131 @@ impl PowerController {
     }
 }
 
+/// Battery fuel gauge behind the I2C register-pointer protocol. Register 4
+/// holds a declared charge word read most-significant byte first. No chip
+/// identity or behavior for unmodeled registers is implied; I2C controller
+/// behavior is separate.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct FuelGauge {
+    registers: Vec<u8>,
+    known: Vec<bool>,
+}
+impl Default for FuelGauge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl FuelGauge {
+    pub fn new() -> Self {
+        let mut s = Self {
+            registers: vec![0; 256],
+            known: vec![false; 256],
+        };
+        // Declared Q8.8 charge sample.
+        s.measurement(4, 0x5f00);
+        // Declared retained OCV sample; no physical calibration is implied.
+        s.measurement(0xe, 0xd000);
+        s
+    }
+    fn measurement(&mut self, register: u8, value: u16) {
+        let n = register as usize;
+        self.registers[n..n + 2].copy_from_slice(&value.to_be_bytes());
+        self.known[n..n + 2].fill(true);
+    }
+    pub fn read(&self, register: u8) -> Result<u8, String> {
+        let n = register as usize;
+        if self.known[n] {
+            Ok(self.registers[n])
+        } else {
+            Err(format!("unmodeled battery-gauge register {register:#x}"))
+        }
+    }
+    pub fn write(&mut self, register: u8, value: u8) -> Result<(), String> {
+        // SOC is read-only in this model; reject writes to its two bytes.
+        if matches!(register, 4 | 5) {
+            return Err("unmodeled battery-gauge SOC write".into());
+        }
+        self.registers[register as usize] = value;
+        self.known[register as usize] = true;
+        Ok(())
+    }
+    /// Read sequential big-endian bytes starting at the selected register.
+    /// Unmodeled registers remain unsupported by `read`.
+    pub fn read_bytes(&self, register: u8, length: usize) -> Result<Vec<u8>, String> {
+        if length > 256 {
+            return Err("battery-gauge transfer exceeds register file".into());
+        }
+        (0..length)
+            .map(|n| self.read(register.wrapping_add(n as u8)))
+            .collect()
+    }
+    pub fn write_bytes(&mut self, register: u8, bytes: &[u8]) -> Result<(), String> {
+        if bytes.len() > 256 {
+            return Err("battery-gauge transfer exceeds register file".into());
+        }
+        if (0..bytes.len()).any(|n| matches!(register.wrapping_add(n as u8), 4 | 5)) {
+            return Err("unmodeled battery-gauge SOC write".into());
+        }
+        for (n, value) in bytes.iter().enumerate() {
+            self.write(register.wrapping_add(n as u8), *value)?;
+        }
+        Ok(())
+    }
+}
+
+impl crate::i2c::Registers for FuelGauge {
+    fn name(&self) -> &'static str {
+        "fuel-gauge"
+    }
+    fn write(&mut self, register: u8, value: u8) -> Result<(), String> {
+        FuelGauge::write(self, register, value)
+    }
+    fn read(&mut self, register: u8) -> Result<u8, String> {
+        FuelGauge::read(self, register)
+    }
+    fn checkpoint(&self) -> Result<Checkpoint, String> {
+        Checkpoint::encode(self.name(), self)
+    }
+    fn validate_checkpoint(&self, saved: &Checkpoint) -> Result<(), String> {
+        let state: Self = saved.decode(self.name())?;
+        if state.registers.len() != 256 || state.known.len() != 256 {
+            return Err("invalid fuel-gauge checkpoint".into());
+        }
+        Ok(())
+    }
+    fn restore_checkpoint(&mut self, saved: &Checkpoint) -> Result<(), String> {
+        self.validate_checkpoint(saved)?;
+        *self = saved.decode(self.name())?;
+        Ok(())
+    }
+    fn save(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap()
+    }
+    fn restore(&mut self, state: &serde_json::Value) -> Result<(), String> {
+        let restored: Self = serde_json::from_value(state.clone()).map_err(|e| e.to_string())?;
+        if restored.registers.len() != 256 || restored.known.len() != 256 {
+            return Err("invalid fuel-gauge checkpoint".into());
+        }
+        *self = restored;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn external_input_bits_change_only_their_mask() {
+        use crate::serial::Endpoint;
+        let mut m = PowerController::new();
+        m.set_register(0x12, 0xc305);
+        m.set_input_bits(0x12, 0x30, 0x10).unwrap();
+        assert_eq!(m.register(0x12), 0xc315);
+        m.set_input_bits(0x12, 0x30, 0).unwrap();
+        assert_eq!(m.register(0x12), 0xc305);
+        assert!(m.set_input_bits(0x12, 0x30, 0x40).is_err());
+        assert!(m.set_input_bits(0x80, 0x30, 0x10).is_err());
+    }
     #[test]
     fn byte_order_checksum_and_rejected_write() {
         let mut m = PowerController::new();
@@ -231,77 +382,5 @@ mod tests {
         let value = restored.register(0x23) as u32 | ((restored.register(0x24) as u32) << 16);
         assert_eq!(value, 0x56781234 + 5);
         assert_eq!(restored.register(0x27) & 2, 2);
-    }
-}
-
-/// Battery-gauge endpoint on I2C1, address 0x36. Register 4 holds a declared
-/// charge word read most-significant byte first. No chip identity or behavior
-/// for unmodeled registers is implied; I2C controller behavior is separate.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct FuelGauge {
-    registers: Vec<u8>,
-    known: Vec<bool>,
-}
-impl Default for FuelGauge {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-impl FuelGauge {
-    pub const ADDRESS: u8 = 0x36;
-    pub fn new() -> Self {
-        let mut s = Self {
-            registers: vec![0; 256],
-            known: vec![false; 256],
-        };
-        // Declared Q8.8 charge sample.
-        s.measurement(4, 0x5f00);
-        // Declared retained OCV sample; no physical calibration is implied.
-        s.measurement(0xe, 0xd000);
-        s
-    }
-    fn measurement(&mut self, register: u8, value: u16) {
-        let n = register as usize;
-        self.registers[n..n + 2].copy_from_slice(&value.to_be_bytes());
-        self.known[n..n + 2].fill(true);
-    }
-    pub fn read(&self, register: u8) -> Result<u8, String> {
-        let n = register as usize;
-        if self.known[n] {
-            Ok(self.registers[n])
-        } else {
-            Err(format!("unmodeled battery-gauge register {register:#x}"))
-        }
-    }
-    pub fn write(&mut self, register: u8, value: u8) -> Result<(), String> {
-        // SOC is read-only in this model; reject writes to its two bytes.
-        if matches!(register, 4 | 5) {
-            return Err("unmodeled battery-gauge SOC write".into());
-        }
-        self.registers[register as usize] = value;
-        self.known[register as usize] = true;
-        Ok(())
-    }
-    /// Read sequential big-endian bytes starting at the selected register.
-    /// Unmodeled registers remain unsupported by `read`.
-    pub fn read_bytes(&self, register: u8, length: usize) -> Result<Vec<u8>, String> {
-        if length > 256 {
-            return Err("battery-gauge transfer exceeds register file".into());
-        }
-        (0..length)
-            .map(|n| self.read(register.wrapping_add(n as u8)))
-            .collect()
-    }
-    pub fn write_bytes(&mut self, register: u8, bytes: &[u8]) -> Result<(), String> {
-        if bytes.len() > 256 {
-            return Err("battery-gauge transfer exceeds register file".into());
-        }
-        if (0..bytes.len()).any(|n| matches!(register.wrapping_add(n as u8), 4 | 5)) {
-            return Err("unmodeled battery-gauge SOC write".into());
-        }
-        for (n, value) in bytes.iter().enumerate() {
-            self.write(register.wrapping_add(n as u8), *value)?;
-        }
-        Ok(())
     }
 }
