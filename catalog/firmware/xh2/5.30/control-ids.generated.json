@@ -2132,7 +2132,8 @@
       "event": 9,
       "debug_key": "DISP_B",
       "target": {
-        "kind": "unclaimed"
+        "kind": "control",
+        "control_id": "disp_back_button"
       },
       "scanner": {
         "index": 28,
