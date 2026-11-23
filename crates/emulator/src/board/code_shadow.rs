@@ -146,6 +146,10 @@ impl CodeShadow {
     pub(super) fn retained(&self) -> u64 {
         self.retained
     }
+    #[cfg(test)]
+    pub(super) fn discards(&self) -> u64 {
+        self.discards
+    }
     /// Host-only counters for a run report.
     pub(super) fn counters(&self) -> String {
         let mut changed: Vec<_> = self.changed_pages.iter().collect();

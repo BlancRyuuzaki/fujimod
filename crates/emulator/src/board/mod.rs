@@ -3899,9 +3899,7 @@ unsafe fn written(
                 {
                     state.code_run = None;
                 }
-                if state.execution_policy == ExecutionPolicy::Exact
-                    && let Some(shadow) = state.code_shadow[b.core].as_mut()
-                {
+                if let Some(shadow) = state.code_shadow[b.core].as_mut() {
                     shadow.stored(&*cpus[b.core], address, size);
                 }
                 notify_memory(
