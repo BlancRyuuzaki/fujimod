@@ -41,6 +41,16 @@ size = 0x70000000
 base = 0xfa200000
 size = 0x100000
 
+# Boot SRAM, 256 KiB. The SoC profile maps it only for ROM and SD starts, but the application
+# keeps the AE statistics banks here, as the X-T5 does: the AE setup 0x2f50bbc (X-T5 0x2e8c6b8)
+# stores the bank pointers 0xff800000 and 0xff8075a0 (0x2f50bf8, 0x2f50c00) with 0x75a0 bytes
+# each, 0x2f79de0 (0x2eb5e74) sets four planes 0x400 apart from 0xff80eb40 (0x2f79de8), and
+# 0x2eec5c4 (0x2e2943c) increments the counter 0xff82c008. The statistics model writes its
+# frames into this RAM.
+[[ram]]
+base = 0xff800000
+size = 0x40000
+
 # The SD slot (host 0xff9b0000, 25-sd.toml) is empty. The format describes the volume a
 # run that inserts a card without an image would see; it is unused while the slot is empty.
 [[sd]]
