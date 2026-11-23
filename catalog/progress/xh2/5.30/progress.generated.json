@@ -1863,7 +1863,7 @@
         {
           "id": "boot-rom-loads-sd-card-on-camera",
           "title": "Boot ROM: loads an SD card on a camera",
-          "result": "not-run"
+          "result": "pass"
         },
         {
           "id": "sd-boot-v1-stock-boots-on-camera",
@@ -1901,9 +1901,9 @@
           "id": "boot-rom-loads-sd-card-on-camera",
           "label": "Boot ROM: loads an SD card on a camera",
           "stage": "boot-rom-loads-sd-card-on-camera",
-          "result": "not-run",
-          "passed": 0,
-          "total": 0,
+          "result": "pass",
+          "passed": 1,
+          "total": 1,
           "milestone": true
         },
         {
