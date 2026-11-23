@@ -53,7 +53,7 @@
         {
           "id": "restart-facts",
           "title": "USB restart request located",
-          "result": "fail"
+          "result": "pass"
         },
         {
           "id": "card-files",
@@ -149,9 +149,9 @@
           "id": "restart-facts",
           "label": "USB restart request located",
           "stage": "restart-facts",
-          "result": "fail",
-          "passed": 0,
-          "total": 0
+          "result": "pass",
+          "passed": 1,
+          "total": 1
         },
         {
           "id": "card-files",
