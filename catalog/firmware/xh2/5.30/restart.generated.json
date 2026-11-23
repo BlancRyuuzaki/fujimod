@@ -55,7 +55,7 @@
       "kind": "console_callback",
       "slot": 33903480,
       "stock_callback": 46961936,
-      "stub_area": 13696960,
+      "stub_area": 2162624,
       "stub_bytes": 64,
       "translation": [
         {
@@ -69,9 +69,9 @@
           "value": 790531
         },
         {
-          "address": 790576,
+          "address": 790536,
           "size": 8,
-          "value": 12584457
+          "value": 2098697
         }
       ],
       "ready_words": [
