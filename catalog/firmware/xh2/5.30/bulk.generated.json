@@ -16,8 +16,8 @@
     "capacity": 65536
   },
   "window": {
-    "address": 0,
-    "size": 2147483648
+    "address": 16384,
+    "size": 2147467264
   },
   "code_checks": [
     {
@@ -146,8 +146,8 @@
       "ranges": [
         {
           "name": "firmware",
-          "address": 0,
-          "size": 99614720
+          "address": 16384,
+          "size": 99598336
         }
       ]
     },
@@ -157,8 +157,8 @@
       "ranges": [
         {
           "name": "ram",
-          "address": 0,
-          "size": 2147483648
+          "address": 16384,
+          "size": 2147467264
         }
       ]
     }
