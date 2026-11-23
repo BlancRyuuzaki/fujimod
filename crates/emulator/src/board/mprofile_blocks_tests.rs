@@ -37,6 +37,8 @@ struct Outcome {
     memory: Vec<u8>,
     observed: u64,
     fast_stores: bool,
+    /// Blocks shortened to one entry because the bookkeeping was not settled.
+    unsettled: u64,
 }
 
 /// The program and its storing peer on a fresh board.
@@ -108,6 +110,7 @@ fn board(blocks: bool) -> Board {
 
 fn run(
     policy: ExecutionPolicy,
+    verify: u32,
     quantum: usize,
     blocks: bool,
     until: u64,
@@ -115,6 +118,7 @@ fn run(
 ) -> Outcome {
     let mut board = board(blocks);
     board.set_execution_policy(policy).unwrap();
+    board.state.borrow_mut().settled.verify = verify;
     for &window in windows {
         board.run_until(window, quantum).unwrap();
     }
@@ -130,28 +134,43 @@ fn outcome(board: &Board) -> Outcome {
     let mut memory = vec![0; 0x24];
     board.read_physical(0x12000, &mut memory[..0x20]).unwrap();
     board.read_physical(0x10800, &mut memory[0x20..]).unwrap();
-    let (observed, fast_stores) = board.state.borrow().blocks[0]
+    let (observed, fast_stores, unsettled) = board.state.borrow().blocks[0]
         .as_ref()
-        .map_or((0, false), |blocks| (blocks.observed, blocks.fast_stores));
+        .map_or((0, false, 0), |blocks| {
+            (blocks.observed, blocks.fast_stores, blocks.shortened_by[0])
+        });
     Outcome {
         state: board.state(),
         registers,
         memory,
         observed,
         fast_stores,
+        unsettled,
     }
 }
 
 /// M-profile processors run in ordered slices under either execution policy, so block
-/// execution holds under both.
+/// execution holds under both. Without verification of settled entries, a block whose
+/// first entry settles the bookkeeping is admitted whole; with it, every unsettled entry
+/// is a block of its own.
 #[test]
 fn block_execution_equals_the_instruction_observer() {
     for policy in [ExecutionPolicy::Exact, ExecutionPolicy::Interactive] {
         for quantum in [1, 2, 3, 7, 16, 64, 100] {
             for (until, windows) in [(2500, &[][..]), (4000, &[211, 212, 900, 2333][..])] {
-                let reference = run(policy, quantum, false, until, windows);
-                let blocks = run(policy, quantum, true, until, windows);
+                let reference = run(policy, 1, quantum, false, until, windows);
+                let blocks = run(policy, 1, quantum, true, until, windows);
+                let whole = run(policy, 0, quantum, true, until, windows);
                 let at = format!("{policy:?} quantum {quantum} until {until}");
+                assert_eq!(whole.registers, reference.registers, "{at} unverified");
+                assert_eq!(whole.memory, reference.memory, "{at} unverified");
+                assert_eq!(whole.state, reference.state, "{at} unverified");
+                // One entry of room per slice leaves nothing to admit whole.
+                if quantum > 1 {
+                    assert!(whole.unsettled < blocks.unsettled, "{at}: none admitted whole");
+                } else {
+                    assert_eq!(whole.unsettled, blocks.unsettled, "{at}");
+                }
                 assert_eq!(reference.observed, 0);
                 assert!(blocks.observed > 0, "{at}: block execution never ran");
                 assert!(blocks.fast_stores, "{at}: every store hooked");
@@ -177,7 +196,7 @@ fn block_execution_equals_the_instruction_observer() {
 /// the portable form is the same bytes either way.
 #[test]
 fn keyframes_do_not_bind_to_the_execution_core_s_own_hooks() {
-    let reference = run(ExecutionPolicy::Exact, 100, false, 2500, &[]);
+    let reference = run(ExecutionPolicy::Exact, 1, 100, false, 2500, &[]);
     let mut board = board(true);
     let start = board.checkpoint(None).unwrap();
     let portable_start = start.export().unwrap().to_bytes().unwrap();

@@ -2034,6 +2034,7 @@ impl Board {
         }
         blocks.room = budget;
         blocks.pending = None;
+        blocks.prepared = None;
         blocks.resume = false;
         // Anything may have happened since the last run.
         blocks.poll = None;
@@ -3655,6 +3656,17 @@ unsafe fn block_entered(block: fujimod_emulator_cpu::Block, data: *mut c_void) {
         let bytes = block.bytes & 0x3fff_ffff;
         // The block before this one ran whole.
         s.settle_block(core, None)?;
+        if let Some(blocks) = s.blocks[core].as_mut()
+            && let Some(prepared) = blocks.prepared.take()
+        {
+            // The engine retried before executing anything. This entry
+            // already ran its observer and used one entry of room.
+            if prepared != pc || !matches!(bytes, 2 | 4) {
+                return Err("M-profile retry did not return to its prepared entry".into());
+            }
+            blocks.pending = Some((pc, bytes, 1, pc));
+            return Ok(());
+        }
         let room = s.blocks[core].as_ref().map_or(0, |blocks| blocks.room);
         if room == 0 {
             // The engine's counter stops before the observer of the first
@@ -3704,16 +3716,25 @@ unsafe fn block_entered(block: fujimod_emulator_cpu::Block, data: *mut c_void) {
         } else {
             scan.unit
         };
-        let limit = if settled {
-            // Until the next device deadline, the end of the run window, the
-            // next generic-timer output change and the peer's turn.
+        let deadline_room = |s: &State| {
+            // Until the next device deadline, the end of the run window or
+            // the next generic-timer output change.
             let until = s.clock_limit.unwrap_or(u64::MAX).min(s.settled.until);
+            s.timeline.processor_budget(core, u64::MAX, Some(until))
+        };
+        // Give the first entry a chance to settle the bookkeeping when the
+        // whole block fits the scan and the run. Keep the verifier's sequence
+        // of observed entries when verification is enabled.
+        let try_whole =
+            !settled && s.settled.verify == 0 && entries > 1 && entries <= unit.min(room);
+        let limit = if settled {
             unit.min(room)
-                .min(s.timeline.processor_budget(core, u64::MAX, Some(until))?)
+                .min(deadline_room(&s)?)
                 .min(s.scheduler_room(core))
+        } else if try_whole {
+            // Check the deadlines and the peer's turn after the first entry.
+            entries
         } else {
-            // The pin push and deadline refresh below are not yet known to be
-            // a fixed point: the next instruction needs them again.
             1
         };
         if limit == 0 {
@@ -3817,6 +3838,23 @@ unsafe fn block_entered(block: fujimod_emulator_cpu::Block, data: *mut c_void) {
                 s.blocks[core].as_mut().unwrap().resume = true;
             }
             return cpu.stop();
+        }
+        if try_whole {
+            let reason = if !s.settled.pass || !s.settled.armed {
+                Some(0)
+            } else {
+                let deadline = deadline_room(&s)?;
+                let peer = s.scheduler_room(core);
+                (entries > deadline.min(peer)).then_some(if peer <= deadline { 3 } else { 4 })
+            };
+            if let Some(reason) = reason {
+                cpu.retry_block(1)?;
+                let blocks = s.blocks[core].as_mut().unwrap();
+                blocks.shortened += 1;
+                blocks.shortened_by[reason] += 1;
+                blocks.prepared = Some(pc);
+                return Ok(());
+            }
         }
         // Admit the block: its first entry is already debited.
         let blocks = s.blocks[core].as_mut().unwrap();

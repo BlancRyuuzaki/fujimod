@@ -36,6 +36,8 @@ pub(super) struct Blocks {
     /// The admitted block now executing: address, bytes, entries, and the
     /// address of its last instruction.
     pub pending: Option<(u64, u32, u64, u64)>,
+    /// The entry at this PC already ran its observer before a one-entry retry.
+    pub prepared: Option<u64>,
     /// The board store hook sees only watched pages (code pages, a live
     /// exclusive granule) and device pages; other stores keep the engine's
     /// inline path and no longer end their block.
