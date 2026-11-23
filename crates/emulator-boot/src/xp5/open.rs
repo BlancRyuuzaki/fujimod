@@ -457,6 +457,7 @@ fn rom_boot_state(state: &BootState, rom: &RomStart) -> Result<BootState, String
     };
     windows.extend(fragment.device);
     state.ram.extend(fragment.ram);
+    state.ram.extend(rom.setup_ram.iter().cloned());
     for window in windows {
         // A bring-up stub page the manifest already owns (the X-T5's memory-controller pages
         // 0xfaf27000 and 0xfaf37000) keeps the manifest's registers and gains the ROM-start

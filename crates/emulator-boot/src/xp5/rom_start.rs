@@ -114,6 +114,10 @@ pub(crate) struct Handoff {
     /// A bring-up stub listed here answers before the fragment's stub of the same page.
     #[serde(default)]
     pub device: Vec<DeviceWindow>,
+    /// Memory this firmware's SD card stage needs beyond the shared ROM-start fragment, in
+    /// ROM and SD card starts only.
+    #[serde(default)]
+    pub ram: Vec<RamRegion>,
     /// Options this firmware's ROM and SD card starts set on windows the boot manifest declares.
     #[serde(default)]
     pub window_options: Vec<WindowOptions>,
@@ -124,6 +128,9 @@ impl Handoff {
         match firmware {
             "xt5-431" => Some(toml::from_str(include_str!(
                 "../../../../catalog/firmware/xt5/4.31/xp5-boot/card-handoff.toml"
+            )).map_err(|error| format!("card-handoff.toml: {error}"))),
+            "xh2-530" => Some(toml::from_str(include_str!(
+                "../../../../catalog/firmware/xh2/5.30/xp5-boot/card-handoff.toml"
             )).map_err(|error| format!("card-handoff.toml: {error}"))),
             _ => None,
         }
@@ -142,6 +149,8 @@ pub(crate) struct RomStart {
     /// (`card-handoff.toml` `[[device]]`). They apply to every start that runs that setup: the
     /// mask ROM start as well as the SD card hand-off.
     pub setup_windows: Vec<DeviceWindow>,
+    /// Memory the firmware's stock setup needs (`card-handoff.toml` `[[ram]]`).
+    pub setup_ram: Vec<RamRegion>,
     /// The firmware's own power-controller reset registers for a mask ROM start, when it declares
     /// a hand-off (`card-handoff.toml`); they replace the shared fragment's, whose register 0x10
     /// value follows another body's stage-one wake-cause mapping.
@@ -185,8 +194,10 @@ impl RomStart {
 
     pub fn from_card_handoff(handoff: Handoff, files: Vec<(String, PathBuf)>) -> Result<Self, String> {
         let (setup_windows, window_options) = (handoff.device.clone(), handoff.window_options.clone());
+        let setup_ram = handoff.ram.clone();
         let mut start = Self::with_media(Entry::CardHandoff(handoff), true, files, true)?;
         start.setup_windows = setup_windows;
+        start.setup_ram = setup_ram;
         start.setup_window_options = window_options;
         Ok(start)
     }
@@ -197,6 +208,7 @@ impl RomStart {
         if let Some(handoff) = Handoff::for_firmware(firmware) {
             let handoff = handoff?;
             self.setup_windows = handoff.device;
+            self.setup_ram = handoff.ram;
             self.setup_window_options = handoff.window_options;
             self.reset_registers = Some(handoff.power_controller_registers);
         }
@@ -243,6 +255,7 @@ impl RomStart {
             card_present,
             card_image: None,
             setup_windows: Vec::new(),
+            setup_ram: Vec::new(),
             reset_registers: None,
             setup_window_options: Vec::new(),
         })
