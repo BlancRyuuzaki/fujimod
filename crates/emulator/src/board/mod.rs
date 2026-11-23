@@ -1894,10 +1894,11 @@ impl Board {
     }
     /// Choose, before a processor runs, between the per-instruction observer
     /// and block execution (`mprofile_blocks`), and set the engine up for the
-    /// choice. Block execution needs exact execution, an M-profile
-    /// controller, and no observer the board's execution core did not install
-    /// itself (PC witnesses, instruction points, discovery stubs, write
-    /// watches): those read counters at their own instructions. Returns
+    /// choice. Block execution needs an M-profile controller and no observer
+    /// the board's execution core did not install itself (PC witnesses,
+    /// instruction points, discovery stubs, write watches): those read
+    /// counters at their own instructions. M-profile processors run in ordered
+    /// slices under either execution policy, so it applies to both. Returns
     /// whether the processor runs in block execution, with `budget` entries.
     fn sync_block_mode(&mut self, core: usize, budget: u64) -> Result<bool, String> {
         let (active, wanted) = {
@@ -1912,8 +1913,7 @@ impl Board {
             } else {
                 usize::from(self.observer_hooks[core].is_some())
             };
-            let wanted = s.execution_policy == ExecutionPolicy::Exact
-                && self.block_execution.get()
+            let wanted = self.block_execution.get()
                 && s.entry_points[core].is_empty()
                 && !s.memory.watching_writes()
                 && self.cpus[core].features().translation_filter

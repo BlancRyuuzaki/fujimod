@@ -106,8 +106,15 @@ fn board(blocks: bool) -> Board {
     board
 }
 
-fn run(quantum: usize, blocks: bool, until: u64, windows: &[u64]) -> Outcome {
+fn run(
+    policy: ExecutionPolicy,
+    quantum: usize,
+    blocks: bool,
+    until: u64,
+    windows: &[u64],
+) -> Outcome {
     let mut board = board(blocks);
+    board.set_execution_policy(policy).unwrap();
     for &window in windows {
         board.run_until(window, quantum).unwrap();
     }
@@ -135,26 +142,31 @@ fn outcome(board: &Board) -> Outcome {
     }
 }
 
+/// M-profile processors run in ordered slices under either execution policy, so block
+/// execution holds under both.
 #[test]
 fn block_execution_equals_the_instruction_observer() {
-    for quantum in [1, 2, 3, 7, 16, 64, 100] {
-        for (until, windows) in [(2500, &[][..]), (4000, &[211, 212, 900, 2333][..])] {
-            let reference = run(quantum, false, until, windows);
-            let blocks = run(quantum, true, until, windows);
-            assert_eq!(reference.observed, 0);
-            assert!(blocks.observed > 0, "quantum {quantum}: block execution never ran");
-            assert!(blocks.fast_stores, "quantum {quantum}: the store hook stayed on every store");
-            assert_eq!(blocks.registers, reference.registers, "quantum {quantum} until {until}");
-            assert_eq!(blocks.memory, reference.memory, "quantum {quantum} until {until}");
-            assert_eq!(blocks.state, reference.state, "quantum {quantum} until {until}");
-            // The program took SysTick exceptions and ran its handler.
-            assert!(reference.registers[8] > 0, "quantum {quantum}: no exception was taken");
-            assert!(reference.registers[5] > 16, "quantum {quantum}: the loop did not pass a WFI");
-            // The store into the code page landed every round, and the
-            // exclusive pair both succeeded and failed against the peer.
-            let rounds = reference.registers[5];
-            assert!((rounds - 1..=rounds).contains(&u64::from(reference.memory[0x20])));
-            assert!(reference.registers[10] > 0, "quantum {quantum}: STREX never failed");
+    for policy in [ExecutionPolicy::Exact, ExecutionPolicy::Interactive] {
+        for quantum in [1, 2, 3, 7, 16, 64, 100] {
+            for (until, windows) in [(2500, &[][..]), (4000, &[211, 212, 900, 2333][..])] {
+                let reference = run(policy, quantum, false, until, windows);
+                let blocks = run(policy, quantum, true, until, windows);
+                let at = format!("{policy:?} quantum {quantum} until {until}");
+                assert_eq!(reference.observed, 0);
+                assert!(blocks.observed > 0, "{at}: block execution never ran");
+                assert!(blocks.fast_stores, "{at}: every store hooked");
+                assert_eq!(blocks.registers, reference.registers, "{at}");
+                assert_eq!(blocks.memory, reference.memory, "{at}");
+                assert_eq!(blocks.state, reference.state, "{at}");
+                // The program took SysTick exceptions and ran its handler.
+                assert!(reference.registers[8] > 0, "{at}: no exception was taken");
+                assert!(reference.registers[5] > 16, "{at}: no WFI passed");
+                // The store into the code page landed every round, and the
+                // exclusive pair both succeeded and failed against the peer.
+                let rounds = reference.registers[5];
+                assert!((rounds - 1..=rounds).contains(&u64::from(reference.memory[0x20])));
+                assert!(reference.registers[10] > 0, "{at}: STREX never failed");
+            }
         }
     }
 }
@@ -165,7 +177,7 @@ fn block_execution_equals_the_instruction_observer() {
 /// the portable form is the same bytes either way.
 #[test]
 fn keyframes_do_not_bind_to_the_execution_core_s_own_hooks() {
-    let reference = run(100, false, 2500, &[]);
+    let reference = run(ExecutionPolicy::Exact, 100, false, 2500, &[]);
     let mut board = board(true);
     let start = board.checkpoint(None).unwrap();
     let portable_start = start.export().unwrap().to_bytes().unwrap();

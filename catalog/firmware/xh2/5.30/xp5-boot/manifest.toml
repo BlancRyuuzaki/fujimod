@@ -4,6 +4,10 @@
 version = 1
 firmware = "xh2-530"
 load_firmware = true
+# Host execution only: the companion computes (the IBIS servo's 16 kHz sample frames) far
+# more than it waits in delay loops, so it runs in block execution. The guest state is the
+# same either way.
+mprofile_block_execution = true
 
 # Device windows: manifest.d/*.toml, merged in filename order.
 
