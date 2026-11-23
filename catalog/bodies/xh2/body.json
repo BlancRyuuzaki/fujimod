@@ -12,7 +12,32 @@
   "power_control": null,
   "card_slot": null,
   "control_bus_chips": [],
-  "connections": [],
+  "connections": [
+    {
+      "id": "sensor-power-enable",
+      "kind": "sensor",
+      "signals": [
+        {
+          "kind": "gpio",
+          "port": 4,
+          "pin": 4,
+          "active_level": true
+        }
+      ]
+    },
+    {
+      "id": "sensor-power-sense",
+      "kind": "sensor",
+      "signals": [
+        {
+          "kind": "gpio",
+          "port": 4,
+          "pin": 4,
+          "active_level": true
+        }
+      ]
+    }
+  ],
   "parts": [
     "x100vi-serial-nor"
   ],
@@ -25,7 +50,12 @@
   ],
   "hardware": {
     "serial_attachments": [],
-    "gpio_feedback": [],
+    "gpio_feedback": [
+      {
+        "output_connection_id": "sensor-power-enable",
+        "input_connection_id": "sensor-power-sense"
+      }
+    ],
     "keypad_samples": {},
     "thermal_connection_ids": [],
     "bus_drain": {
