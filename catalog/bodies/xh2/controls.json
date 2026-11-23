@@ -806,5 +806,32 @@
       "positions": [],
       "short_name": "BATTERY"
     }
-  }
+  },
+  "ladders": [
+    {
+      "wire": {
+        "kind": "adc",
+        "channel": 6
+      },
+      "levels": 4096,
+      "released": null,
+      "basis": "The firmware reads this ADC channel at 12-bit resolution (the refresh 0x140af08 caches it at 0x207aae4). Bands come from the firmware's factory key-band table; a body with its own valid configuration store reads its own bands. No released level is established: it is this channel's idle sample, a property of the body.",
+      "rungs": [
+        {
+          "control_id": "menu_ok_button",
+          "band_low": 0,
+          "band_high": 782,
+          "sample": 391,
+          "basis": "Band 0..782, derived from the firmware's factory key-band table (scanner row 30, physical code 0xd, UI event KEY_OK 1); no other control on this wire accepts it. The sample is the band midpoint."
+        },
+        {
+          "control_id": "disp_back_button",
+          "band_low": 2637,
+          "band_high": 3102,
+          "sample": 2869,
+          "basis": "Band 2637..3102, derived from the firmware's factory key-band table (scanner row 28, physical code 0xf, UI event KEY_DISP_BACK 9); no other control on this wire accepts it. The sample is the band midpoint."
+        }
+      ]
+    }
+  ]
 }
