@@ -619,8 +619,8 @@
       "positions": [],
       "short_name": "DIOPTER"
     },
-    "selector_buttons": {
-      "name": "Selector buttons",
+    "selector_up_button": {
+      "name": "Selector up button (Fn4)",
       "location": "rear",
       "manual_page": 299,
       "face": null,
@@ -628,7 +628,7 @@
       "connection_ids": [],
       "assignable": true,
       "pushable": true,
-      "default_function": "Up, right, down, and left highlight items; as Fn4–Fn7 their defaults are PHOTOMETRY, FILM SIMULATION, DIGITAL TELE-CONV./DIGITAL ZOOM, and PERFORMANCE.",
+      "default_function": "Move up in menus; default function button assignment: PHOTOMETRY.",
       "role": null,
       "mechanical": false,
       "behavior": {
@@ -636,7 +636,64 @@
         "press": null
       },
       "positions": [],
-      "short_name": "SELECTOR"
+      "short_name": "UP"
+    },
+    "selector_right_button": {
+      "name": "Selector right button (Fn5)",
+      "location": "rear",
+      "manual_page": 299,
+      "face": null,
+      "icon": null,
+      "connection_ids": [],
+      "assignable": true,
+      "pushable": true,
+      "default_function": "Move right in menus; default function button assignment: FILM SIMULATION.",
+      "role": null,
+      "mechanical": false,
+      "behavior": {
+        "kind": "button",
+        "press": null
+      },
+      "positions": [],
+      "short_name": "RIGHT"
+    },
+    "selector_down_button": {
+      "name": "Selector down button (Fn6)",
+      "location": "rear",
+      "manual_page": 299,
+      "face": null,
+      "icon": null,
+      "connection_ids": [],
+      "assignable": true,
+      "pushable": true,
+      "default_function": "Move down in menus; default function button assignment: DIGITAL TELE-CONV./DIGITAL ZOOM.",
+      "role": null,
+      "mechanical": false,
+      "behavior": {
+        "kind": "button",
+        "press": null
+      },
+      "positions": [],
+      "short_name": "DOWN"
+    },
+    "selector_left_button": {
+      "name": "Selector left button (Fn7)",
+      "location": "rear",
+      "manual_page": 299,
+      "face": null,
+      "icon": null,
+      "connection_ids": [],
+      "assignable": true,
+      "pushable": true,
+      "default_function": "Move left in menus; default function button assignment: PERFORMANCE.",
+      "role": null,
+      "mechanical": false,
+      "behavior": {
+        "kind": "button",
+        "press": null
+      },
+      "positions": [],
+      "short_name": "LEFT"
     },
     "menu_ok_button": {
       "name": "MENU/OK button",
@@ -830,6 +887,45 @@
           "band_high": 3102,
           "sample": 2869,
           "basis": "Band 2637..3102, derived from the firmware's factory key-band table (scanner row 28, physical code 0xf, UI event KEY_DISP_BACK 9); no other control on this wire accepts it. The sample is the band midpoint."
+        }
+      ]
+    },
+    {
+      "wire": {
+        "kind": "adc",
+        "channel": 13
+      },
+      "levels": 4096,
+      "released": null,
+      "basis": "The firmware reads this ADC channel at 12-bit resolution (the refresh 0x140af08 caches it at 0x207aaf2). Bands come from the firmware's factory key-band table; a body with its own valid configuration store reads its own bands. No released level is established: it is this channel's idle sample, a property of the body.",
+      "rungs": [
+        {
+          "control_id": "selector_up_button",
+          "band_low": 1448,
+          "band_high": 1688,
+          "sample": 1568,
+          "basis": "Band 1448..1688, derived from the firmware's factory key-band table (scanner row 31, physical code 0x15, UI event KEY_UP 2); no other control on this wire accepts it. The sample is the band midpoint."
+        },
+        {
+          "control_id": "selector_right_button",
+          "band_low": 1930,
+          "band_high": 2219,
+          "sample": 2074,
+          "basis": "Band 1930..2219, derived from the firmware's factory key-band table (scanner row 34, physical code 0x18, UI event KEY_RIGHT 5); no other control on this wire accepts it. The sample is the band midpoint."
+        },
+        {
+          "control_id": "selector_left_button",
+          "band_low": 2606,
+          "band_high": 3041,
+          "sample": 2823,
+          "basis": "Band 2606..3041, derived from the firmware's factory key-band table (scanner row 33, physical code 0x17, UI event KEY_LEFT 4); no other control on this wire accepts it. The sample is the band midpoint."
+        },
+        {
+          "control_id": "selector_down_button",
+          "band_low": 3042,
+          "band_high": 3719,
+          "sample": 3380,
+          "basis": "Band 3042..3719, derived from the firmware's factory key-band table (scanner row 32, physical code 0x16, UI event KEY_DOWN 3); no other control on this wire accepts it. The sample is the band midpoint."
         }
       ]
     }
