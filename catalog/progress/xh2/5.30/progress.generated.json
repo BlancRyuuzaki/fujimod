@@ -421,7 +421,7 @@
         {
           "id": "camera-snapshot",
           "title": "Camera state dumped (RAM at least)",
-          "result": "not-run"
+          "result": "pass"
         },
         {
           "id": "camera-fast-memory",
@@ -506,9 +506,9 @@
           "id": "camera-snapshot",
           "label": "Camera state dumped (RAM at least)",
           "stage": "camera-snapshot",
-          "result": "not-run",
-          "passed": 0,
-          "total": 0
+          "result": "pass",
+          "passed": 1,
+          "total": 1
         },
         {
           "id": "camera-fast-memory",
