@@ -426,7 +426,7 @@
         {
           "id": "camera-fast-memory",
           "title": "Memory capture measured at 8 MiB/s or more",
-          "result": "not-run"
+          "result": "pass"
         },
         {
           "id": "camera-fast-flash",
@@ -441,12 +441,12 @@
         {
           "id": "camera-debug-card",
           "title": "Debug access enabled by an SD boot gate card",
-          "result": "not-run"
+          "result": "pass"
         },
         {
           "id": "camera-normal",
           "title": "FF80 answers in normal mode",
-          "result": "not-run"
+          "result": "pass"
         },
         {
           "id": "camera-restart",
@@ -519,9 +519,9 @@
           "id": "camera-fast-memory",
           "label": "Memory capture measured at 8 MiB/s or more",
           "stage": "camera-fast-memory",
-          "result": "not-run",
-          "passed": 0,
-          "total": 0
+          "result": "pass",
+          "passed": 1,
+          "total": 1
         },
         {
           "id": "camera-fast-flash",
@@ -543,17 +543,17 @@
           "id": "camera-debug-card",
           "label": "Debug access enabled by an SD boot gate card",
           "stage": "camera-debug-card",
-          "result": "not-run",
-          "passed": 0,
-          "total": 0
+          "result": "pass",
+          "passed": 1,
+          "total": 1
         },
         {
           "id": "camera-normal",
           "label": "FF80 answers in normal mode",
           "stage": "camera-normal",
-          "result": "not-run",
-          "passed": 0,
-          "total": 0
+          "result": "pass",
+          "passed": 1,
+          "total": 1
         },
         {
           "id": "camera-restart",
