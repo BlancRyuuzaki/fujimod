@@ -193,9 +193,42 @@ fn positions(entries: &[(&str, &[&str], u16, u16, bool)]) -> Vec<ladder_keys::Po
 /// The board's table of decoded controls the catalog cannot yet express, by
 /// body. Bodies without an entry are unchanged.
 fn extension(body: &str, options: &mut ladder_keys::Options) -> Result<(), String> {
-    if body != "xt5" {
-        return Ok(());
+    match body {
+        "xt5" => xt5_extension(options),
+        "xh2" => {
+            options.gpio_keys = vec![
+                shutter_half(
+                    "0x1c52138: selector 0 (GPIO 0.0), released level 1, logical interrupt 1 (INTID 116); read helper 0x138331c.",
+                ),
+                shutter_full(
+                    "0x1c52160: selector 1 (GPIO 0.1), released level 1, logical interrupt 2 (INTID 117); read helper 0x138331c.",
+                ),
+            ];
+            Ok(())
+        }
+        _ => Ok(()),
     }
+}
+
+fn shutter_half(record: &str) -> ladder_keys::GpioKey {
+    ladder_keys::GpioKey {
+        key: Key::ShutterHalf,
+        pin: Pin { port: 0, pin: 0 },
+        active_high: false,
+        basis: format!("Half-press contact S1, scanner record {record}"),
+    }
+}
+
+fn shutter_full(record: &str) -> ladder_keys::GpioKey {
+    ladder_keys::GpioKey {
+        key: Key::ShutterFull,
+        pin: Pin { port: 0, pin: 1 },
+        active_high: false,
+        basis: format!("Full-press contact S2, scanner record {record} A full press holds S1 too."),
+    }
+}
+
+fn xt5_extension(options: &mut ladder_keys::Options) -> Result<(), String> {
     let adc = |channel| move |wire: ladder_keys::Wire| wire == ladder_keys::Wire::Adc { channel };
     let register = |number| {
         move |wire: ladder_keys::Wire| {
@@ -399,6 +432,12 @@ count, bit 3 sign. The firmware never writes it, so the controller clears the co
             active_high: false,
             basis: "Scanner row 98 (physical 0x1f, UI 0x44) reads GPIO 0.14 low.".into(),
         },
+        shutter_half(
+            "0x1c09cd0: selector 0 (GPIO 0.0), released level 1, logical interrupt 1 (INTID 116, descriptor 0x18ea928); read helper 0x1381388.",
+        ),
+        shutter_full(
+            "0x1c09cf8: selector 1 (GPIO 0.1), released level 1, logical interrupt 2 (INTID 117, descriptor 0x18ea938); read helper 0x1381388.",
+        ),
     ];
     Ok(())
 }
@@ -486,8 +525,46 @@ mod tests {
         keys.enqueue(Duration::from_nanos(1), Key::Play, true).unwrap();
         keys.advance(1);
         assert_eq!(keys.sample(11, 4095), 2213);
-        let error = keys.enqueue(Duration::from_nanos(2), Key::ShutterHalf, true).unwrap_err();
-        assert!(error.contains("no declared ladder rung"), "{error}");
+    }
+
+    fn shutter_levels(resolved: &ResolvedConfiguration) {
+        let pins = fujimod_emulator_devices::xp5::pins::Pins::shared();
+        let keys = ControlsOptions::LadderKeys(ladder_keys(resolved).unwrap().unwrap())
+            .open(pins.clone())
+            .unwrap();
+        let levels = || {
+            let pins = pins.lock().unwrap();
+            (pins.level(0, 0), pins.level(0, 1))
+        };
+        assert_eq!(levels(), (1, 1));
+        keys.enqueue(at(1), Key::ShutterHalf, true).unwrap();
+        keys.advance(1);
+        assert_eq!(levels(), (0, 1));
+        keys.enqueue(at(2), Key::ShutterHalf, false).unwrap();
+        keys.advance(2);
+        assert_eq!(levels(), (1, 1));
+        keys.enqueue(at(3), Key::ShutterFull, true).unwrap();
+        keys.advance(3);
+        assert_eq!(levels(), (0, 0));
+        keys.enqueue(at(4), Key::ShutterFull, false).unwrap();
+        keys.advance(4);
+        assert_eq!(levels(), (1, 1));
+        // A full press leaves a held half press held.
+        keys.enqueue(at(5), Key::ShutterHalf, true).unwrap();
+        keys.enqueue(at(6), Key::ShutterFull, true).unwrap();
+        keys.enqueue(at(7), Key::ShutterFull, false).unwrap();
+        keys.advance(7);
+        assert_eq!(levels(), (0, 1));
+    }
+
+    #[test]
+    fn xt5_shutter_contacts_drive_gpio_zero_pins_zero_and_one_low() {
+        shutter_levels(&xt5());
+    }
+
+    #[test]
+    fn xh2_shutter_contacts_drive_gpio_zero_pins_zero_and_one_low() {
+        shutter_levels(&ResolvedConfiguration::bundled("xh2-530").unwrap());
     }
 
     fn xt5_keys() -> std::sync::Arc<dyn fujimod_emulator_parts_controls::key_input::KeyInput> {
@@ -586,7 +663,7 @@ mod tests {
 
     #[test]
     fn every_mapped_identity_is_a_catalog_control() {
-        let bodies = [("xt5-431", "xt5"), ("xh2s-730", "xh2s")].map(|(configuration, body)| {
+        let bodies = [("xt5-431", "xt5"), ("xh2-530", "xh2"), ("xh2s-730", "xh2s")].map(|(configuration, body)| {
             let document = ResolvedConfiguration::bundled(configuration)
                 .unwrap()
                 .reference

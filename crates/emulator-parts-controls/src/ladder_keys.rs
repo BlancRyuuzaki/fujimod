@@ -945,8 +945,18 @@ impl Controls for LadderKeys {
                             } else {
                                 s.held.remove(&key);
                             }
-                            if let (Some(gpio), Some(pins)) = (self.options.gpio_key(key), &self.pins) {
-                                pins.set_input(gpio.pin, edge.pressed == gpio.active_high);
+                            if let Some(pins) = &self.pins {
+                                // A full press holds the half-press contact too.
+                                for gpio in &self.options.gpio_keys {
+                                    let half =
+                                        gpio.key == Key::ShutterHalf && key == Key::ShutterFull;
+                                    if gpio.key == key || half {
+                                        let pressed = s.held.contains(&gpio.key)
+                                            || (gpio.key == Key::ShutterHalf
+                                                && s.held.contains(&Key::ShutterFull));
+                                        pins.set_input(gpio.pin, pressed == gpio.active_high);
+                                    }
+                                }
                             }
                             (if edge.pressed { "press" } else { "release" }).to_owned()
                         }
