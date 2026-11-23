@@ -416,7 +416,7 @@
         {
           "id": "camera-backup",
           "title": "Internal flash backed up",
-          "result": "not-run"
+          "result": "pass"
         },
         {
           "id": "camera-snapshot",
@@ -497,9 +497,9 @@
           "id": "camera-backup",
           "label": "Internal flash backed up",
           "stage": "camera-backup",
-          "result": "not-run",
-          "passed": 0,
-          "total": 0,
+          "result": "pass",
+          "passed": 1,
+          "total": 1,
           "milestone": true
         },
         {
