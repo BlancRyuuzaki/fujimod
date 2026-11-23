@@ -744,7 +744,10 @@
       "mechanical": false,
       "behavior": {
         "kind": "button",
-        "press": null
+        "press": {
+          "kind": "debug_key",
+          "name": "DISP_B"
+        }
       },
       "positions": []
     },
