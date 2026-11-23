@@ -1,0 +1,17 @@
+# UART port 0, an Arm PL011 at 0xff920000, for the stock firmware update program. The first
+# write the X-H2 4.x update run made there is CR (+0x30) = 0 from the serial driver's port setup
+# (PC 0x5de10), the access the X-T5's driver makes (X-T5 manifest.d/65-uart.toml). The normal
+# boot to REC never touches the port.
+#
+# The peer is the virtual Renesas RL78 programming target of the X-T5 declaration: the X-H2
+# updater is the same program family, and whether it sends the same Protocol A frames to a
+# 48 KiB part is INFERRED, not read from this update. The interrupt INTID 293 is the X-T5's
+# (the SoC's UART 0); not read from this update either.
+[[device]]
+base = 0xff920000
+size = 0x1000
+kind = "pl011"
+
+[device.options]
+irq = 293
+rl78 = { flash_bytes = 0xc000 }
