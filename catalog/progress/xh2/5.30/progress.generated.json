@@ -53,12 +53,12 @@
         {
           "id": "restart-facts",
           "title": "USB restart request located",
-          "result": "stale"
+          "result": "fail"
         },
         {
           "id": "card-files",
           "title": "Optional card file access located",
-          "result": "stale"
+          "result": "not-run"
         },
         {
           "id": "controls",
@@ -149,7 +149,7 @@
           "id": "restart-facts",
           "label": "USB restart request located",
           "stage": "restart-facts",
-          "result": "stale",
+          "result": "fail",
           "passed": 0,
           "total": 0
         },
@@ -157,7 +157,7 @@
           "id": "card-files",
           "label": "Optional card file access located",
           "stage": "card-files",
-          "result": "stale",
+          "result": "not-run",
           "passed": 0,
           "total": 0
         },
