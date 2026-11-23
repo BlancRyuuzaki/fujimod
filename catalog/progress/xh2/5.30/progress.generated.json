@@ -406,7 +406,7 @@
         {
           "id": "camera-code",
           "title": "Uploaded code runs in RAM and is cleaned up",
-          "result": "not-run"
+          "result": "pass"
         },
         {
           "id": "camera-bulk",
@@ -485,9 +485,9 @@
           "id": "camera-code",
           "label": "Uploaded code runs in RAM and is cleaned up",
           "stage": "camera-code",
-          "result": "not-run",
-          "passed": 0,
-          "total": 0,
+          "result": "pass",
+          "passed": 1,
+          "total": 1,
           "milestone": true
         },
         {
