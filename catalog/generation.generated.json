@@ -4616,13 +4616,8 @@
           ]
         },
         "controls": {
-          "status": "unavailable",
-          "errors": [
-            {
-              "locator": "controls",
-              "reason": "ControlIdsError: No catalog firmware, body, and physical-control records are published"
-            }
-          ]
+          "status": "available",
+          "errors": []
         },
         "facts": {
           "status": "unavailable",
@@ -4647,17 +4642,12 @@
           ]
         },
         "flash": {
-          "status": "unavailable",
-          "errors": [
-            {
-              "locator": "flash_error",
-              "reason": "mapped loader missing"
-            },
-            {
-              "locator": "publication",
-              "reason": "No catalog firmware and body record is published"
-            }
-          ]
+          "status": "available",
+          "errors": []
+        },
+        "memory-reservations": {
+          "status": "available",
+          "errors": []
         },
         "progress": {
           "status": "unavailable",
@@ -4673,7 +4663,7 @@
           "errors": [
             {
               "locator": "restart",
-              "reason": "ValueError: power-cut routine: no verified family match (0x13823f0: no four settle calls with w0 = -6); 0 structural candidates "
+              "reason": "RestartCatalogError: No console callback transport facts for this firmware"
             }
           ]
         },
@@ -4687,26 +4677,12 @@
           ]
         },
         "settings": {
-          "status": "unavailable",
-          "errors": [
-            {
-              "locator": "settings",
-              "reason": "FileNotFoundError: [Errno 2] No such file or directory: '<input>'"
-            }
-          ]
+          "status": "available",
+          "errors": []
         },
         "state": {
-          "status": "unavailable",
-          "errors": [
-            {
-              "locator": "boot_rom_error",
-              "reason": "xp5: no established safely readable boot ROM extent"
-            },
-            {
-              "locator": "publication",
-              "reason": "No catalog firmware and body record is published"
-            }
-          ]
+          "status": "available",
+          "errors": []
         },
         "ui_setting_names": {
           "status": "available",
