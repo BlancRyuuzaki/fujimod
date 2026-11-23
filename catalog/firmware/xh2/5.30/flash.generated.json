@@ -4,7 +4,9 @@
   "id": "xh2-530-flash",
   "firmware_id": "xh2-530",
   "device": {
-    "kind": "serial-nor"
+    "kind": "serial-nor",
+    "jedec_id": "2c5b1b",
+    "part": "Micron MT35XU01GBBA"
   },
   "window": {
     "address": 4026531840,
@@ -18,7 +20,11 @@
     "dat_offset": 628,
     "xor": 255
   },
-  "transport": null,
+  "reader": {
+    "symbol": "flash_read",
+    "alignment": 64
+  },
+  "transport": "xp5-cmd-callback",
   "code_ranges": [
     {
       "name": "flash_read",
@@ -44,9 +50,26 @@
       "name": "destination cache maintenance",
       "address": 21830368,
       "size": 64
+    },
+    {
+      "name": "flash bank selection",
+      "address": 20477864,
+      "size": 60
+    },
+    {
+      "name": "flash CPU tail copy",
+      "address": 20471452,
+      "size": 168
     }
   ],
-  "state_checks": [],
+  "state_checks": [
+    {
+      "name": "flash driver initialized",
+      "address": 33912728,
+      "size": 4,
+      "value": 2003199317
+    }
+  ],
   "control": {
     "offset": 393216,
     "size": 32768,
