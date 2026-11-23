@@ -241,7 +241,7 @@
         {
           "id": "firmware-update-stock-installs-in-emulator",
           "title": "Firmware update: stock updater installs an update from an SD card in the emulator",
-          "result": "not-run"
+          "result": "pass"
         },
         {
           "id": "sd-boot-v2-fujimod-boots-in-emulator",
@@ -382,9 +382,9 @@
           "id": "firmware-update-stock-installs-in-emulator",
           "label": "Firmware update: stock updater installs an update from an SD card in the emulator",
           "stage": "firmware-update-stock-installs-in-emulator",
-          "result": "not-run",
-          "passed": 0,
-          "total": 0
+          "result": "pass",
+          "passed": 1,
+          "total": 1
         }
       ]
     },
