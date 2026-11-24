@@ -8,17 +8,8 @@ stage_max_bytes = 0x3c000
 "0" = 0x8202
 "10" = 0x0002
 
-# DDR PHY register space of the stock setup (as the X-T5 manifest backs it): the setup
-# reads and writes halfword registers at 0xfb000000 / 0xfb400000 + 2 * APB index (first
-# fault: write at 0xfb04017a, PC 0xff80dfc8). The X-H2 default boot manifest declares none of it
-# because the loader start never runs the stock setup.
-[[ram]]
-base = 0xfb000000
-size = 0x1a0000
-
-[[ram]]
-base = 0xfb400000
-size = 0x1a0000
+# DDR PHY register space (0xfb000000, 0xfb400000) is RAM in the boot manifest; the stage's first
+# fault was a write at 0xfb04017a (PC 0xff80dfc8).
 
 # Memory-controller status the stock setup polls (0xfaf07780 non-zero, low byte of 0xfaf07784 a
 # result code) after writing 0xfaf07680. Scripted answers, as the X-T5's.

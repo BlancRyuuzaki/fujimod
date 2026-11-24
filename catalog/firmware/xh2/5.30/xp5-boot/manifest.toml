@@ -47,6 +47,20 @@ size = 0x100000
 # each, 0x2f79de0 (0x2eb5e74) sets four planes 0x400 apart from 0xff80eb40 (0x2f79de8), and
 # 0x2eec5c4 (0x2e2943c) increments the counter 0xff82c008. The statistics model writes its
 # frames into this RAM.
+# DDR PHY register and firmware space, RAM as on the X-T5 (xt5/4.31 manifest.toml): the firmware
+# stores halfword PHY registers at 0xfb000000 / 0xfb400000 + 2 * APB index. The interactive run
+# of a half press stopped at write2 0xfb440120 (CPU0 PC 0x5de1c, LR 0x13bd4ec, the training drain
+# of 0x13bd764); the SD card start's stock setup also writes them (card-handoff.toml, 2026-11-23).
+# The mailbox pages above each region are the stubs of manifest.d/48-ddr-phy.toml. Plain RAM
+# is the X-T5's model; the X-H2's register meanings are UNVERIFIED.
+[[ram]]
+base = 0xfb000000
+size = 0x1a0000
+
+[[ram]]
+base = 0xfb400000
+size = 0x1a0000
+
 [[ram]]
 base = 0xff800000
 size = 0x40000
