@@ -642,7 +642,9 @@
       "manual_page": 299,
       "face": null,
       "icon": null,
-      "connection_ids": [],
+      "connection_ids": [
+        "controls-adc-13"
+      ],
       "assignable": true,
       "pushable": true,
       "default_function": "Move up in menus; default function button assignment: PHOTOMETRY.",
@@ -650,7 +652,10 @@
       "mechanical": false,
       "behavior": {
         "kind": "button",
-        "press": null
+        "press": {
+          "kind": "debug_key",
+          "name": "UP"
+        }
       },
       "positions": [],
       "short_name": "UP"
@@ -661,7 +666,9 @@
       "manual_page": 299,
       "face": null,
       "icon": null,
-      "connection_ids": [],
+      "connection_ids": [
+        "controls-adc-13"
+      ],
       "assignable": true,
       "pushable": true,
       "default_function": "Move right in menus; default function button assignment: FILM SIMULATION.",
@@ -669,7 +676,10 @@
       "mechanical": false,
       "behavior": {
         "kind": "button",
-        "press": null
+        "press": {
+          "kind": "debug_key",
+          "name": "RIGHT"
+        }
       },
       "positions": [],
       "short_name": "RIGHT"
@@ -680,7 +690,9 @@
       "manual_page": 299,
       "face": null,
       "icon": null,
-      "connection_ids": [],
+      "connection_ids": [
+        "controls-adc-13"
+      ],
       "assignable": true,
       "pushable": true,
       "default_function": "Move down in menus; default function button assignment: DIGITAL TELE-CONV./DIGITAL ZOOM.",
@@ -688,7 +700,10 @@
       "mechanical": false,
       "behavior": {
         "kind": "button",
-        "press": null
+        "press": {
+          "kind": "debug_key",
+          "name": "DOWN"
+        }
       },
       "positions": [],
       "short_name": "DOWN"
@@ -699,7 +714,9 @@
       "manual_page": 299,
       "face": null,
       "icon": null,
-      "connection_ids": [],
+      "connection_ids": [
+        "controls-adc-13"
+      ],
       "assignable": true,
       "pushable": true,
       "default_function": "Move left in menus; default function button assignment: PERFORMANCE.",
@@ -707,7 +724,10 @@
       "mechanical": false,
       "behavior": {
         "kind": "button",
-        "press": null
+        "press": {
+          "kind": "debug_key",
+          "name": "LEFT"
+        }
       },
       "positions": [],
       "short_name": "LEFT"
@@ -718,7 +738,9 @@
       "manual_page": 28,
       "face": "MENU/OK",
       "icon": null,
-      "connection_ids": [],
+      "connection_ids": [
+        "controls-adc-6"
+      ],
       "assignable": false,
       "pushable": true,
       "default_function": "Display menus and confirm selections.",
@@ -726,7 +748,10 @@
       "mechanical": false,
       "behavior": {
         "kind": "button",
-        "press": null
+        "press": {
+          "kind": "debug_key",
+          "name": "EXE_M"
+        }
       },
       "positions": []
     },
@@ -736,7 +761,9 @@
       "manual_page": 21,
       "face": "DISP/BACK",
       "icon": null,
-      "connection_ids": [],
+      "connection_ids": [
+        "controls-adc-6"
+      ],
       "assignable": false,
       "pushable": true,
       "default_function": "Control the EVF and LCD indicator display and return from menus; the parts diagram also names a Bluetooth button at this entry.",

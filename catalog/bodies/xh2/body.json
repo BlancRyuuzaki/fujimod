@@ -70,6 +70,28 @@
           "line": 117
         }
       ]
+    },
+    {
+      "id": "controls-adc-6",
+      "kind": "control",
+      "signals": [
+        {
+          "kind": "adc",
+          "channel": 6,
+          "threshold": null
+        }
+      ]
+    },
+    {
+      "id": "controls-adc-13",
+      "kind": "control",
+      "signals": [
+        {
+          "kind": "adc",
+          "channel": 13,
+          "threshold": null
+        }
+      ]
     }
   ],
   "parts": [
